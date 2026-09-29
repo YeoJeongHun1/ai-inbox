@@ -1,0 +1,2603 @@
+//! 수집 엔진 — 대화 기록(JSONL)을 증분으로 읽어 "요청 1건 = turn 1행" 으로 조립한다.
+//! Claude Code(~/.claude/projects) 와 Codex(~/.codex/sessions — 해석은 `ingest_codex.rs`) 를 같은 표로 모은다.
+//!
+//! Claude Code 쪽 신호는 세 갈래다.
+//!   1. 대화 기록 파일(정본) — 요청·중간 보고·도구·토큰·턴 종료(turn_duration)·요약(away_summary)
+//!   2. 훅 스풀 — Stop·Notification(권한 대기)·SessionEnd 를 즉시 알려 준다
+//!   3. 살아 있는 세션 등록부(~/.claude/sessions/{pid}.json) — busy/idle, 프로세스 생존
+//!
+//! 요청의 경계: 사람이 친 줄(origin.kind=human) 또는 다른 세션이 보낸 메시지(peer).
+//! 백그라운드 작업 완료 알림(task-notification)·한도 리셋 후 이어가기(auto-continuation)는
+//! 새 요청이 아니라 **같은 요청의 연장**이다 — 결과 보고는 대개 그 뒤에 나온다.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::{db, paths, text, time};
+
+#[path = "ingest_codex.rs"]
+mod cx;
+
+/// 파서 규칙이 바뀌면 올린다 → 다음 실행 때 백필 기간 안의 파일을 처음부터 다시 읽는다
+/// (읽음·별표 같은 사용자 상태는 upsert 가 건드리지 않으므로 보존된다).
+pub const PARSER_VERSION: &str = "13";
+
+const FINISHED: &[&str] = &["done", "interrupted", "stopped"];
+/// 이보다 오래 조용하고 프로세스도 없으면 멈춘 것으로 본다.
+const DEAD_QUIET_MS: i64 = 120_000;
+/// 앱이 꺼져 있던 동안 끝난 요청까지 한꺼번에 알리지 않는다.
+const NOTIFY_WINDOW_MS: i64 = 10 * 60_000;
+
+// ── 대화 기록 한 줄 (필요한 칸만) ──────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct Origin {
+    kind: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct Message {
+    model: Option<String>,
+    content: Option<Value>,
+    usage: Option<Value>,
+}
+
+#[derive(Deserialize, Default)]
+struct Line {
+    #[serde(rename = "type")]
+    typ: Option<String>,
+    subtype: Option<String>,
+    uuid: Option<String>,
+    timestamp: Option<String>,
+    #[serde(rename = "isSidechain", default)]
+    is_sidechain: bool,
+    #[serde(rename = "isMeta", default)]
+    is_meta: bool,
+    #[serde(rename = "isCompactSummary", default)]
+    is_compact_summary: bool,
+    #[serde(rename = "isApiErrorMessage", default)]
+    is_api_error: bool,
+    origin: Option<Origin>,
+    #[serde(rename = "promptSource")]
+    prompt_source: Option<String>,
+    message: Option<Message>,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
+    effort: Option<String>,
+    cwd: Option<String>,
+    #[serde(rename = "gitBranch")]
+    git_branch: Option<String>,
+    version: Option<String>,
+    #[serde(rename = "customTitle")]
+    custom_title: Option<String>,
+    #[serde(rename = "agentName")]
+    agent_name: Option<String>,
+    content: Option<Value>,
+    #[serde(rename = "durationMs")]
+    duration_ms: Option<i64>,
+    #[serde(rename = "pendingBackgroundAgentCount")]
+    pending_bg: Option<i64>,
+    #[serde(rename = "totalCostUSD")]
+    total_cost: Option<f64>,
+    #[serde(rename = "totalLinesAdded")]
+    lines_added: Option<i64>,
+    #[serde(rename = "totalLinesRemoved")]
+    lines_removed: Option<i64>,
+    /// 작업 도중 들어온 입력(`queued_command`) 등
+    attachment: Option<Value>,
+}
+
+// ── 요청 하나를 조립하는 누산기 ─────────────────────────────────────────────
+
+#[derive(Clone, Default)]
+struct Usage {
+    input: i64,
+    output: i64,
+    thinking: i64,
+    cc5m: i64,
+    cc1h: i64,
+    cache_read: i64,
+    web_search: i64,
+    web_fetch: i64,
+}
+
+impl Usage {
+    fn from(v: &Value) -> Usage {
+        // 비정상적으로 큰 값이 합계를 넘치게 하지 않도록 호출 하나당 100억 토큰으로 자른다
+        let n = |x: Option<&Value>| x.and_then(Value::as_i64).unwrap_or(0).clamp(0, 10_000_000_000);
+        let cc = v.get("cache_creation");
+        let (cc5m, cc1h) = match cc {
+            Some(c) if c.is_object() => (
+                n(c.get("ephemeral_5m_input_tokens")),
+                n(c.get("ephemeral_1h_input_tokens")),
+            ),
+            _ => (n(v.get("cache_creation_input_tokens")), 0),
+        };
+        let stu = v.get("server_tool_use");
+        Usage {
+            input: n(v.get("input_tokens")),
+            output: n(v.get("output_tokens")),
+            thinking: n(v.get("output_tokens_details").and_then(|d| d.get("thinking_tokens"))),
+            cc5m,
+            cc1h,
+            cache_read: n(v.get("cache_read_input_tokens")),
+            web_search: n(stu.and_then(|s| s.get("web_search_requests"))),
+            web_fetch: n(stu.and_then(|s| s.get("web_fetch_requests"))),
+        }
+    }
+    /// 스트리밍 중간본이 같은 requestId 로 여러 줄 온다 → 칸마다 최댓값
+    fn merge(&mut self, o: &Usage) {
+        self.input = self.input.max(o.input);
+        self.output = self.output.max(o.output);
+        self.thinking = self.thinking.max(o.thinking);
+        self.cc5m = self.cc5m.max(o.cc5m);
+        self.cc1h = self.cc1h.max(o.cc1h);
+        self.cache_read = self.cache_read.max(o.cache_read);
+        self.web_search = self.web_search.max(o.web_search);
+        self.web_fetch = self.web_fetch.max(o.web_fetch);
+    }
+    fn context(&self) -> i64 {
+        self.input + self.cc5m + self.cc1h + self.cache_read
+    }
+}
+
+#[derive(Clone)]
+struct Step {
+    at: Option<String>,
+    kind: &'static str,
+    name: Option<String>,
+    text: String,
+}
+
+#[derive(Clone)]
+struct Sub {
+    agent_type: String,
+    description: String,
+    background: bool,
+    started_at: Option<String>,
+    ended_at: Option<String>,
+}
+
+#[derive(Clone)]
+struct PlanItem {
+    text: String,
+    status: String,
+}
+
+#[derive(Clone)]
+struct TurnAcc {
+    uuid: String,
+    prompt_at: String,
+    prompt_text: String,
+    slash: Option<String>,
+    origin: String,
+    source: Option<String>,
+    peer_name: Option<String>,
+    cwd: Option<String>,
+    branch: Option<String>,
+
+    understanding: Option<String>,
+    saw_tool: bool,
+    plan: Vec<PlanItem>,
+    response: Option<String>,
+    summary: Option<String>,
+    first_reply_at: Option<String>,
+    last_activity_at: Option<String>,
+    stopped_at: Option<String>,
+    interrupted_at: Option<String>,
+    pending_bg: i64,
+    active_ms: i64,
+
+    calls: HashMap<String, Usage>,
+    call_order: Vec<String>,
+    models: BTreeMap<String, i64>,
+    efforts: BTreeMap<String, i64>,
+    tools: BTreeMap<String, i64>,
+    files: BTreeMap<String, i64>,
+    subs: Vec<Sub>,
+    sub_by_tool: HashMap<String, usize>,
+    pending_ask: Option<String>,
+    errors: i64,
+    task_notes: i64,
+    steps: Vec<Step>,
+    /// 다음 요청이 시작돼 이 요청이 닫혔다
+    closed: bool,
+    /// 이번 실행에서 DB 에 이미 쓴 step 수 (step 은 append-only 라 새 것만 넣는다)
+    steps_saved: usize,
+    dirty: bool,
+    /// 모델이 일하는 도중에 사용자가 보낸 말 — 원래 요청과 따로 한 쌍으로 보인다(숨기지 않는다)
+    side: bool,
+    /// 그 말을 받은 직후 모델 응답의 requestId — 이 응답 안의 글만 답으로 친다
+    reply_req: Option<String>,
+    /// Codex 턴 — 끝남 판정이 다르다(턴 끝 줄이 기록에 분명히 있고, 살아 있음은 잠금 파일로 본다)
+    codex: bool,
+    /// 대기 훅이 넣은 말 — 첫 답 첫머리의 받은 말 인용(`text::strip_echo`)을 뗀다
+    echo: bool,
+    /// 작업 중에 보낸 말: 받은 직후 응답이 지나갔다(바로 단 글 모으기 끝)
+    answered: bool,
+    /// 작업 중에 보낸 말: 그 말을 받은 앞 요청의 상태 — 앞 요청이 끝날 때까지 "작업 중", 끝나면 그 최종 답을 받는다
+    follow: Option<String>,
+}
+
+impl TurnAcc {
+    fn new(uuid: String, at: String, line: &Line, text: String, slash: Option<String>, origin: &str, peer: Option<String>) -> TurnAcc {
+        TurnAcc {
+            uuid,
+            prompt_at: at,
+            prompt_text: text,
+            slash,
+            origin: origin.to_string(),
+            source: line.prompt_source.clone(),
+            peer_name: peer,
+            cwd: line.cwd.clone(),
+            branch: line.git_branch.clone(),
+            understanding: None,
+            saw_tool: false,
+            plan: Vec::new(),
+            response: None,
+            summary: None,
+            first_reply_at: None,
+            last_activity_at: None,
+            stopped_at: None,
+            interrupted_at: None,
+            pending_bg: 0,
+            active_ms: 0,
+            calls: HashMap::new(),
+            call_order: Vec::new(),
+            models: BTreeMap::new(),
+            efforts: BTreeMap::new(),
+            tools: BTreeMap::new(),
+            files: BTreeMap::new(),
+            subs: Vec::new(),
+            sub_by_tool: HashMap::new(),
+            pending_ask: None,
+            errors: 0,
+            task_notes: 0,
+            steps: Vec::new(),
+            closed: false,
+            steps_saved: 0,
+            dirty: true,
+            side: false,
+            reply_req: None,
+            codex: false,
+            echo: false,
+            answered: false,
+            follow: None,
+        }
+    }
+
+    fn touch(&mut self, at: &Option<String>) {
+        if let Some(a) = at {
+            if self.last_activity_at.as_deref().map(|l| a.as_str() > l).unwrap_or(true) {
+                self.last_activity_at = Some(a.clone());
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn step(&mut self, at: &Option<String>, kind: &'static str, name: Option<String>, text: String) {
+        self.steps.push(Step { at: at.clone(), kind, name, text });
+        self.dirty = true;
+    }
+
+    fn api_calls(&self) -> i64 {
+        self.calls.len() as i64
+    }
+
+    fn totals(&self) -> Usage {
+        let mut t = Usage::default();
+        for u in self.calls.values() {
+            t.input += u.input;
+            t.output += u.output;
+            t.thinking += u.thinking;
+            t.cc5m += u.cc5m;
+            t.cc1h += u.cc1h;
+            t.cache_read += u.cache_read;
+            t.web_search += u.web_search;
+            t.web_fetch += u.web_fetch;
+        }
+        t
+    }
+
+    fn context_tokens(&self) -> i64 {
+        self.call_order
+            .last()
+            .and_then(|id| self.calls.get(id))
+            .map(Usage::context)
+            .unwrap_or(0)
+    }
+
+    fn top(map: &BTreeMap<String, i64>) -> Option<String> {
+        map.iter().max_by_key(|(_, n)| **n).map(|(k, _)| k.clone())
+    }
+
+    fn quiet_since_stop(&self) -> bool {
+        match (&self.stopped_at, &self.last_activity_at) {
+            (Some(s), Some(a)) => s.as_str() >= a.as_str(),
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    fn interrupted_last(&self) -> bool {
+        match (&self.interrupted_at, &self.last_activity_at) {
+            (Some(i), Some(a)) => i.as_str() >= a.as_str(),
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+}
+
+// ── 세션 쪽 정보 ────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct SessionPatch {
+    title: Option<String>,
+    agent_name: Option<String>,
+    cwd: Option<String>,
+    branch: Option<String>,
+    version: Option<String>,
+    model: Option<String>,
+    first_at: Option<String>,
+    last_at: Option<String>,
+    cost_usd: Option<f64>,
+    lines_added: Option<i64>,
+    lines_removed: Option<i64>,
+}
+
+#[derive(Clone, Default)]
+struct Live {
+    alive: bool,
+    status: Option<String>,
+    name: Option<String>,
+    pid: Option<i64>,
+    /// 훅으로 받은 마지막 Stop / Notification
+    stop_hook_at: Option<String>,
+    notify_at: Option<String>,
+    notify_msg: Option<String>,
+}
+
+struct FileState {
+    session_id: String,
+    size: u64,
+    mtime_ms: i64,
+    offset: u64,
+    read_pos: u64,
+    skipped: bool,
+    primed: bool,
+    open: Option<TurnAcc>,
+    /// 작업 도중 들어온 사용자 말 — 모델의 다음 글을 답으로 붙이고 닫는다
+    side: Vec<TurnAcc>,
+    last_status: Option<(String, bool)>,
+    /// Codex 기록 파일이면 그쪽 해석 상태
+    cx: Option<cx::CxState>,
+}
+
+impl FileState {
+    fn fresh(session_id: String, mtime_ms: i64, offset: u64, skipped: bool, codex: bool) -> FileState {
+        FileState {
+            session_id,
+            // 0 으로 둬야 켜자마자 한 번 다시 읽어 열린 요청을 메모리에 올린다
+            size: 0,
+            mtime_ms,
+            offset,
+            read_pos: offset,
+            skipped,
+            primed: false,
+            open: None,
+            side: Vec::new(),
+            last_status: None,
+            cx: codex.then(cx::CxState::default),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(codex: bool) -> FileState {
+        FileState::fresh("t".into(), 0, 0, false, codex)
+    }
+}
+
+// ── 바깥으로 알리는 것 ──────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize)]
+pub struct Finished {
+    pub turn_id: i64,
+    pub session_id: String,
+    pub status: String,
+    pub needs_input: bool,
+    pub text: String,
+}
+
+#[derive(Default)]
+pub struct Report {
+    pub changed: HashSet<String>,
+    pub finished: Vec<Finished>,
+    /// 시간 예산을 넘겨 아직 못 읽은 파일이 남았다 (첫 백필 중)
+    pub working: bool,
+    /// 이번 틱에 읽은 파일 수
+    pub processed: usize,
+}
+
+pub struct Ingestor {
+    conn: Connection,
+    installed_at: String,
+    backfill_days: i64,
+    files: HashMap<PathBuf, FileState>,
+    live: HashMap<String, Live>,
+    tick_no: u64,
+    /// Codex 기록도 모으나(설정 `codex_enabled`, 기본 켬)
+    codex_enabled: bool,
+    /// Codex 를 처음 모으기 시작한 때 — 그 전에 끝난 Codex 요청은 본 것으로 친다(업데이트하자마자 안 읽음이 쏟아지지 않게)
+    codex_since: String,
+    /// Codex 스레드 이름(session_index.jsonl)과 그 파일의 수정 시각
+    codex_names: HashMap<String, String>,
+    codex_index_mtime: i64,
+    /// 지금 열려 있는 Codex 스레드(잠금 파일). None = 이 플랫폼에선 알 수 없다
+    codex_live: Option<HashSet<String>>,
+    /// 세션 표에 마지막으로 쓴 Codex 세션의 live_status
+    codex_written: HashMap<String, Option<String>>,
+}
+
+impl Ingestor {
+    pub fn new(conn: Connection) -> Ingestor {
+        if db::get_meta(&conn, "parser_version").as_deref() != Some(PARSER_VERSION) {
+            let _ = conn.execute("DELETE FROM source_file", []);
+            let _ = db::set_meta(&conn, "parser_version", PARSER_VERSION);
+        }
+        let installed_at = db::get_meta(&conn, "installed_at").unwrap_or_else(time::now_iso);
+        clean_stale_spool();
+        let backfill_days = db::setting_i64(&conn, "backfill_days", 7);
+        let codex_enabled = db::setting_i64(&conn, "codex_enabled", 1) != 0;
+        // 처음 Codex 를 모으기 시작한 때 — 모으기를 꺼 둔 동안은 정하지 않는다(나중에 켜면 그때부터)
+        let codex_since = db::get_meta(&conn, "codex_since").unwrap_or_else(|| {
+            let now = time::now_iso();
+            if codex_enabled {
+                let _ = db::set_meta(&conn, "codex_since", &now);
+            }
+            now
+        });
+        let codex_root = paths::codex_sessions_dir();
+        let mut files = HashMap::new();
+        if let Ok(mut st) = conn.prepare("SELECT path, session_id, size, mtime_ms, offset, skipped FROM source_file") {
+            let rows = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            });
+            if let Ok(rows) = rows {
+                for (path, sid, size, mtime, offset, skipped) in rows.flatten() {
+                    let p = PathBuf::from(&path);
+                    let codex = p.starts_with(&codex_root);
+                    if codex && !codex_enabled {
+                        continue;
+                    }
+                    let sid = sid.unwrap_or_else(|| stem(&p));
+                    let mut st = FileState::fresh(sid, mtime, offset.max(0) as u64, skipped != 0, codex);
+                    if let Some(c) = st.cx.as_mut() {
+                        // 세션 ID 를 비워 둔 Codex 파일 = 하위 에이전트 스레드(건너뛴다)
+                        c.skip = st.session_id.is_empty();
+                    }
+                    files.insert(p, st);
+                    let _ = size;
+                }
+            }
+        }
+        // 앞 실행이 남긴 Codex 세션의 "실행 중" 표시는 지운다 — 이번 실행이 잠금 파일로 다시 정한다
+        let _ = conn.execute("UPDATE session SET live_status = NULL WHERE agent = 'codex' AND live_status IS NOT NULL", []);
+        Ingestor {
+            conn,
+            installed_at,
+            backfill_days,
+            files,
+            live: HashMap::new(),
+            tick_no: 0,
+            codex_enabled,
+            codex_since,
+            codex_names: HashMap::new(),
+            codex_index_mtime: -1,
+            codex_live: None,
+            codex_written: HashMap::new(),
+        }
+    }
+
+    pub fn tick(&mut self) -> Report {
+        self.tick_no += 1;
+        let mut rep = Report::default();
+        self.drain_spool(&mut rep);
+        self.refresh_registry(&mut rep);
+        self.refresh_codex_live();
+        self.scan_transcripts(&mut rep);
+        self.scan_codex(&mut rep);
+        self.refresh_codex(&mut rep);
+        self.recheck_open(&mut rep);
+        rep
+    }
+
+    // ── 훅 스풀 ──────────────────────────────────────────────────────────
+
+    fn drain_spool(&mut self, rep: &mut Report) {
+        let dir = paths::spool_dir();
+        let Ok(rd) = std::fs::read_dir(&dir) else { return };
+        let mut entries: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        entries.sort();
+        let tx = self.conn.unchecked_transaction().ok();
+        for path in entries {
+            // 훅이 만드는 파일은 수 KB — 그보다 훨씬 크면 우리 것이 아니다
+            if std::fs::metadata(&path).map(|m| m.len() > 1024 * 1024).unwrap_or(true) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let _ = std::fs::remove_file(&path);
+            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            let event = v.get("hook_event_name").and_then(Value::as_str).unwrap_or("?").to_string();
+            let sid = v.get("session_id").and_then(Value::as_str).map(str::to_string);
+            let at = v
+                .get("received_at_ms")
+                .and_then(Value::as_i64)
+                .map(time::iso_from_ms)
+                .unwrap_or_else(time::now_iso);
+            let mut detail = serde_json::Map::new();
+            for k in ["message", "notification_type", "title", "source", "reason", "agent_type", "permission_mode"] {
+                match v.get(k) {
+                    Some(Value::String(x)) => {
+                        detail.insert(k.into(), Value::String(text::safe(x, 1000)));
+                    }
+                    Some(x @ (Value::Bool(_) | Value::Number(_))) => {
+                        detail.insert(k.into(), x.clone());
+                    }
+                    _ => {}
+                }
+            }
+            let _ = self.conn.execute(
+                "INSERT INTO hook_event (session_id, event, at, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![sid, event, at, Value::Object(detail.clone()).to_string()],
+            );
+            let _ = db::set_meta(&self.conn, "hook_last_at", &at);
+            let Some(sid) = sid else { continue };
+            self.ensure_session(&sid, v.get("transcript_path").and_then(Value::as_str));
+            let live = self.live.entry(sid.clone()).or_default();
+            match event.as_str() {
+                "Stop" => live.stop_hook_at = Some(at.clone()),
+                "Notification" => {
+                    let msg = text::safe(detail.get("message").and_then(Value::as_str).unwrap_or(""), 500);
+                    live.notify_at = Some(at.clone());
+                    live.notify_msg = Some(msg.clone());
+                    let _ = self.conn.execute(
+                        "UPDATE session SET notify_at = ?2, notify_msg = ?3 WHERE id = ?1",
+                        params![sid, at, msg],
+                    );
+                }
+                "SessionEnd" => {
+                    let reason = detail.get("reason").and_then(Value::as_str).map(str::to_string);
+                    let _ = self.conn.execute(
+                        "UPDATE session SET ended_at = ?2, end_reason = ?3 WHERE id = ?1",
+                        params![sid, at, reason],
+                    );
+                }
+                _ => {}
+            }
+            rep.changed.insert(sid);
+        }
+        if let Some(tx) = tx {
+            let _ = tx.commit();
+        }
+    }
+
+    fn ensure_session(&self, sid: &str, transcript: Option<&str>) {
+        let _ = self.conn.execute(
+            "INSERT INTO session (id, transcript_path) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET transcript_path = COALESCE(session.transcript_path, excluded.transcript_path)",
+            params![sid, transcript],
+        );
+    }
+
+    // ── 살아 있는 세션 등록부 ────────────────────────────────────────────────
+
+    fn refresh_registry(&mut self, rep: &mut Report) {
+        let mut seen: HashMap<String, (i64, Option<String>, Option<String>)> = HashMap::new();
+        if let Ok(rd) = std::fs::read_dir(paths::registry_dir()) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&p) else { continue };
+                let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
+                let (Some(sid), Some(pid)) = (
+                    v.get("sessionId").and_then(Value::as_str),
+                    v.get("pid").and_then(Value::as_i64),
+                ) else {
+                    continue;
+                };
+                if !pid_alive(pid) {
+                    continue;
+                }
+                let name = if v.get("nameSource").and_then(Value::as_str) == Some("user") {
+                    v.get("name").and_then(Value::as_str).map(str::to_string)
+                } else {
+                    None
+                };
+                let status = crate::deliver::input_status(v.get("status").and_then(Value::as_str).map(str::to_string));
+                seen.insert(sid.to_string(), (pid, status, name));
+            }
+        }
+        let known: Vec<String> = self.live.keys().cloned().collect();
+        let mut all: HashSet<String> = known.into_iter().collect();
+        all.extend(seen.keys().cloned());
+        for sid in all {
+            let entry = self.live.entry(sid.clone()).or_default();
+            let (alive, pid, status, name) = match seen.get(&sid) {
+                Some((pid, st, nm)) => (true, Some(*pid), st.clone(), nm.clone()),
+                None => (false, None, None, None),
+            };
+            let changed = entry.alive != alive || entry.status != status || entry.name != name || entry.pid != pid;
+            if !changed {
+                continue;
+            }
+            entry.alive = alive;
+            entry.status = status.clone();
+            entry.pid = pid;
+            entry.name = name.clone();
+            if alive {
+                self.ensure_session_quiet(&sid);
+            }
+            let _ = self.conn.execute(
+                "UPDATE session SET live_status = ?2, live_pid = ?3, live_name = COALESCE(?4, live_name) WHERE id = ?1",
+                params![sid, status, pid, name],
+            );
+            rep.changed.insert(sid);
+        }
+    }
+
+    fn ensure_session_quiet(&self, sid: &str) {
+        let _ = self.conn.execute("INSERT OR IGNORE INTO session (id) VALUES (?1)", params![sid]);
+    }
+
+    // ── 대화 기록 파일 ──────────────────────────────────────────────────────
+
+    fn scan_transcripts(&mut self, rep: &mut Report) {
+        let root = paths::projects_dir();
+        let Ok(dirs) = std::fs::read_dir(&root) else { return };
+        let cutoff_ms = now_ms() - self.backfill_days.max(0) * 86_400_000;
+        let mut todo: Vec<(PathBuf, u64, i64)> = Vec::new();
+        for d in dirs.flatten() {
+            let dp = d.path();
+            if !dp.is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&dp) else { continue };
+            for f in files.flatten() {
+                let p = f.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Ok(md) = f.metadata() else { continue };
+                let size = md.len();
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                match self.files.get(&p) {
+                    Some(st) if st.size == size && st.mtime_ms == mtime && st.primed => {}
+                    Some(_) => todo.push((p, size, mtime)),
+                    None => {
+                        let sid = stem(&p);
+                        let skipped = mtime < cutoff_ms;
+                        let offset = if skipped { size } else { 0 };
+                        self.files.insert(p.clone(), FileState::fresh(sid, mtime, offset, skipped, false));
+                        todo.push((p, size, mtime));
+                    }
+                }
+            }
+        }
+        // 최근 파일부터 — 켜자마자 지금 돌고 있는 세션이 먼저 보이게
+        todo.sort_by_key(|(_, _, m)| -m);
+        // 첫 백필이 길어도 화면이 먼저 채워지도록 한 번에 1.2초까지만 — 남은 파일은 다음 틱에
+        let budget = std::time::Instant::now();
+        for (p, size, mtime) in todo {
+            if budget.elapsed() > std::time::Duration::from_millis(1200) {
+                rep.working = true;
+                break;
+            }
+            rep.processed += 1;
+            if let Some(sid) = self.process_file(&p, size, mtime, rep) {
+                rep.changed.insert(sid);
+            }
+        }
+    }
+
+    // ── Codex ───────────────────────────────────────────────────────────────
+
+    /// Codex 기록: sessions/YYYY/MM/DD/rollout-<시각>-<스레드 ID>.jsonl. 규칙은 Claude 쪽과 같다
+    /// (백필 기간 밖 파일은 그 뒤로 늘어난 부분만, 최근 파일부터, 한 번에 시간 예산만큼).
+    fn scan_codex(&mut self, rep: &mut Report) {
+        if !self.codex_enabled {
+            return;
+        }
+        let cutoff_ms = now_ms() - self.backfill_days.max(0) * 86_400_000;
+        let mut found: Vec<(PathBuf, u64, i64)> = Vec::new();
+        walk_rollouts(&paths::codex_sessions_dir(), 0, &mut found);
+        let mut todo: Vec<(PathBuf, u64, i64)> = Vec::new();
+        for (p, size, mtime) in found {
+            match self.files.get(&p) {
+                Some(st) if st.size == size && st.mtime_ms == mtime && st.primed => {}
+                Some(_) => todo.push((p, size, mtime)),
+                None => {
+                    let Some(sid) = cx::thread_id_of(&p) else { continue };
+                    let skipped = mtime < cutoff_ms;
+                    let offset = if skipped { size } else { 0 };
+                    let mut st = FileState::fresh(sid, mtime, offset, skipped, true);
+                    // 늘어난 부분만 따라갈 파일도 첫 줄(session_meta)로 하위 에이전트 스레드인지는 먼저 본다
+                    if skipped && codex_subagent_file(&p) {
+                        if let Some(c) = st.cx.as_mut() {
+                            c.skip = true;
+                        }
+                    }
+                    self.files.insert(p.clone(), st);
+                    todo.push((p, size, mtime));
+                }
+            }
+        }
+        todo.sort_by_key(|(_, _, m)| -m);
+        let budget = std::time::Instant::now();
+        for (p, size, mtime) in todo {
+            if budget.elapsed() > std::time::Duration::from_millis(800) {
+                rep.working = true;
+                break;
+            }
+            rep.processed += 1;
+            if let Some(sid) = self.process_file(&p, size, mtime, rep) {
+                rep.changed.insert(sid);
+            }
+        }
+    }
+
+    /// 지금 열려 있는 Codex 스레드 — 상태 판정 전에(작업 중 / 멈춤)
+    fn refresh_codex_live(&mut self) {
+        if !self.codex_enabled {
+            return;
+        }
+        self.codex_live = if cfg!(windows) { None } else { Some(crate::codex::live_threads()) };
+    }
+
+    /// Codex 스레드 이름(session_index.jsonl)과 세션 표의 live_status(busy · idle · 없음)
+    fn refresh_codex(&mut self, rep: &mut Report) {
+        if !self.codex_enabled {
+            return;
+        }
+        let idx = paths::codex_index_path();
+        let mtime = std::fs::metadata(&idx)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if mtime != self.codex_index_mtime {
+            self.codex_index_mtime = mtime;
+            let mut names: HashMap<String, String> = HashMap::new();
+            let small = std::fs::metadata(&idx).map(|m| m.len() < 16 * 1024 * 1024).unwrap_or(false);
+            if small {
+                if let Ok(body) = std::fs::read_to_string(&idx) {
+                    for line in body.lines() {
+                        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                        let (Some(id), Some(name)) = (v.get("id").and_then(Value::as_str), v.get("thread_name").and_then(Value::as_str)) else {
+                            continue;
+                        };
+                        let name = text::safe(name.trim(), 120);
+                        if crate::channel::valid_session_id(id) && !name.is_empty() {
+                            names.insert(id.to_string(), name); // 뒤 줄이 최신
+                        }
+                    }
+                }
+            }
+            for (id, name) in &names {
+                if self.codex_names.get(id) == Some(name) {
+                    continue;
+                }
+                let n = self
+                    .conn
+                    .execute(
+                        "UPDATE session SET title = ?2 WHERE id = ?1 AND agent = 'codex' AND COALESCE(title, '') <> ?2",
+                        params![id, name],
+                    )
+                    .unwrap_or(0);
+                if n > 0 {
+                    rep.changed.insert(id.clone());
+                }
+            }
+            self.codex_names = names;
+        }
+        let Some(live) = self.codex_live.clone() else { return };
+        let mut sids: HashSet<String> = self.codex_written.keys().cloned().collect();
+        sids.extend(live.iter().cloned());
+        for sid in sids {
+            let want = if live.contains(&sid) {
+                let busy = self
+                    .files
+                    .values()
+                    .find(|st| st.cx.is_some() && st.session_id == sid)
+                    .and_then(|st| st.last_status.as_ref())
+                    .is_some_and(|(s, _)| matches!(s.as_str(), "running" | "waiting" | "background"));
+                Some(if busy { "busy" } else { "idle" }.to_string())
+            } else {
+                None
+            };
+            if self.codex_written.get(&sid) == Some(&want) {
+                continue;
+            }
+            let n = self
+                .conn
+                .execute("UPDATE session SET live_status = ?2, live_pid = NULL WHERE id = ?1 AND agent = 'codex'", params![sid, want])
+                .unwrap_or(0);
+            if n == 0 && want.is_some() {
+                continue; // 세션 행이 아직 없다(기록을 읽기 전) — 다음 틱에
+            }
+            self.codex_written.insert(sid.clone(), want);
+            rep.changed.insert(sid);
+        }
+    }
+
+    fn process_file(&mut self, path: &Path, size: u64, mtime: i64, rep: &mut Report) -> Option<String> {
+        let mut st = self.files.remove(path)?;
+        if !st.primed {
+            st.read_pos = st.offset;
+            st.open = None;
+            st.side.clear();
+            st.primed = true;
+        }
+        if size < st.read_pos {
+            // 파일이 줄었다(다시 쓰였다) — 처음부터
+            st.read_pos = 0;
+            st.offset = 0;
+            st.open = None;
+            st.side.clear();
+        }
+        let mut closed: Vec<TurnAcc> = Vec::new();
+        let mut patch = SessionPatch::default();
+        let codex = st.cx.is_some();
+        let result = read_lines(path, st.read_pos, |line_start, raw| {
+            if codex {
+                cx::feed(&mut st, line_start, raw, &mut closed, &mut patch);
+            } else {
+                feed(&mut st, line_start, raw, &mut closed, &mut patch);
+            }
+        });
+        if let Ok(end) = result {
+            st.read_pos = end;
+        }
+        if st.open.is_none() {
+            st.offset = st.read_pos;
+        }
+        st.size = size;
+        st.mtime_ms = mtime;
+
+        if st.cx.as_ref().is_some_and(|c| c.skip) {
+            // Codex 하위 에이전트 스레드 — 위치만 기억하고 세션으로 만들지 않는다(세션 ID 를 비워 표시)
+            st.session_id.clear();
+            st.open = None;
+            st.side.clear();
+            st.offset = st.read_pos;
+            let _ = self.conn.execute(
+                "INSERT INTO source_file (path, session_id, size, mtime_ms, offset, skipped)
+                 VALUES (?1, '', ?2, ?3, ?4, ?5)
+                 ON CONFLICT(path) DO UPDATE SET session_id = '', size = excluded.size, mtime_ms = excluded.mtime_ms,
+                     offset = excluded.offset, skipped = excluded.skipped",
+                params![path.to_string_lossy(), size as i64, mtime, st.offset as i64, st.skipped as i64],
+            );
+            self.files.insert(path.to_path_buf(), st);
+            return None;
+        }
+
+        let sid = st.session_id.clone();
+        let tx = self.conn.unchecked_transaction().ok();
+        // 요청이 하나도 없는 Codex 기록(가져온 대화의 사본뿐·아직 말이 없는 새 스레드)은 세션으로 만들지 않는다
+        let exists = self.session_exists(&sid);
+        let empty = codex && closed.is_empty() && st.open.is_none() && st.side.is_empty() && !exists;
+        if codex && !empty && !exists && patch.version.is_none() {
+            // 이번 읽기가 첫 줄부터가 아니었다(요청 없던 스레드에 턴이 붙음) — 버전·폴더·브랜치는 첫 줄에서
+            if let Some(m) = codex_meta(path) {
+                let st_of = |k: &str| m.get(k).and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string);
+                patch.version = st_of("cli_version");
+                patch.cwd = patch.cwd.take().or_else(|| st_of("cwd"));
+                patch.branch = patch.branch.take().or_else(|| m.get("git").and_then(|g| g.get("branch")).and_then(Value::as_str).map(str::to_string));
+            }
+        }
+        if !empty {
+            self.upsert_session(&sid, path, &patch, codex);
+        }
+        for acc in closed.iter_mut() {
+            self.flush_turn(&sid, acc, rep);
+        }
+        let mut last = None;
+        if let Some(acc) = st.open.as_mut() {
+            if acc.dirty {
+                last = self.flush_turn(&sid, acc, rep);
+            }
+        }
+        // 아직 답을 못 받은 "작업 중에 보낸 말"도 바로 보이게 — 상태·답은 앞 요청을 따라간다
+        self.follow_sides(&sid, &mut st);
+        for acc in st.side.iter_mut() {
+            if acc.dirty {
+                self.flush_turn(&sid, acc, rep);
+            }
+        }
+        if last.is_some() {
+            st.last_status = last;
+        }
+        let _ = self.conn.execute(
+            "INSERT INTO source_file (path, session_id, size, mtime_ms, offset, skipped)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET session_id = excluded.session_id, size = excluded.size,
+                 mtime_ms = excluded.mtime_ms, offset = excluded.offset, skipped = excluded.skipped",
+            params![path.to_string_lossy(), sid, size as i64, mtime, st.offset as i64, st.skipped as i64],
+        );
+        if let Some(tx) = tx {
+            let _ = tx.commit();
+        }
+        self.files.insert(path.to_path_buf(), st);
+        Some(sid)
+    }
+
+    /// 파일은 그대로인데 바깥 신호(프로세스 종료·권한 대기·Stop 훅)로 상태가 바뀌는 요청
+    fn recheck_open(&mut self, rep: &mut Report) {
+        let keys: Vec<PathBuf> = self
+            .files
+            .iter()
+            .filter(|(_, st)| st.open.is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            let Some(mut st) = self.files.remove(&k) else { continue };
+            let sid = st.session_id.clone();
+            if let Some(acc) = st.open.as_mut() {
+                let now = self.status_of(&sid, acc);
+                if st.last_status.as_ref() != Some(&now) {
+                    let tx = self.conn.unchecked_transaction().ok();
+                    acc.dirty = true;
+                    st.last_status = self.flush_turn(&sid, acc, rep);
+                    if let Some(tx) = tx {
+                        let _ = tx.commit();
+                    }
+                    rep.changed.insert(sid.clone());
+                }
+            }
+            if self.follow_sides(&sid, &mut st) {
+                let tx = self.conn.unchecked_transaction().ok();
+                for acc in st.side.iter_mut().filter(|a| a.dirty) {
+                    self.flush_turn(&sid, acc, rep);
+                }
+                if let Some(tx) = tx {
+                    let _ = tx.commit();
+                }
+                rep.changed.insert(sid.clone());
+            }
+            self.files.insert(k, st);
+        }
+    }
+
+    fn session_exists(&self, sid: &str) -> bool {
+        self.conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM session WHERE id = ?1)", params![sid], |r| r.get(0))
+            .unwrap_or(false)
+    }
+
+    fn upsert_session(&self, sid: &str, path: &Path, p: &SessionPatch, codex: bool) {
+        let project_dir = p.cwd.clone();
+        // Codex 스레드 이름은 기록 파일이 아니라 session_index.jsonl 에 있다
+        let title = if codex { p.title.clone().or_else(|| self.codex_names.get(sid).cloned()) } else { p.title.clone() };
+        if codex {
+            crate::codex::remember(sid);
+        }
+        let _ = self.conn.execute(
+            "INSERT INTO session (id, transcript_path, project_dir, title, agent_name, git_branch, cc_version, model,
+                                  first_at, last_at, cost_usd, lines_added, lines_removed, agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(id) DO UPDATE SET
+                agent         = COALESCE(excluded.agent, session.agent),
+                transcript_path = excluded.transcript_path,
+                project_dir   = COALESCE(session.project_dir, excluded.project_dir),
+                title         = COALESCE(excluded.title, session.title),
+                agent_name    = COALESCE(excluded.agent_name, session.agent_name),
+                git_branch    = COALESCE(excluded.git_branch, session.git_branch),
+                cc_version    = COALESCE(excluded.cc_version, session.cc_version),
+                model         = COALESCE(excluded.model, session.model),
+                first_at      = CASE WHEN session.first_at IS NULL OR excluded.first_at < session.first_at
+                                     THEN COALESCE(excluded.first_at, session.first_at) ELSE session.first_at END,
+                last_at       = CASE WHEN session.last_at IS NULL OR excluded.last_at > session.last_at
+                                     THEN COALESCE(excluded.last_at, session.last_at) ELSE session.last_at END,
+                cost_usd      = COALESCE(excluded.cost_usd, session.cost_usd),
+                lines_added   = COALESCE(excluded.lines_added, session.lines_added),
+                lines_removed = COALESCE(excluded.lines_removed, session.lines_removed)",
+            params![
+                sid,
+                path.to_string_lossy(),
+                project_dir,
+                title,
+                p.agent_name,
+                p.branch,
+                p.version,
+                p.model,
+                p.first_at,
+                p.last_at,
+                p.cost_usd,
+                p.lines_added,
+                p.lines_removed,
+                codex.then_some(crate::codex::AGENT)
+            ],
+        );
+    }
+
+    /// Codex 턴의 (status, needs_input). 턴 끝(task_complete)·중단(turn_aborted) 줄이 기록에 분명히 남으므로
+    /// 그게 없으면 "작업 중" — 단, 스레드를 연 프로세스가 없고(잠금 파일) 한동안 조용하면 멈춘 것으로 본다.
+    fn codex_status(&self, sid: &str, acc: &TurnAcc) -> (String, bool) {
+        let has_work = acc.api_calls() > 0 || acc.response.is_some();
+        let status = if acc.side && acc.closed {
+            "done"
+        } else if acc.interrupted_last() {
+            "interrupted"
+        } else if acc.stopped_at.is_some() {
+            if has_work { "done" } else { "stopped" }
+        } else if acc.closed {
+            // 끝 줄 없이 다음 턴이 시작됐다 — 프로세스가 끊겼다
+            "interrupted"
+        } else {
+            let alive = self.codex_live.as_ref().is_some_and(|l| l.contains(sid));
+            // 열려 있는지 알 수 없는 플랫폼이면 조용한 시간으로만(길게) 본다
+            let limit = if self.codex_live.is_some() { DEAD_QUIET_MS } else { 30 * 60_000 };
+            let quiet = acc
+                .last_activity_at
+                .as_deref()
+                .or(Some(acc.prompt_at.as_str()))
+                .and_then(time::age_ms)
+                .map(|a| a > limit)
+                .unwrap_or(true);
+            if !alive && quiet { "stopped" } else { "running" }
+        };
+        let needs_input = status == "done" && acc.response.as_deref().map(text::asks_user).unwrap_or(false);
+        (status.to_string(), needs_input)
+    }
+
+    /// 작업 중에 보낸 말들을 앞 요청의 상태에 맞춘다 — 앞 요청이 끝나면 그 최종 답을 받는다. 바뀐 게 있으면 true
+    fn follow_sides(&self, sid: &str, st: &mut FileState) -> bool {
+        let Some(main) = st.open.as_ref() else { return false };
+        let (ms, _) = self.status_of(sid, main);
+        let finished = FINISHED.contains(&ms.as_str()) || ms == "background";
+        let mut any = false;
+        for side in st.side.iter_mut() {
+            let before = (side.follow.clone(), side.response.clone(), side.stopped_at.clone());
+            side.follow = Some(ms.clone());
+            if finished {
+                settle_side(side, main);
+            }
+            if before != (side.follow.clone(), side.response.clone(), side.stopped_at.clone()) {
+                side.dirty = true;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// (status, needs_input)
+    fn status_of(&self, sid: &str, acc: &TurnAcc) -> (String, bool) {
+        if acc.codex {
+            return self.codex_status(sid, acc);
+        }
+        let live = self.live.get(sid).cloned().unwrap_or_default();
+        let has_work = acc.api_calls() > 0 || acc.response.is_some();
+        let mut status: &str;
+        if acc.side && !acc.closed {
+            if let Some(f) = acc.follow.as_deref() {
+                // 앞 요청을 따라간다 — 끝나면(백그라운드 대기 포함) 끝, 아니면 작업 중
+                let done = FINISHED.contains(&f) || f == "background";
+                let needs = done && acc.response.as_deref().map(text::asks_user).unwrap_or(false);
+                return (if done { "done" } else { "running" }.into(), needs);
+            }
+        }
+        if acc.side && acc.closed {
+            // 작업 중에 보낸 말은 답 글이 없어도 "멈춤"이 아니다 — 앞 요청 안에서 이어졌다
+            return ("done".into(), acc.response.as_deref().map(text::asks_user).unwrap_or(false));
+        }
+        if acc.closed {
+            status = if acc.interrupted_last() {
+                "interrupted"
+            } else if has_work {
+                "done"
+            } else {
+                "stopped"
+            };
+        } else if acc.pending_ask.is_some() {
+            status = "waiting";
+        } else if acc.interrupted_last() {
+            status = "interrupted";
+        } else if acc.quiet_since_stop() {
+            status = if acc.pending_bg > 0 { "background" } else { "done" };
+        } else {
+            status = "running";
+            let after_activity = |t: &Option<String>| match (t, &acc.last_activity_at) {
+                (Some(t), Some(a)) => t.as_str() >= a.as_str(),
+                (Some(_), None) => true,
+                _ => false,
+            };
+            // Stop 훅이 마지막 활동 뒤에 왔다 = 모델이 멈췄다
+            if after_activity(&live.stop_hook_at) {
+                status = "done";
+            }
+            // 등록부가 idle = 입력을 기다린다
+            if live.alive && live.status.as_deref() == Some("idle") {
+                if acc.last_activity_at.as_deref().and_then(time::age_ms).map(|a| a > 5_000).unwrap_or(true) {
+                    status = "done";
+                }
+            }
+        }
+        if !acc.closed && matches!(status, "running" | "background") {
+            // 권한 승인 대기 (Notification 훅)
+            if let (Some(at), Some(msg)) = (&live.notify_at, &live.notify_msg) {
+                let newer = acc.last_activity_at.as_deref().map(|a| at.as_str() >= a).unwrap_or(true);
+                let m = msg.to_lowercase();
+                if newer && (m.contains("permission") || m.contains("approve") || m.contains("allow")) {
+                    status = "waiting";
+                }
+            }
+        }
+        if !acc.closed && matches!(status, "running" | "background" | "waiting") && !live.alive {
+            let quiet = acc
+                .last_activity_at
+                .as_deref()
+                .or(Some(acc.prompt_at.as_str()))
+                .and_then(time::age_ms)
+                .map(|a| a > DEAD_QUIET_MS)
+                .unwrap_or(true);
+            if quiet {
+                status = if has_work { "done" } else { "stopped" };
+                if acc.pending_bg > 0 || status == "stopped" {
+                    status = "stopped";
+                }
+            }
+        }
+        let needs_input = status == "done" && acc.response.as_deref().map(text::asks_user).unwrap_or(false);
+        (status.to_string(), needs_input)
+    }
+
+    /// 기록에서 지운 요청인가(지운 뒤에 새 활동이 붙지 않은 것). 줄 위치로 만든 ID(pos-…)는 같은 세션에서만 맞춘다.
+    fn deleted_before(&self, sid: &str, acc: &TurnAcc) -> bool {
+        let deleted_at: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT MAX(deleted_at) FROM turn_deleted
+                  WHERE prompt_uuid = ?1 AND (session_id = ?2 OR prompt_uuid NOT LIKE 'pos-%')",
+                params![acc.uuid, sid],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let Some(d) = deleted_at else { return false };
+        !acc.last_activity_at.as_deref().is_some_and(|a| a > d.as_str())
+    }
+
+    /// 요청 하나를 DB 에 쓴다. 반환: 이번에 계산된 (status, needs_input)
+    fn flush_turn(&self, sid: &str, acc: &mut TurnAcc, rep: &mut Report) -> Option<(String, bool)> {
+        let (status, needs_input) = self.status_of(sid, acc);
+        // 기록에서 지운 요청 — 원본을 다시 읽어도, 이어서 실행한 복사본 세션에 같은 요청이 있어도 쓰지 않는다.
+        // 지운 뒤에 새 활동(백그라운드 작업 완료 등)이 붙었으면 다시 받는다. 상태는 돌려준다 — None 이면
+        // 부르는 쪽이 "상태가 바뀌었다"로 보고 틱마다 다시 쓰려 한다.
+        if self.deleted_before(sid, acc) {
+            return Some((status, needs_input));
+        }
+        let finished = FINISHED.contains(&status.as_str());
+        let t = acc.totals();
+        let ended_at = if finished || status == "background" {
+            match (&acc.stopped_at, &acc.last_activity_at) {
+                (Some(s), Some(a)) => Some(if s > a { s.clone() } else { a.clone() }),
+                (Some(s), None) => Some(s.clone()),
+                (None, Some(a)) => Some(a.clone()),
+                (None, None) => Some(acc.prompt_at.clone()),
+            }
+        } else {
+            None
+        };
+        let span_end = ended_at.clone().or_else(|| acc.last_activity_at.clone());
+        let duration_ms = span_end.as_deref().and_then(|e| time::diff_ms(&acc.prompt_at, e));
+        let ttfr = acc.first_reply_at.as_deref().and_then(|f| time::diff_ms(&acc.prompt_at, f));
+        let hidden = !acc.side
+            && acc.api_calls() == 0
+            && acc.response.is_none()
+            && (finished || (acc.slash.is_some() && acc.prompt_text.is_empty()));
+        let plan_json = if acc.plan.is_empty() {
+            None
+        } else {
+            Some(
+                Value::Array(acc.plan.iter().map(|p| json!({"text": p.text, "status": p.status})).collect())
+                    .to_string(),
+            )
+        };
+
+        let old: Option<(i64, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT id, status, notified FROM turn WHERE session_id = ?1 AND prompt_uuid = ?2",
+                params![sid, acc.uuid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+
+        // 설치 전에 끝난 요청은 이미 본 것으로 친다 (백필이 안 읽음 수백 개를 만들지 않게)
+        let cutoff = if acc.codex { self.codex_since.as_str() } else { self.installed_at.as_str() };
+        let backfilled = finished && ended_at.as_deref().map(|e| e < cutoff).unwrap_or(false);
+        let read_at: Option<String> = if backfilled { ended_at.clone() } else { None };
+
+        let res = self.conn.execute(
+            "INSERT INTO turn (session_id, prompt_uuid, seq, origin, prompt_source, peer_name, prompt_at, prompt_text,
+                slash_command, understanding, plan_json, summary, response_text, first_reply_at, last_activity_at,
+                stopped_at, ended_at, duration_ms, active_ms, ttfr_ms, status, needs_input, hidden, error_count,
+                pending_bg, model, effort, api_calls, input_tokens, output_tokens, thinking_tokens, cache_create_5m,
+                cache_create_1h, cache_read, web_search, web_fetch, context_tokens, tool_calls, files_changed,
+                subagent_count, task_notifications, cwd, git_branch, read_at, notified, updated_at)
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(seq), 0) + 1 FROM turn WHERE session_id = ?1), ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
+             ON CONFLICT(session_id, prompt_uuid) DO UPDATE SET
+                origin = excluded.origin, prompt_source = excluded.prompt_source, peer_name = excluded.peer_name,
+                prompt_at = excluded.prompt_at, prompt_text = excluded.prompt_text, slash_command = excluded.slash_command,
+                understanding = excluded.understanding, plan_json = excluded.plan_json, summary = excluded.summary,
+                response_text = excluded.response_text, first_reply_at = excluded.first_reply_at,
+                last_activity_at = excluded.last_activity_at, stopped_at = excluded.stopped_at,
+                ended_at = excluded.ended_at, duration_ms = excluded.duration_ms, active_ms = excluded.active_ms,
+                ttfr_ms = excluded.ttfr_ms, status = excluded.status, needs_input = excluded.needs_input,
+                hidden = excluded.hidden, error_count = excluded.error_count, pending_bg = excluded.pending_bg,
+                model = excluded.model, effort = excluded.effort, api_calls = excluded.api_calls,
+                input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
+                thinking_tokens = excluded.thinking_tokens, cache_create_5m = excluded.cache_create_5m,
+                cache_create_1h = excluded.cache_create_1h, cache_read = excluded.cache_read,
+                web_search = excluded.web_search, web_fetch = excluded.web_fetch,
+                context_tokens = excluded.context_tokens, tool_calls = excluded.tool_calls,
+                files_changed = excluded.files_changed, subagent_count = excluded.subagent_count,
+                task_notifications = excluded.task_notifications, cwd = excluded.cwd, git_branch = excluded.git_branch,
+                updated_at = excluded.updated_at",
+            params![
+                sid,
+                acc.uuid,
+                acc.origin,
+                acc.source,
+                acc.peer_name,
+                acc.prompt_at,
+                acc.prompt_text,
+                acc.slash,
+                acc.understanding,
+                plan_json,
+                acc.summary,
+                acc.response,
+                acc.first_reply_at,
+                acc.last_activity_at,
+                acc.stopped_at,
+                ended_at,
+                duration_ms,
+                acc.active_ms,
+                ttfr,
+                status,
+                needs_input as i64,
+                hidden as i64,
+                acc.errors,
+                acc.pending_bg,
+                LocalTop(&acc.models).get(),
+                LocalTop(&acc.efforts).get(),
+                acc.api_calls(),
+                t.input,
+                t.output,
+                t.thinking,
+                t.cc5m,
+                t.cc1h,
+                t.cache_read,
+                t.web_search,
+                t.web_fetch,
+                acc.context_tokens(),
+                acc.tools.values().sum::<i64>(),
+                acc.files.len() as i64,
+                acc.subs.len() as i64,
+                acc.task_notes,
+                acc.cwd,
+                acc.branch,
+                read_at,
+                backfilled as i64,
+                time::now_iso(),
+            ],
+        );
+        if let Err(err) = res {
+            eprintln!("[ai-inbox] 요청 저장 실패 {}: {err}", acc.uuid);
+            return None;
+        }
+        let turn_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM turn WHERE session_id = ?1 AND prompt_uuid = ?2",
+                params![sid, acc.uuid],
+                |r| r.get(0),
+            )
+            .ok()?;
+
+        // 자식 표 — 도구·파일·서브에이전트는 작아서 통째로 바꾼다
+        let _ = self.conn.execute("DELETE FROM turn_tool WHERE turn_id = ?1", params![turn_id]);
+        for (name, n) in &acc.tools {
+            let _ = self.conn.execute(
+                "INSERT INTO turn_tool (turn_id, tool_name, calls) VALUES (?1, ?2, ?3)",
+                params![turn_id, name, n],
+            );
+        }
+        let _ = self.conn.execute("DELETE FROM turn_file WHERE turn_id = ?1", params![turn_id]);
+        for (path, n) in &acc.files {
+            let _ = self.conn.execute(
+                "INSERT INTO turn_file (turn_id, path, edits) VALUES (?1, ?2, ?3)",
+                params![turn_id, path, n],
+            );
+        }
+        let _ = self.conn.execute("DELETE FROM turn_subagent WHERE turn_id = ?1", params![turn_id]);
+        for (i, s) in acc.subs.iter().enumerate() {
+            let dur = match (&s.started_at, &s.ended_at) {
+                (Some(a), Some(b)) => time::diff_ms(a, b),
+                _ => None,
+            };
+            let _ = self.conn.execute(
+                "INSERT INTO turn_subagent (turn_id, seq, agent_type, description, background, started_at, ended_at, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![turn_id, i as i64, s.agent_type, s.description, s.background as i64, s.started_at, s.ended_at, dur],
+            );
+        }
+        // 작업 과정은 append-only — 이번 실행에서 처음 쓰는 요청이면 비우고 전부, 아니면 새 것만
+        if acc.steps_saved == 0 {
+            let _ = self.conn.execute("DELETE FROM turn_step WHERE turn_id = ?1", params![turn_id]);
+        }
+        for (i, s) in acc.steps.iter().enumerate().skip(acc.steps_saved) {
+            let _ = self.conn.execute(
+                "INSERT OR REPLACE INTO turn_step (turn_id, seq, at, kind, name, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![turn_id, i as i64, s.at, s.kind, s.name, s.text],
+            );
+        }
+        acc.steps_saved = acc.steps.len();
+        acc.dirty = false;
+        // 작업 중에 보낸 말은 원래 요청보다 늦게 줄에 오른다 — 이미 뒤 요청이 있으면(다시 읽기 등)
+        // 순서 번호를 보낸 시각 순으로 다시 매겨 대화에서 제자리에 오게 한다
+        if acc.side && old.is_none() {
+            let later: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM turn WHERE session_id = ?1 AND prompt_at > ?2)",
+                    params![sid, acc.prompt_at],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if later {
+                let _ = self.conn.execute(
+                    "UPDATE turn SET seq = (SELECT COUNT(*) FROM turn t2 WHERE t2.session_id = turn.session_id
+                         AND (t2.prompt_at < turn.prompt_at OR (t2.prompt_at = turn.prompt_at AND t2.id <= turn.id)))
+                      WHERE session_id = ?1",
+                    params![sid],
+                );
+            }
+        }
+
+        // 알림 후보: 방금 끝났거나(✅) 사용자를 기다리게 됐다(❓·권한)
+        let was = old.as_ref().map(|(_, s, _)| s.as_str()).unwrap_or("");
+        let already = old.as_ref().map(|(_, _, n)| *n != 0).unwrap_or(false) || backfilled;
+        let attention = finished || status == "waiting";
+        let was_attention = FINISHED.contains(&was) || was == "waiting";
+        let recent = ended_at
+            .as_deref()
+            .or(acc.last_activity_at.as_deref())
+            .and_then(time::age_ms)
+            .map(|a| a < NOTIFY_WINDOW_MS)
+            .unwrap_or(false);
+        // 따로 답한 글이 없는 "작업 중에 보낸 말"은 결과가 아니다 — 안 읽음·알림을 만들지 않는다
+        let no_result_side = acc.side && acc.closed && acc.response.is_none();
+        if no_result_side {
+            let _ = self.conn.execute(
+                "UPDATE turn SET read_at = COALESCE(read_at, ended_at, prompt_at), notified = 1 WHERE id = ?1",
+                params![turn_id],
+            );
+        }
+        if attention && !was_attention && !already && !hidden && recent && !no_result_side {
+            let body = acc
+                .summary
+                .clone()
+                .or_else(|| acc.response.clone())
+                .unwrap_or_else(|| acc.prompt_text.clone());
+            rep.finished.push(Finished {
+                turn_id,
+                session_id: sid.to_string(),
+                status: status.clone(),
+                needs_input,
+                text: text::clip(text::first_line(&body), 140),
+            });
+            let _ = self.conn.execute("UPDATE turn SET notified = 1 WHERE id = ?1", params![turn_id]);
+        }
+        if status == "waiting" || !finished {
+            // 다시 돌기 시작하면 다음 완료 때 또 알릴 수 있게
+            if was_attention && !attention {
+                let _ = self.conn.execute("UPDATE turn SET notified = 0 WHERE id = ?1", params![turn_id]);
+            }
+        }
+        // 보관한 뒤에 새 요청이 오거나 하던 일이 끝나면 목록으로 되돌린다 — 보관 때문에 새 결과를 놓치지 않게.
+        // 시각으로 가른다(앱이 꺼져 있던 동안 온 것도 되돌린다). 다시 읽기로 옛 요청을 다시 쓰는 것은 되돌리지 않는다.
+        if !backfilled && !hidden {
+            let since: Option<Option<String>> = self
+                .conn
+                .query_row("SELECT archived_at FROM session WHERE id = ?1 AND hidden = 1", params![sid], |r| r.get(0))
+                .optional()
+                .ok()
+                .flatten();
+            if let Some(since) = since {
+                let since = since.unwrap_or_default();
+                let fresh_prompt = old.is_none() && acc.prompt_at.as_str() > since.as_str();
+                let done_at = ended_at.as_deref().or(acc.last_activity_at.as_deref()).unwrap_or("");
+                let fresh_result = attention && !was_attention && done_at > since.as_str();
+                if fresh_prompt || fresh_result {
+                    let _ = self
+                        .conn
+                        .execute("UPDATE session SET hidden = 0, archived_at = NULL WHERE id = ?1", params![sid]);
+                }
+            }
+        }
+        rep.changed.insert(sid.to_string());
+        Some((status, needs_input))
+    }
+}
+
+struct LocalTop<'a>(&'a BTreeMap<String, i64>);
+impl LocalTop<'_> {
+    fn get(&self) -> Option<String> {
+        TurnAcc::top(self.0)
+    }
+}
+
+// ── 줄 해석 ──────────────────────────────────────────────────────────────────
+
+/// 완결된 줄만 읽는다(쓰는 중인 마지막 줄은 다음 번에). 반환: 다음 읽기 위치
+const MAX_LINE: usize = 64 * 1024 * 1024;
+
+fn read_lines(path: &Path, start: u64, mut f: impl FnMut(u64, &[u8])) -> std::io::Result<u64> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut rd = BufReader::with_capacity(1 << 20, file);
+    let mut pos = start;
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    loop {
+        buf.clear();
+        // 한 줄이 64MB 를 넘으면(비정상) 메모리에 모으지 않고 줄 끝까지 흘려보낸다
+        let mut len = 0usize;
+        let mut oversized = false;
+        let complete = loop {
+            let chunk = rd.fill_buf()?;
+            if chunk.is_empty() {
+                break false;
+            }
+            let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (chunk.len(), false),
+            };
+            if !oversized {
+                if len + take > MAX_LINE {
+                    oversized = true;
+                    buf.clear();
+                } else {
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+            len += take;
+            rd.consume(take);
+            if done {
+                break true;
+            }
+        };
+        if !complete {
+            break; // 쓰는 중인 마지막 줄 — 다음 번에
+        }
+        if !oversized {
+            f(pos, &buf);
+        }
+        pos += len as u64;
+    }
+    Ok(pos)
+}
+
+fn feed(st: &mut FileState, line_start: u64, raw: &[u8], closed: &mut Vec<TurnAcc>, patch: &mut SessionPatch) {
+    let Ok(line) = serde_json::from_slice::<Line>(raw) else { return };
+    let typ = line.typ.as_deref().unwrap_or("");
+    let at = line.timestamp.as_deref().and_then(time::normalize);
+
+    match typ {
+        "custom-title" => {
+            if let Some(t) = line.custom_title.as_ref().filter(|t| !t.trim().is_empty()) {
+                patch.title = Some(t.trim().to_string());
+            }
+            return;
+        }
+        "agent-name" => {
+            if let Some(t) = line.agent_name.as_ref().filter(|t| !t.trim().is_empty()) {
+                patch.agent_name = Some(t.trim().to_string());
+            }
+            return;
+        }
+        "cost-state" => {
+            patch.cost_usd = line.total_cost.or(patch.cost_usd);
+            patch.lines_added = line.lines_added.or(patch.lines_added);
+            patch.lines_removed = line.lines_removed.or(patch.lines_removed);
+            return;
+        }
+        "user" | "assistant" | "system" | "attachment" => {}
+        _ => return,
+    }
+    if line.is_sidechain {
+        return;
+    }
+    if let Some(a) = &at {
+        if patch.first_at.as_deref().map(|f| a.as_str() < f).unwrap_or(true) {
+            patch.first_at = Some(a.clone());
+        }
+        if patch.last_at.as_deref().map(|l| a.as_str() > l).unwrap_or(true) {
+            patch.last_at = Some(a.clone());
+        }
+    }
+    if let Some(c) = &line.cwd {
+        if patch.cwd.is_none() {
+            patch.cwd = Some(c.clone());
+        }
+    }
+    if line.git_branch.is_some() {
+        patch.branch = line.git_branch.clone();
+    }
+    if line.version.is_some() {
+        patch.version = line.version.clone();
+    }
+
+    match typ {
+        "user" => on_user(st, line_start, &line, at, closed),
+        "attachment" => on_attachment(st, line_start, &line, at, closed),
+        "assistant" => {
+            if let Some(acc) = st.open.as_mut() {
+                on_assistant(acc, &line, at.clone(), patch);
+            }
+            answer_side(st, &line, at, closed);
+        }
+        "system" => {
+            if let Some(acc) = st.open.as_mut() {
+                on_system(acc, &line, at);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 작업 도중 들어온 입력. Claude Code 는 모델이 일하는 동안 보낸 말을 `user` 줄이 아니라
+/// `attachment{type: queued_command}` 로 대화에 끼워 넣는다 — 안 읽으면 그 질문이 통째로 사라진다.
+fn on_attachment(st: &mut FileState, line_start: u64, line: &Line, at: Option<String>, closed: &mut Vec<TurnAcc>) {
+    let Some(a) = &line.attachment else { return };
+    if a.get("type").and_then(Value::as_str) != Some("queued_command") {
+        return;
+    }
+    let prompt = a.get("prompt").map(text::text_of).unwrap_or_default();
+    if prompt.trim().is_empty() {
+        return;
+    }
+    let mode = a.get("commandMode").and_then(Value::as_str).unwrap_or("prompt");
+    let kind = a.get("origin").and_then(|o| o.get("kind")).and_then(Value::as_str).unwrap_or("");
+    let when = a
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(time::normalize)
+        .or(at.clone())
+        .unwrap_or_else(time::now_iso);
+    let uuid = a
+        .get("source_uuid")
+        .and_then(Value::as_str)
+        .or(line.uuid.as_deref())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("pos-{line_start}"));
+    let rewake = if mode == "task-notification" { text::rewake_message(&prompt) } else { None };
+    let echo = rewake.is_some();
+    let (mode, kind, prompt) = match rewake {
+        Some(msg) => ("prompt", "human", msg),
+        None => (mode, kind, prompt),
+    };
+    match (mode, kind) {
+        ("prompt", "human") | ("prompt", "") | ("prompt", "channel") => {
+            let c = if kind == "channel" {
+                text::clean_prompt(&text::strip_channel_tag(&prompt))
+            } else {
+                text::clean_prompt(&prompt)
+            };
+            if c.text.is_empty() && c.slash.is_none() {
+                return;
+            }
+            let (body, origin) = inbox_or(&c.text, if kind == "channel" { "channel" } else { "human" });
+            let body = text::redact(&body);
+            let Some(main) = st.open.as_mut() else {
+                // 돌던 요청이 없으면 평범한 새 요청이다
+                let mut acc = TurnAcc::new(uuid, when, line, body, c.slash, origin, None);
+                acc.echo = echo;
+                start_turn(st, line_start, acc, closed);
+                return;
+            };
+            main.step(&Some(when.clone()), "ask", None, text::clip(&body, 2000));
+            main.touch(&at);
+            let mut side = TurnAcc::new(uuid, when, line, body, c.slash, origin, None);
+            side.source = Some("mid-turn".into());
+            side.side = true;
+            side.echo = echo;
+            side.cwd = side.cwd.clone().or(main.cwd.clone());
+            side.branch = side.branch.clone().or(main.branch.clone());
+            st.side.push(side);
+        }
+        ("prompt", "peer") => {
+            if let Some(main) = st.open.as_mut() {
+                let (peer, body) = text::parse_peer(&prompt);
+                main.step(&Some(when), "ask", Some(peer.unwrap_or_else(|| "다른 세션".into())), text::safe(&body, 2000));
+                main.touch(&at);
+            }
+        }
+        ("task-notification", _) => {
+            if let Some(main) = st.open.as_mut() {
+                let (tool_id, status, summary) = text::parse_task_notification(&prompt);
+                if let Some(i) = tool_id.as_deref().and_then(|t| main.sub_by_tool.get(t)).copied() {
+                    main.subs[i].ended_at = Some(when.clone());
+                }
+                main.task_notes += 1;
+                main.step(&Some(when), "task", status, text::safe(&summary, 1000));
+                main.touch(&at);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 작업 도중 보낸 말의 답: **그 말을 받은 직후 모델 응답 하나(같은 requestId)** 안의 글만 답으로 붙인다.
+/// 그 응답에 글이 없으면(바로 도구만 부름) 억지로 붙이지 않는다 — 뒤의 진행 안내가 답처럼 보이는 것을 막는다.
+/// (Claude Code 는 도구 호출 앞의 짧은 글을 대화 기록에 남기지 않을 때가 있다 — 실측 2026-09-24)
+fn answer_side(st: &mut FileState, line: &Line, at: Option<String>, _closed: &mut Vec<TurnAcc>) {
+    if line.is_api_error {
+        return;
+    }
+    let rid = line.request_id.clone().unwrap_or_default();
+    for side in st.side.iter_mut() {
+        if side.answered {
+            continue;
+        }
+        match &side.reply_req {
+            None => side.reply_req = Some(rid.clone()),
+            Some(r) if *r == rid => {}
+            Some(_) => {
+                // 다음 응답이 시작됐다 — 이 말에 바로 단 글 모으기는 끝. 요청은 닫지 않는다: 앞 요청이 끝날 때까지
+                // "작업 중"이고, 끝나면 그 최종 답을 받는다(09-28 사용자: "앞 요청에 이어졌다가 아니라 각 요청에 맞는 응답을")
+                side.answered = true;
+                side.dirty = true;
+                continue;
+            }
+        }
+        if side.first_reply_at.is_none() {
+            side.first_reply_at = at.clone();
+        }
+        side.touch(&at);
+        if let Some(Value::Array(blocks)) = line.message.as_ref().and_then(|m| m.content.as_ref()) {
+            for t in blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                let t = if std::mem::take(&mut side.echo) { text::strip_echo(t) } else { t };
+                if t.is_empty() {
+                    continue;
+                }
+                let t = text::redact(t);
+                // 바로 단 글은 "지금 하는 일"로 보인다 — 최종 답은 앞 요청이 끝날 때(`settle_side`)
+                side.understanding = Some(match side.understanding.take() {
+                    Some(prev) => text::clip(&format!("{prev}\n\n{t}"), 4000),
+                    None => text::clip(&t, 4000),
+                });
+                side.step(&at, "text", None, text::clip(&t, 12_000));
+            }
+        }
+        return;
+    }
+}
+
+/// 작업 중에 보낸 말의 답 = 그 말을 받은 뒤 앞 요청이 낸 최종 글(Claude 는 도구 사이의 짧은 글을 기록에 남기지 않을 때가 있어
+/// 바로 단 글만으로는 답이 비기 쉽다 — 09-28 실측). 그 뒤에 쓴 글이 없으면 바로 단 글.
+fn settle_side(s: &mut TurnAcc, main: &TurnAcc) {
+    let wrote_after = main.steps.iter().any(|x| x.kind == "text" && x.at.as_deref().is_some_and(|a| a > s.prompt_at.as_str()));
+    let fin = if wrote_after { main.response.clone() } else { None };
+    s.response = fin.or_else(|| s.understanding.clone());
+    s.stopped_at = main.stopped_at.clone().or_else(|| main.last_activity_at.clone());
+}
+
+fn close_sides(st: &mut FileState, closed: &mut Vec<TurnAcc>) {
+    for mut s in st.side.drain(..) {
+        s.closed = true;
+        s.dirty = true;
+        closed.push(s);
+    }
+}
+
+fn start_turn(st: &mut FileState, line_start: u64, acc: TurnAcc, closed: &mut Vec<TurnAcc>) {
+    if let Some(prev) = st.open.as_mut() {
+        // 모델이 한 마디도 하기 전에 이어서 친 말(대기열 입력 등) → 같은 요청으로 합친다
+        let untouched = prev.api_calls() == 0 && prev.response.is_none() && prev.steps.is_empty();
+        if untouched && prev.slash.is_none() && acc.slash.is_none() && prev.origin == "human" && acc.origin == "human" && !acc.prompt_text.is_empty() {
+            let add = acc.prompt_text.trim();
+            if !add.is_empty() && !prev.prompt_text.contains(add) {
+                prev.prompt_text = format!("{}\n\n{}", prev.prompt_text.trim_end(), add);
+            }
+            prev.dirty = true;
+            return;
+        }
+    }
+    if let Some(prev) = st.open.as_ref() {
+        for side in st.side.iter_mut() {
+            settle_side(side, prev);
+        }
+    }
+    if let Some(mut prev) = st.open.take() {
+        prev.closed = true;
+        prev.dirty = true;
+        closed.push(prev);
+    }
+    close_sides(st, closed);
+    st.open = Some(acc);
+    st.offset = line_start;
+}
+
+/// AI Inbox 입력창에서 보낸 말이면 머리말을 떼고 출처를 `inbox` 로 남긴다
+fn inbox_or<'a>(body: &str, origin: &'a str) -> (String, &'a str) {
+    match crate::conoti::strip_inbox(body) {
+        Some(rest) => (rest.to_string(), "inbox"),
+        None => (body.to_string(), origin),
+    }
+}
+
+fn on_user(st: &mut FileState, line_start: u64, line: &Line, at: Option<String>, closed: &mut Vec<TurnAcc>) {
+    if line.is_compact_summary {
+        return;
+    }
+    let Some(msg) = &line.message else { return };
+    let content = msg.content.clone().unwrap_or(Value::Null);
+    let tool_results: Vec<&Value> = content
+        .as_array()
+        .map(|a| a.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")).collect())
+        .unwrap_or_default();
+
+    if !tool_results.is_empty() {
+        let Some(acc) = st.open.as_mut() else { return };
+        for tr in tool_results {
+            let id = tr.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+            if acc.pending_ask.as_deref() == Some(id) {
+                acc.pending_ask = None;
+            }
+            if let Some(&i) = acc.sub_by_tool.get(id) {
+                let body = text::text_of(tr.get("content").unwrap_or(&Value::Null));
+                if body.starts_with("Async agent launched") || body.contains("running in the background") {
+                    acc.subs[i].background = true;
+                } else {
+                    acc.subs[i].ended_at = at.clone();
+                }
+            }
+        }
+        acc.touch(&at);
+        return;
+    }
+
+    let raw = text::text_of(&content);
+    let kind = line.origin.as_ref().and_then(|o| o.kind.clone());
+    let uuid = line
+        .uuid
+        .clone()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("pos-{line_start}"));
+    let when = at.clone().unwrap_or_else(time::now_iso);
+
+    match kind.as_deref() {
+        Some("human") => {
+            let c = text::clean_prompt(&raw);
+            let (body, origin) = inbox_or(&c.text, "human");
+            let acc = TurnAcc::new(uuid, when, line, text::redact(&body), c.slash, origin, None);
+            start_turn(st, line_start, acc, closed);
+        }
+        Some("channel") => {
+            let (body, origin) = inbox_or(&text::strip_channel_tag(&raw), "channel");
+            let acc = TurnAcc::new(uuid, when, line, text::redact(&body), None, origin, None);
+            start_turn(st, line_start, acc, closed);
+        }
+        Some("peer") => {
+            let (peer, body) = text::parse_peer(&raw);
+            let acc = TurnAcc::new(uuid, when, line, text::redact(&body), None, "peer", peer);
+            start_turn(st, line_start, acc, closed);
+        }
+        Some("task-notification") if text::rewake_message(&raw).is_some() => {
+            // AI Inbox 대기 훅이 쉬던 세션을 깨워 넣은 말 → 새 요청
+            let msg = text::rewake_message(&raw).unwrap_or_default();
+            let (body, origin) = inbox_or(&msg, "human");
+            let mut acc = TurnAcc::new(uuid, when, line, text::redact(&body), None, origin, None);
+            acc.echo = true;
+            start_turn(st, line_start, acc, closed);
+        }
+        Some("task-notification") => {
+            if let Some(acc) = st.open.as_mut() {
+                let (tool_id, status, summary) = text::parse_task_notification(&raw);
+                if let Some(i) = tool_id.as_deref().and_then(|t| acc.sub_by_tool.get(t)).copied() {
+                    acc.subs[i].ended_at = at.clone();
+                }
+                acc.task_notes += 1;
+                acc.step(&at, "task", status, text::safe(&summary, 1000));
+                acc.touch(&at);
+            }
+        }
+        Some(other) => {
+            // auto-continuation 등: 같은 요청의 연장
+            if let Some(acc) = st.open.as_mut() {
+                let label = if other == "auto-continuation" { "사용량 한도가 풀려 이어서 진행".to_string() } else { text::safe(text::first_line(&raw), 200) };
+                acc.step(&at, "continue", Some(other.to_string()), label);
+                acc.touch(&at);
+            }
+        }
+        None => {
+            // 옛 형식(origin 없음): 사람이 친 줄 vs 중단 표시 vs 메타
+            if raw.starts_with("[Request interrupted") {
+                if let Some(acc) = st.open.as_mut() {
+                    acc.interrupted_at = at.clone().or_else(|| Some(time::now_iso()));
+                    acc.step(&at, "interrupt", None, "사용자가 중단함".into());
+                    acc.dirty = true;
+                }
+                return;
+            }
+            if line.is_meta || raw.trim_start().starts_with("<local-command-stdout>") {
+                return;
+            }
+            if raw.trim_start().starts_with("<channel ") {
+                let (body, origin) = inbox_or(&text::strip_channel_tag(&raw), "channel");
+                let acc = TurnAcc::new(uuid, when, line, text::redact(&body), None, origin, None);
+                start_turn(st, line_start, acc, closed);
+                return;
+            }
+            let c = text::clean_prompt(&raw);
+            if c.text.is_empty() && c.slash.is_none() {
+                return;
+            }
+            let (body, origin) = inbox_or(&c.text, "human");
+            let acc = TurnAcc::new(uuid, when, line, text::redact(&body), c.slash, origin, None);
+            start_turn(st, line_start, acc, closed);
+        }
+    }
+}
+
+fn on_assistant(acc: &mut TurnAcc, line: &Line, at: Option<String>, patch: &mut SessionPatch) {
+    let Some(msg) = &line.message else { return };
+    if acc.first_reply_at.is_none() {
+        acc.first_reply_at = at.clone();
+    }
+    acc.touch(&at);
+
+    if line.is_api_error {
+        acc.errors += 1;
+        let body = text::text_of(msg.content.as_ref().unwrap_or(&Value::Null));
+        acc.step(&at, "error", None, text::safe(&body, 400));
+        return;
+    }
+    if let Some(m) = msg.model.as_ref().filter(|m| !m.starts_with('<')) {
+        *acc.models.entry(m.clone()).or_default() += 1;
+        patch.model = Some(m.clone());
+    }
+    if let Some(e) = &line.effort {
+        *acc.efforts.entry(e.clone()).or_default() += 1;
+    }
+    if let (Some(rid), Some(u)) = (&line.request_id, &msg.usage) {
+        let usage = Usage::from(u);
+        match acc.calls.get_mut(rid) {
+            Some(old) => old.merge(&usage),
+            None => {
+                acc.calls.insert(rid.clone(), usage);
+                acc.call_order.push(rid.clone());
+            }
+        }
+    }
+
+    let Some(Value::Array(blocks)) = &msg.content else { return };
+    for b in blocks {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let t = b.get("text").and_then(Value::as_str).unwrap_or("").trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let t = if std::mem::take(&mut acc.echo) { text::strip_echo(t) } else { t };
+                if t.is_empty() {
+                    continue;
+                }
+                let t = text::redact(t);
+                if !acc.saw_tool && acc.understanding.is_none() {
+                    acc.understanding = Some(text::clip(&t, 4000));
+                }
+                acc.response = Some(text::clip(&t, 120_000));
+                acc.step(&at, "text", None, text::clip(&t, 12_000));
+            }
+            Some("tool_use") => {
+                acc.saw_tool = true;
+                let name = b.get("name").and_then(Value::as_str).unwrap_or("?").to_string();
+                let input = b.get("input").cloned().unwrap_or(Value::Null);
+                let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                *acc.tools.entry(name.clone()).or_default() += 1;
+                if matches!(name.as_str(), "Edit" | "Write" | "NotebookEdit" | "MultiEdit") {
+                    if let Some(p) = input.get("file_path").or_else(|| input.get("notebook_path")).and_then(Value::as_str) {
+                        *acc.files.entry(p.to_string()).or_default() += 1;
+                    }
+                }
+                match name.as_str() {
+                    "TodoWrite" => {
+                        if let Some(todos) = input.get("todos").and_then(Value::as_array) {
+                            acc.plan = todos
+                                .iter()
+                                .filter_map(|t| {
+                                    let text = t.get("content").and_then(Value::as_str)?;
+                                    Some(PlanItem {
+                                        text: text::safe(text, 500),
+                                        status: t.get("status").and_then(Value::as_str).unwrap_or("pending").to_string(),
+                                    })
+                                })
+                                .collect();
+                        }
+                    }
+                    "TaskCreate" => {
+                        if let Some(s) = input.get("subject").and_then(Value::as_str) {
+                            acc.plan.push(PlanItem { text: text::safe(s, 500), status: "pending".into() });
+                        }
+                    }
+                    "Agent" | "Task" => {
+                        acc.sub_by_tool.insert(id.clone(), acc.subs.len());
+                        acc.subs.push(Sub {
+                            agent_type: input
+                                .get("subagent_type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("general-purpose")
+                                .to_string(),
+                            description: text::safe(input.get("description").and_then(Value::as_str).unwrap_or(""), 300),
+                            background: input.get("run_in_background").and_then(Value::as_bool).unwrap_or(false),
+                            started_at: at.clone(),
+                            ended_at: None,
+                        });
+                    }
+                    "AskUserQuestion" => acc.pending_ask = Some(id.clone()),
+                    _ => {}
+                }
+                let summary = text::tool_summary(&name, &input, acc.cwd.as_deref());
+                acc.step(&at, "tool", Some(name), summary);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn on_system(acc: &mut TurnAcc, line: &Line, at: Option<String>) {
+    match line.subtype.as_deref() {
+        Some("turn_duration") => {
+            acc.active_ms = acc.active_ms.saturating_add(line.duration_ms.unwrap_or(0).clamp(0, 7 * 86_400_000));
+            acc.pending_bg = line.pending_bg.unwrap_or(0).max(0);
+            acc.stopped_at = at;
+            acc.dirty = true;
+        }
+        Some("away_summary") => {
+            if let Some(Value::String(s)) = &line.content {
+                let s = text::redact(s.trim());
+                acc.summary = Some(s.clone());
+                acc.step(&at, "summary", None, s);
+            }
+        }
+        Some("compact_boundary") => acc.step(&at, "compact", None, "대화가 길어 앞부분을 압축함".into()),
+        Some("api_error") => {
+            acc.errors += 1;
+            acc.step(&at, "error", None, "API 오류".into());
+        }
+        _ => {}
+    }
+}
+
+// ── 잡동사니 ─────────────────────────────────────────────────────────────────
+
+/// 훅이 쓰다 만 임시 파일(.tmp)이 한 시간 넘게 남아 있으면 지운다.
+fn clean_stale_spool() {
+    let Ok(rd) = std::fs::read_dir(paths::spool_dir()) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("tmp") {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .map(|d| d.as_secs() > 3600)
+            .unwrap_or(false);
+        if old {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+/// sessions/ 아래 rollout-*.jsonl (연/월/일 폴더 — 깊이 4까지)
+fn walk_rollouts(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, u64, i64)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            if depth < 4 {
+                walk_rollouts(&p, depth + 1, out);
+            }
+            continue;
+        }
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        let mtime = md.modified().ok().and_then(|m| m.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0);
+        out.push((p, md.len(), mtime));
+    }
+}
+
+/// Codex 기록 첫 줄(session_meta)의 payload — 첫 줄은 지시문이 들어 있어 크다(8MB 까지만 본다)
+fn codex_meta(path: &Path) -> Option<Value> {
+    use std::io::Read;
+    let f = File::open(path).ok()?;
+    let mut rd = BufReader::new(f).take(8 * 1024 * 1024);
+    let mut line = Vec::new();
+    rd.read_until(b'\n', &mut line).ok()?;
+    let v = serde_json::from_slice::<Value>(&line).ok()?;
+    (v.get("type").and_then(Value::as_str) == Some("session_meta")).then(|| v.get("payload").cloned()).flatten()
+}
+
+/// 하위 에이전트 스레드인가
+fn codex_subagent_file(path: &Path) -> bool {
+    let Some(p) = codex_meta(path) else { return false };
+    p.get("source").and_then(|s| s.get("subagent")).is_some() || p.get("thread_source").and_then(Value::as_str) == Some("subagent")
+}
+
+fn stem(p: &Path) -> String {
+    p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+pub fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: 시그널 0 은 보내지 않고 존재만 확인한다.
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub fn pid_alive(pid: i64) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        ok && code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(lines: &[Value]) -> (Vec<TurnAcc>, Option<TurnAcc>) {
+        let (closed, st) = run_state(lines);
+        (closed, st.open)
+    }
+
+    /// 닫힌 요청 + 읽은 뒤의 상태(열린 요청·아직 앞 요청을 따라가는 "작업 중에 보낸 말")
+    fn run_state(lines: &[Value]) -> (Vec<TurnAcc>, FileState) {
+        let mut st = FileState::fresh("s".into(), 0, 0, false, false);
+        st.primed = true;
+        let mut closed = Vec::new();
+        let mut patch = SessionPatch::default();
+        let mut pos = 0u64;
+        for l in lines {
+            let raw = serde_json::to_vec(l).unwrap();
+            feed(&mut st, pos, &raw, &mut closed, &mut patch);
+            pos += raw.len() as u64 + 1;
+        }
+        (closed, st)
+    }
+
+    fn human(uuid: &str, at: &str, text: &str) -> Value {
+        json!({"type":"user","uuid":uuid,"timestamp":at,"origin":{"kind":"human"},"promptSource":"typed",
+               "message":{"role":"user","content":text}})
+    }
+
+    fn said(at: &str, text: &str) -> Value {
+        json!({"type":"assistant","timestamp":at,"requestId":format!("r-{at}"),
+               "message":{"content":[{"type":"text","text":text}],"usage":{"output_tokens":1}}})
+    }
+
+    /// 실제 데이터 폴더를 건드리지 않는 수집기(메모리 DB)
+    fn ingestor() -> Ingestor {
+        let conn = Connection::open_in_memory().unwrap();
+        db::migrate(&conn).unwrap();
+        Ingestor {
+            conn,
+            installed_at: "2000-01-01T00:00:00.000Z".into(),
+            backfill_days: 7,
+            files: HashMap::new(),
+            live: HashMap::new(),
+            tick_no: 0,
+            codex_enabled: true,
+            codex_since: "2000-01-01T00:00:00.000Z".into(),
+            codex_names: HashMap::new(),
+            codex_index_mtime: -1,
+            codex_live: Some(HashSet::new()),
+            codex_written: HashMap::new(),
+        }
+    }
+
+    /// 실제 ~/.codex 기록을 메모리 DB 로 읽어 요약만 찍는다(내용은 찍지 않는다).
+    /// `cargo test codex_real_ingest -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn codex_real_ingest() {
+        let mut ing = ingestor();
+        ing.backfill_days = std::env::var("DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(7);
+        for _ in 0..50 {
+            let mut rep = Report::default();
+            ing.refresh_codex_live();
+            ing.scan_codex(&mut rep);
+            ing.refresh_codex(&mut rep);
+            if !rep.working {
+                break;
+            }
+        }
+        let q = |sql: &str| ing.conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        println!(
+            "codex sessions={} turns={} visible={} running={} unread={} with_title={} live={:?}",
+            q("SELECT COUNT(*) FROM session WHERE agent = 'codex'"),
+            q("SELECT COUNT(*) FROM turn"),
+            q("SELECT COUNT(*) FROM turn WHERE hidden = 0"),
+            q("SELECT COUNT(*) FROM turn WHERE status IN ('running','waiting','background')"),
+            q("SELECT COUNT(*) FROM turn WHERE hidden = 0 AND read_at IS NULL AND status IN ('done','interrupted','stopped')"),
+            q("SELECT COUNT(*) FROM session WHERE agent = 'codex' AND title IS NOT NULL"),
+            ing.codex_live.as_ref().map(|l| l.len()),
+        );
+        let mut st = ing
+            .conn
+            .prepare(
+                "SELECT s.id, s.cc_version, s.model, s.live_status, COUNT(t.id), SUM(t.tool_calls), SUM(t.api_calls), SUM(t.output_tokens),
+                        GROUP_CONCAT(t.status), SUM(LENGTH(t.prompt_text) > 0), SUM(t.response_text IS NOT NULL)
+                   FROM session s LEFT JOIN turn t ON t.session_id = s.id WHERE s.agent = 'codex' GROUP BY s.id ORDER BY s.last_at",
+            )
+            .unwrap();
+        let rows = st
+            .query_map([], |r| {
+                Ok(format!(
+                    "{:.8} v{:?} {:?} live={:?} turns={} tools={:?} calls={:?} out={:?} prompts={:?} replies={:?} [{}]",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, Option<i64>>(10)?,
+                    r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                ))
+            })
+            .unwrap();
+        for r in rows.flatten() {
+            println!("  {r}");
+        }
+    }
+
+    fn at(offset_min: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::minutes(offset_min)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn turns_of(ing: &Ingestor) -> i64 {
+        ing.conn.query_row("SELECT COUNT(*) FROM turn WHERE session_id = 's'", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn deleted_requests_stay_deleted_but_new_activity_comes_in() {
+        let ing = ingestor();
+        let mut rep = Report::default();
+        ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
+        let (mut old, _) = run(&[human("u1", &at(-30), "하나"), said(&at(-29), "끝"), human("u2", &at(-20), "둘")]);
+        assert!(ing.flush_turn("s", &mut old[0], &mut rep).is_some());
+        assert_eq!(turns_of(&ing), 1);
+
+        let out = crate::archive::delete_sessions(&ing.conn, &["s".into()]).unwrap();
+        assert_eq!(out.deleted, vec!["s".to_string()]);
+        assert_eq!(turns_of(&ing), 0);
+        // 원본을 다시 읽어도 쓰지 않는다 — 상태는 돌려준다(None 이면 틱마다 다시 쓰려 한다) · 바뀜도 만들지 않는다
+        ing.conn.execute("INSERT OR IGNORE INTO session (id) VALUES ('s')", []).unwrap();
+        let mut rep = Report::default();
+        assert!(ing.flush_turn("s", &mut old[0], &mut rep).is_some());
+        assert_eq!(turns_of(&ing), 0);
+        assert!(rep.changed.is_empty());
+        // 이어서 실행해 생긴 복사본 세션에 같은 요청이 있어도 되살리지 않는다
+        ing.conn.execute("INSERT INTO session (id) VALUES ('copy')", []).unwrap();
+        ing.flush_turn("copy", &mut old[0], &mut rep);
+        let copied: i64 = ing.conn.query_row("SELECT COUNT(*) FROM turn WHERE session_id = 'copy'", [], |r| r.get(0)).unwrap();
+        assert_eq!(copied, 0);
+
+        // 지운 뒤에 새 요청은 들어온다(수집 전에 친 요청도 — 시각이 아니라 ID 로 가린다)
+        let (mut new, _) = run(&[human("u3", &at(-25), "셋"), said(&at(-24), "완료"), human("u4", &at(3), "넷")]);
+        assert!(ing.flush_turn("s", &mut new[0], &mut rep).is_some());
+        assert_eq!(turns_of(&ing), 1);
+        // 지운 요청에 새 활동(백그라운드 작업 완료)이 붙으면 다시 받는다
+        let (mut cont, _) = run(&[
+            human("u1", &at(-30), "하나"),
+            said(&at(-29), "끝"),
+            json!({"type":"user","timestamp":at(1),"origin":{"kind":"task-notification"},
+                   "message":{"role":"user","content":"<task-notification><status>completed</status><summary>셸 끝</summary></task-notification>"}}),
+            said(&at(2), "백그라운드 결과"),
+            human("u5", &at(4), "다섯"),
+        ]);
+        assert!(ing.flush_turn("s", &mut cont[0], &mut rep).is_some());
+        assert_eq!(turns_of(&ing), 2);
+    }
+
+    #[test]
+    fn deleted_open_request_does_not_churn_every_tick() {
+        let mut ing = ingestor();
+        ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
+        let (_, open) = run(&[
+            human("u1", &at(-5), "하나"),
+            said(&at(-4), "끝"),
+            json!({"type":"system","subtype":"turn_duration","timestamp":at(-3),"durationMs":1000,"pendingBackgroundAgentCount":0}),
+        ]);
+        let mut acc = open.unwrap();
+        ing.flush_turn("s", &mut acc, &mut Report::default());
+        assert_eq!(crate::archive::delete_sessions(&ing.conn, &["s".into()]).unwrap().deleted.len(), 1);
+        acc.dirty = true;
+        let mut st = FileState::fresh("s".into(), 0, 0, false, false);
+        st.primed = true;
+        st.open = Some(acc);
+        ing.files.insert(PathBuf::from("/nowhere/s.jsonl"), st);
+        let mut first = Report::default();
+        ing.recheck_open(&mut first);
+        let mut second = Report::default();
+        ing.recheck_open(&mut second);
+        assert!(second.changed.is_empty(), "지운 요청이 틱마다 '바뀜'을 만들면 안 된다");
+        assert_eq!(turns_of(&ing), 0);
+    }
+
+    #[test]
+    fn pos_ids_are_matched_only_within_their_session() {
+        let ing = ingestor();
+        let mut rep = Report::default();
+        for sid in ["a", "b"] {
+            ing.conn.execute("INSERT INTO session (id) VALUES (?1)", params![sid]).unwrap();
+        }
+        let mut acc = run(&[human("u1", &at(-5), "x"), said(&at(-4), "y"), human("u2", &at(-3), "z")]).0.remove(0);
+        acc.uuid = "pos-100".into();
+        ing.flush_turn("a", &mut acc, &mut rep);
+        crate::archive::delete_sessions(&ing.conn, &["a".into()]).unwrap();
+        // 다른 세션의 같은 줄 위치 ID 는 다른 요청이다
+        ing.flush_turn("b", &mut acc, &mut rep);
+        let n: i64 = ing.conn.query_row("SELECT COUNT(*) FROM turn WHERE session_id = 'b'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn archived_session_comes_back_on_activity_after_archiving() {
+        let ing = ingestor();
+        let mut rep = Report::default();
+        ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
+        let (mut first, _) = run(&[human("u1", &at(-300), "하나"), said(&at(-299), "끝"), human("u2", &at(-298), "둘")]);
+        ing.flush_turn("s", &mut first[0], &mut rep);
+        crate::archive::set_archived(&ing.conn, &["s".into()], true).unwrap();
+        // 보관 시각을 두 시간 전으로 — 앱이 꺼져 있던 동안 온 결과를 흉내 낸다
+        ing.conn.execute("UPDATE session SET archived_at = ?1 WHERE id = 's'", params![at(-120)]).unwrap();
+        let hidden = |ing: &Ingestor| -> i64 { ing.conn.query_row("SELECT hidden FROM session WHERE id = 's'", [], |r| r.get(0)).unwrap() };
+
+        // 이미 있던 요청을 다시 써도(재수집) 보관은 그대로
+        ing.flush_turn("s", &mut first[0], &mut rep);
+        assert_eq!(hidden(&ing), 1);
+        // 보관 전에 친 요청이 늦게 들어와도 그대로
+        let (mut late, _) = run(&[human("u3", &at(-200), "셋"), said(&at(-199), "끝"), human("u4", &at(-198), "넷")]);
+        ing.flush_turn("s", &mut late[0], &mut rep);
+        assert_eq!(hidden(&ing), 1);
+        // 보관한 뒤에 온 요청(한 시간 전 — "최근" 창 밖)은 목록으로 되돌린다
+        let (mut next, _) = run(&[human("u5", &at(-60), "다섯"), said(&at(-59), "완료"), human("u6", &at(-58), "여섯")]);
+        ing.flush_turn("s", &mut next[0], &mut rep);
+        assert_eq!(hidden(&ing), 0);
+        let since: Option<String> = ing.conn.query_row("SELECT archived_at FROM session WHERE id = 's'", [], |r| r.get(0)).unwrap();
+        assert!(since.is_none());
+    }
+
+    #[test]
+    fn task_notification_extends_turn() {
+        let (closed, open) = run(&[
+            human("u1", "2026-09-23T01:00:00.000Z", "조사해줘"),
+            json!({"type":"assistant","timestamp":"2026-09-23T01:00:05.000Z","requestId":"r1",
+                   "message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"조사를 시작합니다"}],
+                   "usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100}}}),
+            json!({"type":"assistant","timestamp":"2026-09-23T01:00:06.000Z","requestId":"r1",
+                   "message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","id":"t1","name":"Agent",
+                   "input":{"description":"깃허브 조사","subagent_type":"research","run_in_background":true}}],
+                   "usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100}}}),
+            json!({"type":"system","subtype":"turn_duration","timestamp":"2026-09-23T01:00:07.000Z","durationMs":7000,"pendingBackgroundAgentCount":1}),
+            json!({"type":"user","timestamp":"2026-09-23T01:05:00.000Z","origin":{"kind":"task-notification"},
+                   "message":{"role":"user","content":"<task-notification><tool-use-id>t1</tool-use-id><status>completed</status><summary>Agent \"깃허브 조사\" finished</summary></task-notification>"}}),
+            json!({"type":"assistant","timestamp":"2026-09-23T01:05:10.000Z","requestId":"r2",
+                   "message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"결과입니다. 진행할까요?"}],
+                   "usage":{"input_tokens":3,"output_tokens":50,"cache_read_input_tokens":300}}}),
+            json!({"type":"system","subtype":"turn_duration","timestamp":"2026-09-23T01:05:11.000Z","durationMs":11000,"pendingBackgroundAgentCount":0}),
+        ]);
+        assert!(closed.is_empty());
+        let acc = open.unwrap();
+        assert_eq!(acc.api_calls(), 2);
+        assert_eq!(acc.totals().output, 70); // r1 은 최댓값 20, r2 50
+        assert_eq!(acc.context_tokens(), 303);
+        assert_eq!(acc.response.as_deref(), Some("결과입니다. 진행할까요?"));
+        assert_eq!(acc.understanding.as_deref(), Some("조사를 시작합니다"));
+        assert_eq!(acc.subs.len(), 1);
+        assert!(acc.subs[0].ended_at.is_some());
+        assert_eq!(acc.task_notes, 1);
+        assert_eq!(acc.active_ms, 18000);
+        assert_eq!(acc.pending_bg, 0);
+        assert!(acc.quiet_since_stop());
+    }
+
+    #[test]
+    fn new_prompt_closes_previous() {
+        let (closed, open) = run(&[
+            human("u1", "2026-09-23T01:00:00.000Z", "하나"),
+            json!({"type":"assistant","timestamp":"2026-09-23T01:00:05.000Z","requestId":"r1",
+                   "message":{"content":[{"type":"text","text":"끝"}],"usage":{"output_tokens":1}}}),
+            human("u2", "2026-09-23T01:10:00.000Z", "둘"),
+        ]);
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].closed);
+        assert_eq!(open.unwrap().prompt_text, "둘");
+    }
+
+    #[test]
+    fn interrupt_marks_turn() {
+        let (_, open) = run(&[
+            human("u1", "2026-09-23T01:00:00.000Z", "하나"),
+            json!({"type":"assistant","timestamp":"2026-09-23T01:00:05.000Z","requestId":"r1",
+                   "message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":1}}}),
+            json!({"type":"user","timestamp":"2026-09-23T01:00:09.000Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}),
+        ]);
+        assert!(open.unwrap().interrupted_last());
+    }
+
+    fn queued(at: &str, src: &str, mode: &str, kind: &str, prompt: &str) -> Value {
+        json!({"type":"attachment","uuid":format!("att-{src}"),"timestamp":at,
+               "attachment":{"type":"queued_command","prompt":prompt,"source_uuid":src,"commandMode":mode,
+                             "origin":{"kind":kind},"timestamp":at,"humanTurn":kind == "human"}})
+    }
+
+    #[test]
+    fn message_sent_while_working_becomes_its_own_pair() {
+        let (closed, st) = run_state(&[
+            human("u1", "2026-09-24T01:00:00.000Z", "중계 만들어 줘"),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:00:05.000Z","requestId":"r1",
+                   "message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],
+                   "usage":{"output_tokens":5}}}),
+            queued("2026-09-24T01:05:00.000Z", "q1", "prompt", "human", "키체인뭐야? 이게 왜 필요해?"),
+            queued("2026-09-24T01:05:30.000Z", "q2", "prompt", "peer", "<cross-session-message from=\"uds:/tmp/x.sock\" from-name=\"mini-01\">알려 드려요</cross-session-message>"),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:06:00.000Z","requestId":"r2",
+                   "message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"키체인은 macOS 비밀번호 금고입니다."},
+                   {"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":9}}}),
+            queued("2026-09-24T01:07:00.000Z", "q3", "task-notification", "task-notification",
+                   "<task-notification><tool-use-id>t9</tool-use-id><status>completed</status><summary>CI 끝</summary></task-notification>"),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:30:00.000Z","requestId":"r3",
+                   "message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"중계 완성"}],"usage":{"output_tokens":3}}}),
+        ]);
+        // 작업 중에 보낸 말 → 따로 한 쌍. 앞 요청이 끝날 때까지 열려 있고(작업 중), 바로 단 글(r2)은 "지금 하는 일"
+        assert!(closed.is_empty());
+        let side = &st.side[0];
+        assert!(side.side && !side.closed && side.answered);
+        assert_eq!(side.uuid, "q1");
+        assert_eq!(side.prompt_text, "키체인뭐야? 이게 왜 필요해?");
+        assert_eq!(side.prompt_at, "2026-09-24T01:05:00.000Z");
+        assert_eq!(side.source.as_deref(), Some("mid-turn"));
+        assert_eq!(side.understanding.as_deref(), Some("키체인은 macOS 비밀번호 금고입니다."));
+        assert_eq!(side.response, None);
+        // 원래 요청은 그대로 이어지고, 과정에 끼어든 말이 남는다
+        let main = st.open.clone().unwrap();
+        assert_eq!(main.response.as_deref(), Some("중계 완성"));
+        let asks: Vec<_> = main.steps.iter().filter(|s| s.kind == "ask").collect();
+        assert_eq!(asks.len(), 2);
+        assert_eq!(asks[1].name.as_deref(), Some("mini-01"));
+        assert_eq!(main.task_notes, 1);
+    }
+
+    #[test]
+    fn unanswered_side_closes_with_next_prompt() {
+        let (closed, _) = run(&[
+            human("u1", "2026-09-24T01:00:00.000Z", "하나"),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:00:05.000Z","requestId":"r1",
+                   "message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":1}}}),
+            queued("2026-09-24T01:01:00.000Z", "q1", "prompt", "human", "그것도 해 줘"),
+            human("u2", "2026-09-24T01:10:00.000Z", "둘"),
+        ]);
+        assert_eq!(closed.len(), 2);
+        assert!(closed.iter().any(|c| c.side && c.prompt_text == "그것도 해 줘" && c.closed));
+    }
+
+    #[test]
+    fn side_answer_is_only_the_immediate_response() {
+        // 질문 직후 응답(r2)이 도구만 부르고 글이 없으면 → 답 없음. 뒤 응답(r3)의 진행 안내를 답으로 붙이지 않는다
+        let lines = [
+            human("u1", "2026-09-24T01:00:00.000Z", "하나"),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:00:05.000Z","requestId":"r1",
+                   "message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":1}}}),
+            queued("2026-09-24T01:01:00.000Z", "q1", "prompt", "human", "키체인뭐야?"),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:01:05.000Z","requestId":"r2",
+                   "message":{"content":[{"type":"thinking","thinking":""}],"usage":{"output_tokens":1}}}),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:01:06.000Z","requestId":"r2",
+                   "message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":1}}}),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:01:30.000Z","requestId":"r3",
+                   "message":{"content":[{"type":"text","text":"다시 빌드합니다."}],"usage":{"output_tokens":1}}}),
+        ];
+        // 바로 단 글이 없다(r2 는 도구만) — 뒤 응답(r3)의 진행 안내를 "바로 단 글"로 붙이지 않는다
+        let (closed, st) = run_state(&lines);
+        let side = &st.side[0];
+        assert!(side.answered && !side.closed);
+        assert_eq!(side.understanding, None);
+        assert_eq!(closed.iter().filter(|c| c.side).count(), 0, "앞 요청이 끝나기 전에는 닫지 않는다");
+    }
+
+    #[test]
+    fn side_follows_the_running_request_and_gets_its_final_answer() {
+        // 09-28 실기기: 작업 중에 보낸 말이 곧바로 "완료 — 앞 요청 안에서 이어졌어요"로 닫혔다(바로 단 글이 기록에 없었다)
+        let mut ing = ingestor();
+        ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
+        // 판정 경계(조용한 2분)에서 멀리 — 초 단위
+        let at = |sec: i64| (chrono::Utc::now() + chrono::Duration::seconds(sec)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let lines = vec![
+            human("u1", &at(-400), "배포해 줘"),
+            json!({"type":"assistant","timestamp":at(-390),"requestId":"r1",
+                   "message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":1}}}),
+            queued(&at(-300), "q1", "prompt", "human", "끝나면 운영도 올려 줘"),
+            json!({"type":"assistant","timestamp":at(-290),"requestId":"r2",
+                   "message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":1}}}),
+            json!({"type":"assistant","timestamp":at(-10),"requestId":"r3",
+                   "message":{"content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":1}}}),
+        ];
+        let (closed, mut st) = run_state(&lines);
+        assert!(closed.is_empty());
+        let status = |ing: &Ingestor, uuid: &str| -> (String, Option<String>) {
+            ing.conn
+                .query_row("SELECT status, response_text FROM turn WHERE prompt_uuid = ?1", params![uuid], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        // 앞 요청이 일하는 동안: 작업 중 — 이 말을 받은 지 5분이 지나 자기 활동은 조용해도(프로세스 정보 없음) 앞 요청을 따른다
+        let mut rep = Report::default();
+        ing.follow_sides("s", &mut st);
+        for acc in st.side.iter_mut() {
+            ing.flush_turn("s", acc, &mut rep);
+        }
+        assert_eq!(status(&ing, "q1"), ("running".into(), None));
+        // 앞 요청이 최종 보고를 쓰고 끝남 → 그 보고가 이 말의 답
+        let fin = "dev 배포 끝, 운영도 올렸습니다.";
+        for l in [said(&at(-5), fin), json!({"type":"system","subtype":"turn_duration","timestamp":at(-4),"durationMs":1000})] {
+            let raw = serde_json::to_vec(&l).unwrap();
+            let mut closed = Vec::new();
+            feed(&mut st, 0, &raw, &mut closed, &mut SessionPatch::default());
+        }
+        st.open.as_mut().unwrap().dirty = true;
+        ing.files.insert(PathBuf::from("/nowhere/s.jsonl"), st);
+        ing.recheck_open(&mut Report::default());
+        assert_eq!(status(&ing, "q1"), ("done".into(), Some(fin.into())));
+    }
+
+    #[test]
+    fn queued_when_nothing_runs_is_a_normal_turn() {
+        let (_, open) = run(&[queued("2026-09-24T01:01:00.000Z", "q1", "prompt", "human", "새 요청")]);
+        let o = open.unwrap();
+        assert!(!o.side);
+        assert_eq!(o.prompt_text, "새 요청");
+    }
+
+    #[test]
+    fn inbox_messages_lose_header_and_keep_origin() {
+        let first = crate::conoti::wrap_desk("테스트 돌려 줘");
+        let chan = format!("<channel source=\"ai-inbox\" reply_id=\"dk1\">\n{}\n</channel>", crate::conoti::wrap_desk("하나 더"));
+        let (closed, open) = run(&[
+            human("u1", "2026-09-24T01:00:00.000Z", &first),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:00:05.000Z","requestId":"r1",
+                   "message":{"content":[{"type":"text","text":"네"}],"usage":{"output_tokens":1}}}),
+            json!({"type":"user","uuid":"u2","timestamp":"2026-09-24T01:02:00.000Z","origin":{"kind":"channel"},
+                   "message":{"role":"user","content":chan}}),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:02:05.000Z","requestId":"r2",
+                   "message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"ls"}}],"usage":{"output_tokens":1}}}),
+            queued("2026-09-24T01:03:00.000Z", "q1", "prompt", "human", &crate::conoti::wrap_desk("그것도")),
+        ]);
+        assert_eq!((closed[0].origin.as_str(), closed[0].prompt_text.as_str()), ("inbox", "테스트 돌려 줘"));
+        let o = open.unwrap();
+        assert_eq!((o.origin.as_str(), o.prompt_text.as_str()), ("inbox", "하나 더"));
+        // 작업 중에 보낸 말도 머리말 없이
+        let asks: Vec<_> = o.steps.iter().filter(|s| s.kind == "ask").collect();
+        assert_eq!(asks[0].text, "그것도");
+    }
+
+    #[test]
+    fn rewake_from_waiter_is_a_new_inbox_request() {
+        let wake = format!(
+            "<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n<system-reminder>\nStop hook blocking error from command \"Stop\": {}\n\n{}\n</system-reminder>",
+            crate::wake::NOTE,
+            crate::conoti::wrap_desk("이어서 배포해 줘")
+        );
+        let (closed, open) = run(&[
+            human("u1", "2026-09-24T01:00:00.000Z", "빌드해 줘"),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:00:05.000Z","requestId":"r1",
+                   "message":{"content":[{"type":"text","text":"빌드했습니다"}],"usage":{"output_tokens":1}}}),
+            json!({"type":"user","uuid":"w1","timestamp":"2026-09-24T01:10:00.000Z","origin":{"kind":"task-notification"},
+                   "promptSource":"system","message":{"role":"user","content":wake}}),
+            // 터미널에 보이라고 답 첫머리에 옮겨 적은 받은 말 — 앱에는 요청이 따로 있으니 뗀다
+            json!({"type":"assistant","timestamp":"2026-09-24T01:10:03.000Z","requestId":"r2",
+                   "message":{"content":[{"type":"text","text":"> 📥 AI Inbox 앱에서 보낸 사용자 메시지\n>\n> 이어서 배포해 줘\n\n배포합니다."}],"usage":{"output_tokens":1}}}),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:10:09.000Z","requestId":"r3",
+                   "message":{"content":[{"type":"text","text":"> 📥 인용은 첫 글만 뗀다\n\n배포했습니다"}],"usage":{"output_tokens":1}}}),
+        ]);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].response.as_deref(), Some("빌드했습니다"));
+        let o = open.unwrap();
+        assert_eq!((o.origin.as_str(), o.prompt_text.as_str()), ("inbox", "이어서 배포해 줘"));
+        assert_eq!(o.understanding.as_deref(), Some("배포합니다."));
+        assert_eq!(o.response.as_deref(), Some("> 📥 인용은 첫 글만 뗀다\n\n배포했습니다"));
+    }
+
+    #[test]
+    fn typed_prompt_keeps_echo_like_quote() {
+        let (_, open) = run(&[
+            human("u1", "2026-09-24T01:00:00.000Z", "인용해 줘"),
+            json!({"type":"assistant","timestamp":"2026-09-24T01:00:05.000Z","requestId":"r1",
+                   "message":{"content":[{"type":"text","text":"> 📥 받은 글\n\n끝"}],"usage":{"output_tokens":1}}}),
+        ]);
+        assert_eq!(open.unwrap().response.as_deref(), Some("> 📥 받은 글\n\n끝"));
+    }
+}

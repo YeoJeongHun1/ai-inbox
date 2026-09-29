@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2F6BFF"/>
+      <stop offset="1" stop-color="#1B3FB8"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#bg)"/>
+  <!-- 뒤 말풍선 (사용자) -->
+  <path d="M560 262h170c38 0 68 30 68 68v96c0 38-30 68-68 68h-40l-52 50v-50h-78c-38 0-68-30-68-68v-96c0-38 30-68 68-68z" fill="#9DB8FF" opacity="0.85"/>
+  <!-- 앞 말풍선 (AI) -->
+  <path d="M300 380h290c44 0 80 36 80 80v170c0 44-36 80-80 80H420l-92 84v-84h-28c-44 0-80-36-80-80V460c0-44 36-80 80-80z" fill="#FFFFFF"/>
+  <!-- 체크 -->
+  <path d="M340 548l66 64 132-134" fill="none" stroke="#2F6BFF" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 안 읽음 점 -->
+  <circle cx="742" cy="700" r="62" fill="#FF8A3D" stroke="#1F47C8" stroke-width="22"/>
+</svg>
