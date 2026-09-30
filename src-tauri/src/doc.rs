@@ -19,6 +19,22 @@ fn on(v: &Value, k: &str) -> Option<i64> {
     v.get(k).and_then(Value::as_i64)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 호환 시험용 — 이 스레드에서만 화면 시각의 UTC 오프셋(초)을 고정한다(러너 시간대와 무관하게 같은 문서가 나오도록)
+    pub static TEST_UTC_OFFSET: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn local(iso: &str) -> Option<DateTime<chrono::FixedOffset>> {
+    let d = DateTime::parse_from_rfc3339(iso).ok()?;
+    match TEST_UTC_OFFSET.with(|o| o.get()) {
+        Some(secs) => Some(d.with_timezone(&chrono::FixedOffset::east_opt(secs)?)),
+        None => Some(d.with_timezone(&Local).fixed_offset()),
+    }
+}
+
+#[cfg(not(test))]
 fn local(iso: &str) -> Option<DateTime<Local>> {
     DateTime::parse_from_rfc3339(iso).ok().map(|d| d.with_timezone(&Local))
 }

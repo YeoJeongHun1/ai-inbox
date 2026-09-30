@@ -44,6 +44,8 @@ fn temp_data_dir() {
 /// 0.8.0(v10) 모양의 DB 에 지어낸 데이터를 넣은 뒤 **0.10.0 이 마이그레이션**한 DB — 업그레이드한 사용자와 같다.
 fn upgraded_db() -> Connection {
     temp_data_dir();
+    // 기준선(0.8.0)은 한국 시간(UTC+9)에서 만들어졌다 — 러너가 UTC 여도 같은 화면 시각이 나오게 고정
+    crate::doc::TEST_UTC_OFFSET.with(|o| o.set(Some(9 * 3600)));
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(SCHEMA_V10).unwrap();
     db::set_meta(&c, "schema_version", "10").unwrap();

@@ -1266,7 +1266,8 @@ pub struct RuleCandidate {
 }
 
 fn as_dir(p: &str) -> String {
-    let mut n = norm(p);
+    // Windows 경로(C:\a\b)도 같은 규칙 문구(/a/b/)로 맞춘다
+    let mut n = norm(p).replace('\\', "/");
     if !n.ends_with('/') {
         n.push('/');
     }

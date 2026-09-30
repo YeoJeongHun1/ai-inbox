@@ -128,6 +128,9 @@ fn strip_private(p: &str) -> &str {
 pub fn is_internal_cwd(cwd: &str) -> bool {
     let dir = llm_scratch_dir();
     let Some(d) = dir.to_str() else { return false };
+    // Windows: 구분자가 `\\` 일 수도 `/` 일 수도 있고 대소문자를 가리지 않는다
+    let fold = |x: &str| if cfg!(windows) { x.replace('\\', "/").to_lowercase() } else { x.to_string() };
+    let (cwd, d) = (fold(cwd), fold(d));
     let (c, d) = (strip_private(cwd.trim_end_matches('/')), strip_private(d.trim_end_matches('/')));
     !d.is_empty() && (c == d || c.strip_prefix(d).is_some_and(|r| r.starts_with('/')))
 }
