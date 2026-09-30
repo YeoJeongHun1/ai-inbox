@@ -566,6 +566,8 @@ pub fn run() {
             api::app_restart,
         ])
         .setup(move |app| {
+            // 업데이트 직전에 멈춰 둔 대기 훅을 다시 받는다(wake::release_all)
+            wake::resume();
             build_main_window(app.handle())?;
             build_tray(app.handle())?;
             spawn_ingest(app.handle().clone(), rescan.clone());

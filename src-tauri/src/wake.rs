@@ -78,6 +78,53 @@ fn remove_if_mine(file: &Path, me: u32) {
     }
 }
 
+// ── 앱 업데이트 중 멈춤 ──────────────────────────────────────────────────────
+//
+// 대기자는 이 앱의 실행 파일로 돈다 — Windows 에서는 대기자가 떠 있는 동안 실행 파일이 잠겨, 업데이트 설치기(Tauri NSIS)가
+// Restart Manager 로 대기자를 **강제로** 끝낸다(훅이 비정상 종료로 끝나고 표식이 남는다). 그 전에 스스로 조용히(0) 끝나게 한다.
+
+const PAUSE_TTL: Duration = Duration::from_secs(120);
+
+fn pause_file() -> PathBuf {
+    paths::data_dir().join("wake.pause")
+}
+
+/// 멈춤 표식이 PAUSE_TTL 안에 찍혔나(업데이트가 실패해 앱이 남아도 저절로 풀린다)
+fn paused_at(file: &Path) -> bool {
+    std::fs::metadata(file).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|e| e < PAUSE_TTL)
+}
+
+/// 대기자 표식들에 적힌 pid
+fn marker_pids(dir: &Path) -> Vec<u32> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+    rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).filter_map(|e| marker_pid(&e.path())).collect()
+}
+
+/// 앱 업데이트 직전: 멈춤 표식을 남기고(대기자들이 0.5초 안에 스스로 끝나고, 새 대기자도 바로 끝난다) 끝나길 `wait` 까지 기다린다.
+/// 반환: 아직 살아 있는 대기자 수
+pub fn release_all(wait: Duration) -> usize {
+    paths::ensure_private_dir(&paths::data_dir());
+    release_in(&pause_file(), &waiter_dir(), wait, &crate::ingest::pid_alive)
+}
+
+fn release_in(pause: &Path, dir: &Path, wait: Duration, alive: &dyn Fn(i64) -> bool) -> usize {
+    let _ = std::fs::write(pause, now_ms().to_string());
+    let pids = marker_pids(dir);
+    let until = Instant::now() + wait;
+    loop {
+        let left = pids.iter().filter(|p| alive(**p as i64)).count();
+        if left == 0 || Instant::now() >= until {
+            return left;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 멈춤을 푼다 — 앱이 (다시) 시작할 때 · 업데이트가 실패했을 때
+pub fn resume() {
+    let _ = std::fs::remove_file(pause_file());
+}
+
 /// 앱 쪽: 이 세션에 대기자가 살아 있나(심장 박동 10초 안 + 프로세스 생존)
 pub fn waiter_alive(session_id: &str) -> bool {
     if !channel::valid_session_id(session_id) {
@@ -93,6 +140,11 @@ pub fn waiter_alive(session_id: &str) -> bool {
 /// 훅 진입점. 반환값이 종료 코드: 0 = 조용히 끝(아무것도 안 보임) · 2 = Claude 를 깨운다(stderr 가 보인다)
 pub fn run() -> i32 {
     if crate::llm::is_internal_env() {
+        return 0;
+    }
+    // 앱 업데이트 중 — 실행 파일을 쥐지 않게 바로 끝난다(다음 훅 이벤트나, 앱이 말을 넣을 때 설정 수정 시각 갱신으로 다시 잇는다)
+    let pause = pause_file();
+    if paused_at(&pause) {
         return 0;
     }
     let mut raw = Vec::new();
@@ -126,6 +178,11 @@ pub fn run() -> i32 {
         std::thread::sleep(POLL);
         // 더 새 대기자가 이어받았다
         if marker_pid(&file) != Some(me) {
+            return 0;
+        }
+        // 앱 업데이트가 시작됐다
+        if paused_at(&pause) {
+            remove_if_mine(&file, me);
             return 0;
         }
         // 세션이 끝났거나 /clear 로 다른 세션이 됐다
@@ -168,6 +225,40 @@ mod tests {
         assert!(takes_now(Some("busy")));
         assert!(!takes_now(Some("waiting")));
         assert!(!takes_now(None));
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("aiinbox-wake-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn marker(dir: &Path, sid: &str, pid: i64, at_ms: u64) {
+        std::fs::write(dir.join(format!("{sid}.json")), json!({"pid": pid, "claude_pid": 1, "at_ms": at_ms}).to_string()).unwrap();
+    }
+
+    #[test]
+    fn update_pause_waits_for_waiters_and_expires() {
+        let d = tmp_dir("pause");
+        let pause = d.join("wake.pause");
+        assert!(!paused_at(&pause));
+        let w = d.join("waiters");
+        std::fs::create_dir_all(&w).unwrap();
+        marker(&w, "a", 111, now_ms());
+        marker(&w, "b", 222, now_ms());
+        // 대기자가 모두 끝났으면 바로 돌아온다
+        let t = Instant::now();
+        assert_eq!(release_in(&pause, &w, Duration::from_secs(5), &|_| false), 0);
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(paused_at(&pause), "멈춤 표식이 찍힌다");
+        // 끝나지 않는 대기자는 기다린 만큼만
+        assert_eq!(release_in(&pause, &w, Duration::from_millis(300), &|p| p == 222), 1);
+        // 오래된 멈춤은 저절로 풀린다
+        let old = SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options().write(true).open(&pause).unwrap().set_modified(old).unwrap();
+        assert!(!paused_at(&pause));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
