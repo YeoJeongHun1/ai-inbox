@@ -340,7 +340,7 @@ pub fn queue(thread_id: &str, text: &str, images: &[PathBuf]) -> Result<(), Stri
 }
 
 fn launch_error(stderr: &[u8], stdout: &[u8], code: Option<i32>) -> String {
-    let all = format!("{}\n{}", String::from_utf8_lossy(stderr), String::from_utf8_lossy(stdout));
+    let all = format!("{}\n{}", crate::text::cli_text(stderr), crate::text::cli_text(stdout));
     if all.contains("Not inside a trusted directory") {
         return "Codex 가 이 폴더를 신뢰하지 않습니다 — 터미널에서 그 폴더로 가서 codex 를 한 번 열고 신뢰를 허용하세요".into();
     }

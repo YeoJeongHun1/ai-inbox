@@ -432,8 +432,8 @@ fn parse_short(stdout: &str) -> Option<String> {
 }
 
 fn launch_error(out: &std::process::Output) -> String {
-    let err = String::from_utf8_lossy(&out.stderr);
-    let all = format!("{err}\n{}", String::from_utf8_lossy(&out.stdout));
+    let err = crate::text::cli_text(&out.stderr);
+    let all = format!("{err}\n{}", crate::text::cli_text(&out.stdout));
     if all.contains("not trusted") {
         return "이 폴더는 아직 Claude Code 가 신뢰하지 않은 폴더입니다 — 터미널에서 그 폴더로 가서 claude 를 한 번 열고 신뢰를 허용하세요".into();
     }

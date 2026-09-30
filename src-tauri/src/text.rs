@@ -23,6 +23,39 @@ pub fn first_line(s: &str) -> &str {
     s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
 }
 
+/// CLI(claude·codex)가 낸 오류 글. UTF-8 이 아니면 Windows 에서는 로캘 코드 페이지(OEM → ANSI — 한국어 Windows 는 CP949)로
+/// 풀어 본다. 그래도 안 되면 깨진 바이트만 대체 문자로
+pub fn cli_text(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::{GetACP, GetOEMCP};
+        let pages = unsafe { [GetOEMCP(), GetACP()] };
+        if let Some(s) = pages.iter().find_map(|&cp| decode_codepage(cp, bytes)) {
+            return s;
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// 코드 페이지 `cp` 로 풀기 — 그 코드 페이지에 맞지 않는 바이트가 있으면 None
+#[cfg(windows)]
+fn decode_codepage(cp: u32, bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+    let len = i32::try_from(bytes.len()).ok().filter(|n| *n > 0)?;
+    unsafe {
+        let n = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; n as usize];
+        let m = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
+        (m > 0).then(|| String::from_utf16_lossy(&wide[..m as usize]))
+    }
+}
+
 /// 토큰·키로 보이는 문자열을 가린다. 앱 안에서만 보지만 MD 로 내보내 공유하거나 알림으로 뜰 수 있어서다.
 /// 완벽한 탐지는 아니다(README 의 보안 절 참고) — 흔한 형식을 잡는다. **저장하는 모든 텍스트 칸이 여기를 지난다.**
 pub fn redact(s: &str) -> String {
@@ -302,6 +335,23 @@ pub fn asks_user(response: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_text_keeps_utf8_and_falls_back_for_other_bytes() {
+        assert_eq!(cli_text("로그인이 필요합니다 — not logged in".as_bytes()), "로그인이 필요합니다 — not logged in");
+        // UTF-8 이 아닌 바이트도 글자로는 나온다(Windows 는 로캘 코드 페이지, 그 밖은 대체 문자)
+        assert!(cli_text(&[b'e', b'r', b'r', 0xC7, 0xD1]).starts_with("err"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cp949_error_text_is_decoded_on_windows() {
+        // "한글 오류" 를 CP949 로
+        let bytes = [0xC7, 0xD1, 0xB1, 0xDB, b' ', 0xBF, 0xC0, 0xB7, 0xF9];
+        assert_eq!(decode_codepage(949, &bytes).as_deref(), Some("한글 오류"));
+        assert_eq!(decode_codepage(949, &[0xC7]), None, "잘린 두 바이트 글자는 맞지 않는다");
+        assert_eq!(decode_codepage(949, &[]), None);
+    }
 
     #[test]
     fn slash_with_args() {

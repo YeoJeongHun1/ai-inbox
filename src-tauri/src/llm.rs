@@ -141,8 +141,8 @@ fn detect_codex() -> CliInfo {
     info.version = crate::codex::version();
     c.args(["login", "status"]);
     if let Some(o) = capture_simple(c, Duration::from_secs(10)) {
-        let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&o.stderr));
+        let mut text = crate::text::cli_text(&o.stdout);
+        text.push_str(&crate::text::cli_text(&o.stderr));
         (info.logged_in, info.login_kind) = parse_codex_login(&text, o.code == Some(0));
     }
     info
@@ -361,9 +361,9 @@ fn finish(out: Captured, file_text: Option<String>) -> R<String> {
         None => String::from_utf8_lossy(&out.stdout).to_string(),
     };
     if out.code != Some(0) {
-        let mut hay = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        let mut hay = crate::text::cli_text(&out.stdout).to_lowercase();
         hay.push('\n');
-        hay.push_str(&String::from_utf8_lossy(&out.stderr).to_lowercase());
+        hay.push_str(&crate::text::cli_text(&out.stderr).to_lowercase());
         return Err(classify(&hay, out.code));
     }
     answer = answer.trim().to_string();
