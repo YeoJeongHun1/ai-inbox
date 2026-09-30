@@ -452,7 +452,7 @@ impl Reader {
 
 /// 명령을 돌린다: 표준입력에 `input` 을 쓰고 닫고, 제한 시간을 넘기면 죽인다. 출력은 상한까지만 모은다
 pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captured, ExecErr> {
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::deliver::no_console(&mut cmd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // 자기 프로세스 그룹에서 돌려, 시간 초과 때 CLI 가 띄운 하위 프로세스까지 함께 끝낸다
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);

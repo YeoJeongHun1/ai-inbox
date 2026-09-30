@@ -143,6 +143,7 @@ pub(crate) fn codex_cmd_for(stdin_prompt: bool) -> Result<Command, String> {
         return Err("Windows 에서는 npm 래퍼(codex.cmd)로 여러 줄 말을 넘길 수 없습니다 — codex.exe 가 있는 설치가 필요합니다".into());
     }
     let mut c = Command::new(&bin);
+    crate::deliver::no_console(&mut c);
     for (k, _) in std::env::vars_os() {
         if k.to_str().is_some_and(inherited) {
             c.env_remove(k);

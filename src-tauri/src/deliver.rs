@@ -325,19 +325,30 @@ const INHERITED_ENV: &[&str] = &[
     "CLAUDE_EFFORT",
 ];
 
+/// Windows GUI 빌드(`windows_subsystem = "windows"`)에서 콘솔 프로그램(claude·codex)을 띄우면 콘솔 창이 잠깐 뜬다 — 창 없이 띄운다.
+/// 다른 OS 에서는 아무것도 하지 않는다
+pub(crate) fn no_console(c: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::os::windows::process::CommandExt::creation_flags(c, CREATE_NO_WINDOW);
+    }
+    c
+}
+
 pub(crate) fn claude_cmd() -> Result<Command, String> {
     let claude = find_claude().ok_or("claude 실행 파일을 찾지 못함")?;
     let mut c = Command::new(claude);
     for k in INHERITED_ENV {
         c.env_remove(k);
     }
-    c.stdin(Stdio::null());
+    no_console(&mut c).stdin(Stdio::null());
     Ok(c)
 }
 
 /// 명령을 돌리되 제한 시간을 넘기면 끊는다
 pub(crate) fn output_within(mut c: Command, limit: Duration) -> Option<std::process::Output> {
-    let mut child = c.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut child = no_console(&mut c).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let until = Instant::now() + limit;
     loop {
         match child.try_wait() {
@@ -537,6 +548,20 @@ mod tests {
         assert_eq!(decide_codex(Some(false), false), Route::Ended);
         assert_eq!(decide_codex(Some(false), true), Route::Busy(None), "이 앱이 띄운 exec 가 아직 돌면 기다린다");
         assert_eq!(decide_codex(None, false), Route::Live);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn console_programs_run_without_a_window_and_still_give_output() {
+        // CREATE_NO_WINDOW 를 걸어도 콘솔 프로그램이 돌고 출력·표준입력이 오간다
+        let mut c = Command::new("cmd");
+        c.args(["/C", "echo ok"]);
+        let out = output_within(c, Duration::from_secs(10)).expect("cmd");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+        let mut f = Command::new("findstr");
+        f.arg("x");
+        let o = crate::llm::exec_cli(f, b"x1\ny2\n", Duration::from_secs(10)).ok().expect("findstr");
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "x1");
     }
 
     #[test]
