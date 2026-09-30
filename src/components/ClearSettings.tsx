@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { api, POLICY_LABEL, type ClearOverview, type CliInfo, type HistoryStatus, type SchedPolicy, type SchedSettings } from "../api";
 import { fullTime } from "../format";
+import { kbd } from "../keys";
 import { ClearDialog } from "./ClearDialog";
 
 /** 설정 — /clear 로 끝난 대화의 기본 처리 */
@@ -116,7 +117,7 @@ export function HistorySection({ toast }: { toast: (m: string) => void }) {
     <section className="set">
       <h3>대화 이력 검색 (구독 AI 사용)</h3>
       <p className="set-note">
-        왼쪽 위 <strong>이력 찾기</strong>(⌘⇧H)에서 "예전에 어떤 작업을 했더라"를 물어볼 수 있습니다. 질문과 맞는 요청·결과 <strong>발췌</strong>만 골라, 이 컴퓨터에 설치·로그인해 둔{" "}
+        왼쪽 위 <strong>이력 찾기</strong>({kbd("⌘⇧H")})에서 "예전에 어떤 작업을 했더라"를 물어볼 수 있습니다. 질문과 맞는 요청·결과 <strong>발췌</strong>만 골라, 이 컴퓨터에 설치·로그인해 둔{" "}
         <strong>Claude Code</strong>(<code>claude -p</code>) 또는 <strong>Codex</strong>(<code>codex exec</code>)로 답을 만듭니다 — API 키는 필요 없습니다. 발췌는 그 구독 서비스의 서버(Claude → Anthropic · Codex → OpenAI)로 나가고,
         <strong> 질문 한 번마다 구독 사용량이 소모됩니다.</strong> 모델은 빈 임시 폴더에서 도구 없이 한 번만 돌며 파일·명령에 접근할 수 없고, 훅·MCP·개인 설정은 켜지 않습니다. 이 호출은 이 앱의 목록에 세션으로 나타나지 않습니다.
         비밀값은 저장할 때 이미 가려지지만 완전하지 않으니, 보내고 싶지 않으면 켜지 마세요. "모델 없이 찾기"는 켜지 않아도 되고 아무 데도 접속하지 않습니다.

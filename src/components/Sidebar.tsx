@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Archive, CheckCheck, Clock, History, Loader2, Pin, PinOff, Plus, Search, Settings, Smartphone, Trash2 } from "lucide-react";
 import type { Counts, Filter, SessionItem } from "../api";
 import { endedLabel, listTime } from "../format";
+import { kbd } from "../keys";
 import { tagColor, useTags } from "../tags";
 import { AboutBadge } from "./About";
 
@@ -128,7 +129,7 @@ export function Sidebar(p: Props) {
       <header className="side-head" data-tauri-drag-region>
         <span className="wordmark">AI Inbox</span>
         <div className="side-actions">
-          <button className="phone-btn new-btn" title="폴더를 골라 Claude Code·Codex 에 새 일을 시키기 (⌘N)" onClick={p.onNewTask}>
+          <button className="phone-btn new-btn" title={`폴더를 골라 Claude Code·Codex 에 새 일을 시키기 (${kbd("⌘N")})`} onClick={p.onNewTask}>
             <Plus size={15} />
             새 작업
           </button>
@@ -155,7 +156,7 @@ export function Sidebar(p: Props) {
             <Clock size={17} />
             {(p.sched.held > 0 || p.sched.active > 0) && <span className="sched-badge">{p.sched.held > 0 ? p.sched.held : p.sched.active}</span>}
           </button>
-          <button className="icon-btn" title="기록 — 지난 대화 검색·보낸 메시지·이미지 (⌘⇧F)" onClick={p.onArchive}>
+          <button className="icon-btn" title={`기록 — 지난 대화 검색·보낸 메시지·이미지 (${kbd("⌘⇧F")})`} onClick={p.onArchive}>
             <Archive size={17} />
           </button>
           <button className="icon-btn" title="모든 세션 모두 읽음 — 되돌릴 수 있습니다" onClick={p.onReadAll} disabled={!p.counts.unread}>
@@ -180,7 +181,7 @@ export function Sidebar(p: Props) {
       </label>
       <button
             className={`icon-btn ${p.historyChatOpen ? "on" : ""}`}
-            title="대화 이력 찾기 — 내 작업 이력에서 찾는 대화(세션에 지시하지 않음) (⌘⇧H)"
+            title={`대화 이력 찾기 — 내 작업 이력에서 찾는 대화(세션에 지시하지 않음) (${kbd("⌘⇧H")})`}
             onClick={p.onHistoryChat}
           >
             <History size={17} />

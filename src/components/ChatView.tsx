@@ -46,6 +46,7 @@ import {
   type Turn,
 } from "../api";
 import { clock, dayKey, dayParts, daysLeft, duration, fullTime, modelName, numeral, statusView, tokens, toolName, usd } from "../format";
+import { kbd } from "../keys";
 import { AttStrip, Lightbox } from "./Attachments";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
@@ -78,8 +79,6 @@ const tocSaved = () => {
     return false;
   }
 };
-
-const IS_MAC = navigator.userAgent.includes("Mac");
 
 const LIVE_LABEL: Record<string, string> = { busy: "작업 중", idle: "입력 대기", waiting: "승인 대기" };
 
@@ -715,7 +714,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
           )}
           <button
             className={`toc-btn ${tocOpen ? "on" : ""}`}
-            title={`이 세션의 요청 목록 — 골라서 그 자리로 가거나 하나만 보기 (${IS_MAC ? "⌘⇧O" : "Ctrl+Shift+O"})`}
+            title={`이 세션의 요청 목록 — 골라서 그 자리로 가거나 하나만 보기 (${kbd("⌘⇧O")})`}
             aria-pressed={tocOpen}
             onClick={() => (tocOpen ? closeToc() : setTocOpen(true))}
           >
@@ -743,7 +742,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
               await api.setHidden(sessionId, !s.archived);
               await load();
               onRead();
-              toast(s.archived ? "목록으로 되돌렸습니다" : "보관했습니다 — 기록(⌘⇧F) › 세션 › 보관함에서 되돌릴 수 있습니다");
+              toast(s.archived ? "목록으로 되돌렸습니다" : `보관했습니다 — 기록(${kbd("⌘⇧F")}) › 세션 › 보관함에서 되돌릴 수 있습니다`);
             }}
           >
             {s.archived ? <ArchiveRestore size={17} /> : <Archive size={17} />}

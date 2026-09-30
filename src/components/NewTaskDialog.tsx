@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ImagePlus, X } from "lucide-react";
 import { AGENT_LABEL, api, type Agent } from "../api";
+import { kbd } from "../keys";
 import { DraftTray, MAX_ATTS, hasFiles, imagesFromClipboard, useAttachDraft } from "./Attachments";
 
 interface Props {
@@ -167,7 +168,7 @@ export function NewTaskDialog({ onClose, onStarted, toast }: Props) {
             <button className="btn" disabled={att.items.length >= MAX_ATTS} onClick={() => picker.current?.click()}>
               <ImagePlus size={14} /> 이미지 붙이기
             </button>
-            <span className="set-note small inline">붙여넣기(⌘V)·끌어다 놓기도 됩니다 · {MAX_ATTS}장까지</span>
+            <span className="set-note small inline">붙여넣기({kbd("⌘V")})·끌어다 놓기도 됩니다 · {MAX_ATTS}장까지</span>
             <input
               ref={picker}
               type="file"
@@ -197,7 +198,7 @@ export function NewTaskDialog({ onClose, onStarted, toast }: Props) {
             <button className="btn" onClick={onClose} disabled={busy}>
               취소
             </button>
-            <button className="btn primary" disabled={!ready} onClick={start} title="시작 (⌘Enter)">
+            <button className="btn primary" disabled={!ready} onClick={start} title={`시작 (${kbd("⌘Enter")})`}>
               {busy ? "시작하는 중…" : "시작"}
             </button>
           </div>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { announceRead, api, type ReadBatch, type ToastAction, type Counts, type Filter, type HookStatus, type SessionItem, type UpdateState } from "./api";
 import { fullTime } from "./format";
+import { kbd } from "./keys";
 import { Sidebar, type SessionAction } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { DocPanel } from "./components/DocPanel";
@@ -276,7 +277,7 @@ export default function App() {
       }
       else if (a === "archive") {
         await api.setHidden(id, true);
-        toast("보관했습니다 — 기록(⌘⇧F) › 세션 › 보관함에서 되돌릴 수 있습니다");
+        toast(`보관했습니다 — 기록(${kbd("⌘⇧F")}) › 세션 › 보관함에서 되돌릴 수 있습니다`);
       } else if (a === "delete") {
         const { deleted } = await api.archiveDeleteSessions([id]);
         if (deleted.length) {
