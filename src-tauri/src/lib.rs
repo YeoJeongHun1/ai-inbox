@@ -261,7 +261,13 @@ fn spawn_phone(app: AppHandle, kick: Arc<AtomicBool>) {
             conoti::cleanup_legacy(&conn);
             let mut pipe = conoti::Pipeline::new(conn);
             let mut last_confirm = 0usize;
+            let mut last_sweep: Option<Instant> = None;
             loop {
+                // 강제로 끝난 대기 훅의 표식 정리(시작할 때와 10분마다)
+                if last_sweep.is_none_or(|t| t.elapsed() > Duration::from_secs(600)) {
+                    wake::sweep_dead();
+                    last_sweep = Some(Instant::now());
+                }
                 // 예약 전송: 시각이 된 예약을 대기열에 넣는다(같은 틱에 아래 파이프라인이 전달)
                 let srep = pipe.tick_schedule(chrono::Utc::now(), &sched::LiveProbe);
                 if !srep.alerts.is_empty() {

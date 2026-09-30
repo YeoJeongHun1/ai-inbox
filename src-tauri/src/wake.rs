@@ -125,6 +125,48 @@ pub fn resume() {
     let _ = std::fs::remove_file(pause_file());
 }
 
+// ── 죽은 대기자 정리 ─────────────────────────────────────────────────────────
+
+/// 심장 박동이 이만큼 멈춘 표식은 살아 있는 대기자의 것이 아니다(박동은 3초마다)
+const STALE_MS: u64 = 10 * 60 * 1000;
+/// 쓰다 만 임시 파일·읽을 수 없는 표식은 이만큼 지나면 지운다
+const LEFTOVER: Duration = Duration::from_secs(60);
+
+/// 대기자가 강제로 끝나면(설치기·작업 관리자·재부팅·전원) 표식이 남는다 — 앱이 시작할 때와 주기적으로 지운다. 반환: 지운 수
+pub fn sweep_dead() -> usize {
+    sweep_in(&waiter_dir(), &crate::ingest::pid_alive)
+}
+
+fn sweep_in(dir: &Path, alive: &dyn Fn(i64) -> bool) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let now = now_ms();
+    let mut removed = 0;
+    for e in rd.flatten() {
+        let p = e.path();
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > LEFTOVER);
+        let name = e.file_name().to_string_lossy().into_owned();
+        let dead = if name.ends_with(".tmp") {
+            old
+        } else if name.ends_with(".json") {
+            match std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+                // waiter_alive 와 같은 기준: 프로세스가 없거나 박동이 멈췄다
+                Some(v) => {
+                    let pid_ok = v.get("pid").and_then(Value::as_i64).is_some_and(alive);
+                    let beat = v.get("at_ms").and_then(Value::as_u64).unwrap_or(0);
+                    !pid_ok || now.saturating_sub(beat) > STALE_MS
+                }
+                None => old,
+            }
+        } else {
+            false
+        };
+        if dead && std::fs::remove_file(&p).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// 앱 쪽: 이 세션에 대기자가 살아 있나(심장 박동 10초 안 + 프로세스 생존)
 pub fn waiter_alive(session_id: &str) -> bool {
     if !channel::valid_session_id(session_id) {
@@ -258,6 +300,30 @@ mod tests {
         let old = SystemTime::now() - Duration::from_secs(600);
         std::fs::File::options().write(true).open(&pause).unwrap().set_modified(old).unwrap();
         assert!(!paused_at(&pause));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sweep_removes_only_dead_waiter_markers() {
+        let d = tmp_dir("sweep");
+        let now = now_ms();
+        marker(&d, "live", 111, now);
+        marker(&d, "dead", 222, now);
+        marker(&d, "stuck", 111, now - STALE_MS - 1000);
+        let old = SystemTime::now() - Duration::from_secs(600);
+        let aged = |name: &str, body: &str| {
+            std::fs::write(d.join(name), body).unwrap();
+            std::fs::File::options().write(true).open(d.join(name)).unwrap().set_modified(old).unwrap();
+        };
+        aged("x.333.tmp", "{");
+        aged("broken.json", "{");
+        std::fs::write(d.join("y.444.tmp"), "{").unwrap(); // 지금 쓰는 중일 수 있다
+        std::fs::write(d.join("note.txt"), "남의 파일").unwrap();
+        assert_eq!(sweep_in(&d, &|p| p == 111), 4);
+        let mut left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec!["live.json", "note.txt", "y.444.tmp"]);
+        assert_eq!(sweep_in(&d.join("none"), &|_| true), 0, "폴더가 없으면 아무것도 안 한다");
         let _ = std::fs::remove_dir_all(&d);
     }
 
