@@ -182,6 +182,8 @@ pub struct Device {
     pub can_reply: bool,
     /// 폰에서 세션 관리(보관함 보기·보관·고정·기록에서 지우기) 허용
     pub can_manage: bool,
+    /// 폰에서 예약 전송을 만들기·고치기·취소·처리(0.10.0, 기본 끔)
+    pub can_schedule: bool,
     pub created_at: String,
     pub last_seen: Option<String>,
     #[serde(skip)]
@@ -192,7 +194,7 @@ pub struct Device {
 
 pub fn devices(conn: &Connection) -> Vec<Device> {
     let Ok(mut st) = conn.prepare(
-        "SELECT pid, name, phone_pub, can_reply, created_at, last_seen, ticket, acct, can_manage FROM relay_device ORDER BY created_at",
+        "SELECT pid, name, phone_pub, can_reply, created_at, last_seen, ticket, acct, can_manage, can_schedule FROM relay_device ORDER BY created_at",
     ) else {
         return vec![];
     };
@@ -207,6 +209,7 @@ pub fn devices(conn: &Connection) -> Vec<Device> {
             ticket: r.get(6)?,
             acct: r.get(7)?,
             can_manage: r.get::<_, i64>(8)? != 0,
+            can_schedule: r.get::<_, i64>(9)? != 0,
         })
     })
     .map(|rows| rows.flatten().collect())
@@ -227,6 +230,8 @@ pub fn remove_device(conn: &Connection, shared: &Shared, pid: &str) -> Result<()
     shared.update_identity(|id| {
         id.psks.remove(pid);
     })?;
+    // 이 기기가 걸어 둔 예약은 거둔다 — 연결이 해제된 폰이 만든 무인 실행이 남지 않게
+    crate::sched::cancel_device(conn, pid);
     conn.execute("DELETE FROM relay_device WHERE pid = ?1", params![pid]).map_err(|e| e.to_string())?;
     shared.dropped.lock().unwrap().push(pid.to_string());
     Ok(())
@@ -270,6 +275,10 @@ pub struct Shared {
     pub changed: AtomicU64,
     /// 새 결과(푸시 후보) — 올리기만 한다
     pub finished: AtomicU64,
+    /// 예약이 전달되지 못했다는 알림(푸시 후보, 0.10.0) — 올리기만 한다. 푸시는 내용 없이 종류(`k`: sched_held·sched_ready·sched_missed)만 싣는다
+    pub sched_alert: AtomicU64,
+    /// 그 알림들의 푸시 종류 `k`(sched::PUSH_*) — 푸시가 나갈 때 비운다
+    pub sched_kinds: Mutex<Vec<&'static str>>,
     /// 설정이 바뀌었으니 다시 붙어라
     pub kick: AtomicBool,
     /// 지운 기기 — 열린 통로를 닫는다
@@ -286,6 +295,8 @@ impl Shared {
             pending: Mutex::new(None),
             changed: AtomicU64::new(0),
             finished: AtomicU64::new(0),
+            sched_alert: AtomicU64::new(0),
+            sched_kinds: Mutex::new(Vec::new()),
             kick: AtomicBool::new(false),
             dropped: Mutex::new(Vec::new()),
             identity: Mutex::new(None),
@@ -322,6 +333,13 @@ impl Shared {
 
     pub fn bump_finished(&self) {
         self.finished.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn bump_sched_alert(&self, kinds: Vec<&'static str>) {
+        if let Ok(mut k) = self.sched_kinds.lock() {
+            k.extend(kinds);
+        }
+        self.sched_alert.fetch_add(1, Ordering::SeqCst);
     }
 }
 

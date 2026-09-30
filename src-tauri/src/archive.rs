@@ -41,11 +41,13 @@ pub struct TurnHit {
     atts: Vec<String>,
     /// 보관한 세션의 요청(목록에는 없지만 검색에는 나온다)
     archived: bool,
+    /// 요청 태그(뗀 것 제외)
+    tags: Vec<crate::tags::TurnTag>,
 }
 
 #[derive(Serialize)]
 pub struct Page<T> {
-    items: Vec<T>,
+    pub(crate) items: Vec<T>,
     has_more: bool,
 }
 
@@ -70,21 +72,36 @@ pub fn snippet(text: &str, q: &str, width: usize) -> Option<String> {
     Some(s)
 }
 
+#[allow(dead_code)] // 시험이 쓴다 — 화면은 태그 거르기가 있는 search_turns_tagged
 pub fn search_turns(conn: &Connection, query: &str, before: Option<&str>, limit: i64) -> R<Page<TurnHit>> {
+    search_turns_tagged(conn, query, before, limit, None)
+}
+
+/// 검색어와 (선택) 태그 거르기. 태그를 골랐으면 검색어가 비어도 그 태그의 요청을 최신순으로 보여 준다.
+pub fn search_turns_tagged(conn: &Connection, query: &str, before: Option<&str>, limit: i64, filter: Option<&crate::tags::TagFilter>) -> R<Page<TurnHit>> {
     let q = query.trim();
-    if q.is_empty() {
+    let tag_sql = filter.and_then(|f| f.sql("t"));
+    if q.is_empty() && tag_sql.is_none() {
         return Ok(Page { items: vec![], has_more: false });
     }
     let limit = limit.clamp(1, 100);
     let like = like_of(q);
+    let text_clause = if q.is_empty() {
+        String::new()
+    } else {
+        "AND (t.prompt_text LIKE ?1 ESCAPE '\\' OR t.response_text LIKE ?1 ESCAPE '\\' OR t.summary LIKE ?1 ESCAPE '\\'
+                 OR s.live_name LIKE ?1 ESCAPE '\\' OR s.title LIKE ?1 ESCAPE '\\')"
+            .to_string()
+    };
     let sql = format!(
         "SELECT t.id, t.session_id, t.prompt_at, t.status, t.origin, t.prompt_text, t.summary, t.response_text, {NAME_COLS}, s.hidden
            FROM turn t JOIN session s ON s.id = t.session_id
           WHERE t.hidden = 0
             AND (?3 IS NULL OR t.prompt_at < ?3)
-            AND (t.prompt_text LIKE ?1 ESCAPE '\\' OR t.response_text LIKE ?1 ESCAPE '\\' OR t.summary LIKE ?1 ESCAPE '\\'
-                 OR s.live_name LIKE ?1 ESCAPE '\\' OR s.title LIKE ?1 ESCAPE '\\')
-          ORDER BY t.prompt_at DESC LIMIT ?2"
+            {text_clause}
+            {tag}
+          ORDER BY t.prompt_at DESC LIMIT ?2",
+        tag = tag_sql.map(|w| format!("AND {w}")).unwrap_or_default()
     );
     let mut st = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = st
@@ -95,6 +112,7 @@ pub fn search_turns(conn: &Connection, query: &str, before: Option<&str>, limit:
             let summary: Option<String> = r.get(6)?;
             let response: Option<String> = r.get(7)?;
             let (snippet, snippet_in) = snippet(&prompt, q, 160)
+                .filter(|_| !q.is_empty())
                 .map(|s| (s, "prompt"))
                 .or_else(|| summary.as_deref().and_then(|t| snippet(t, q, 160)).map(|s| (s, "summary")))
                 .or_else(|| response.as_deref().and_then(|t| snippet(t, q, 160)).map(|s| (s, "response")))
@@ -111,12 +129,18 @@ pub fn search_turns(conn: &Connection, query: &str, before: Option<&str>, limit:
                 snippet_in,
                 atts,
                 archived: r.get::<_, i64>(13)? != 0,
+                tags: Vec::new(),
             })
         })
         .map_err(|e| e.to_string())?;
     let mut items: Vec<TurnHit> = rows.flatten().collect();
     let has_more = items.len() as i64 > limit;
     items.truncate(limit as usize);
+    let ids: Vec<i64> = items.iter().map(|i| i.turn_id).collect();
+    let mut map = crate::tags::tags_of_turns(conn, &ids);
+    for i in &mut items {
+        i.tags = map.remove(&i.turn_id).unwrap_or_default();
+    }
     Ok(Page { items, has_more })
 }
 
@@ -159,7 +183,7 @@ fn session_rows_sql() -> String {
     format!(
         "SELECT * FROM (
            SELECT s.id, {NAME_COLS}, s.hidden, s.pinned, s.live_status IS NOT NULL AS live,
-                  a.n, a.first_at, a.last_at, a.active, a.unread
+                  a.n, a.first_at, a.last_at, a.active, a.unread, COALESCE(s.clear_state, '') = 'keep' AS keep
              FROM session s JOIN ({agg}) a ON a.session_id = s.id
          ) x WHERE 1 = 1",
         agg = agg_sql()
@@ -231,9 +255,10 @@ pub fn set_archived(conn: &Connection, ids: &[String], archived: bool) -> R<usiz
     Ok(n)
 }
 
-/// 한 번에 정리해도 되는 세션 — 목록에 있고, 고정하지 않았고, 실행 중이 아니고, 진행 중·안 읽은 결과·전달 대기 말이 없는 것
-const SAFE_TO_TIDY: &str = "x.hidden = 0 AND x.pinned = 0 AND x.live = 0 AND x.active = 0 AND x.unread = 0
-    AND NOT EXISTS (SELECT 1 FROM conoti_reply r WHERE r.session_id = x.id AND r.state IN ('confirm','delivering'))";
+/// 한 번에 정리해도 되는 세션 — 목록에 있고, 이력으로 보관하지 않았고, 고정하지 않았고, 실행 중이 아니고, 진행 중·안 읽은 결과·전달 대기 말이 없는 것
+const SAFE_TO_TIDY: &str = "x.hidden = 0 AND x.keep = 0 AND x.pinned = 0 AND x.live = 0 AND x.active = 0 AND x.unread = 0
+    AND NOT EXISTS (SELECT 1 FROM conoti_reply r WHERE r.session_id = x.id AND r.state IN ('confirm','delivering'))
+    AND NOT EXISTS (SELECT 1 FROM schedule sc WHERE sc.session_id = x.id AND sc.state = 'active')";
 
 /// 정리 제안: `short` 요청 1개 이하인 세션 · `idle_days` 그 기간 넘게 조용한 세션 — 한 번에 정리해도 되는 것만
 pub fn tidy_candidates(conn: &Connection, short: bool, idle_days: Option<i64>) -> R<Vec<String>> {
@@ -299,6 +324,7 @@ fn delete_locked(conn: &Connection, ids: &[String]) -> R<(Deleted, Vec<(String, 
                     "SELECT (SELECT COUNT(*) FROM turn WHERE session_id = s.id AND status IN ('running','background','waiting'))
                           + (SELECT COUNT(*) FROM conoti_reply WHERE session_id = s.id
                               AND (state IN ('confirm','delivering') OR (state = 'delivered' AND result_turn IS NULL AND delivered_at >= ?2)))
+                          + (SELECT COUNT(*) FROM schedule WHERE session_id = s.id AND state = 'active')
                           + COALESCE(s.live_status IN ('busy','waiting'), 0),
                             {NAME_COLS}
                        FROM session s WHERE s.id = ?1"
@@ -325,7 +351,13 @@ fn delete_locked(conn: &Connection, ids: &[String]) -> R<(Deleted, Vec<(String, 
             conn.execute("DELETE FROM reply_attachment WHERE reply_id = ?1", params![rid]).map_err(|e| e.to_string())?;
         }
         conn.execute("DELETE FROM conoti_reply WHERE session_id = ?1", params![id]).map_err(|e| e.to_string())?;
+        // 끝난 예약 기록(걸려 있는 예약이 있으면 위에서 이미 남겼다) — 이미지 연결도 함께
+        conn.execute("DELETE FROM schedule_run WHERE schedule_id IN (SELECT id FROM schedule WHERE session_id = ?1)", params![id]).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM schedule_att WHERE schedule_id IN (SELECT id FROM schedule WHERE session_id = ?1)", params![id]).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM schedule WHERE session_id = ?1", params![id]).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM sched_allow WHERE session_id = ?1", params![id]).map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM hook_event WHERE session_id = ?1", params![id]).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM turn_hint WHERE session_id = ?1", params![id]).map_err(|e| e.to_string())?;
         // 지운 요청의 ID — 원본을 다시 읽어도, 복사본 세션에 같은 요청이 있어도 되살리지 않는다
         conn.execute(
             "INSERT INTO turn_deleted (session_id, prompt_uuid, deleted_at)
@@ -549,7 +581,8 @@ pub fn stats(conn: &Connection) -> Stats {
     let one = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, Option<i64>>(0)).optional().ok().flatten().flatten().unwrap_or(0);
     // 세션 수·정리 제안은 요청 표를 한 번만 훑어 센다(tidy_candidates 와 같은 조건)
     let safe = "s.hidden = 0 AND s.pinned = 0 AND s.live_status IS NULL AND a.active = 0 AND a.unread = 0
-        AND NOT EXISTS (SELECT 1 FROM conoti_reply r WHERE r.session_id = s.id AND r.state IN ('confirm','delivering'))";
+        AND NOT EXISTS (SELECT 1 FROM conoti_reply r WHERE r.session_id = s.id AND r.state IN ('confirm','delivering'))
+        AND NOT EXISTS (SELECT 1 FROM schedule sc WHERE sc.session_id = s.id AND sc.state = 'active')";
     let (sessions, archived, tidy_short, tidy_idle) = conn
         .query_row(
             &format!(

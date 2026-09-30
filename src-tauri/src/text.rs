@@ -130,7 +130,7 @@ pub fn rewake_message(raw: &str) -> Option<String> {
     if !raw.contains("hook blocking error from command") {
         return None;
     }
-    let start = [crate::conoti::INBOX_HEADER, crate::conoti::REPLY_HEADER].iter().filter_map(|h| raw.find(h)).min()?;
+    let start = [crate::conoti::INBOX_HEADER, crate::conoti::SCHED_HEADER, crate::conoti::REPLY_HEADER].iter().filter_map(|h| raw.find(h)).min()?;
     let rest = &raw[start..];
     let end = rest.find("</system-reminder>").unwrap_or(rest.len());
     let msg = rest[..end].trim_end();

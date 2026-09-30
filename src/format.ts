@@ -1,4 +1,4 @@
-import type { Status } from "./api";
+import type { Ended, Status } from "./api";
 
 const WEEK = ["일", "월", "화", "수", "목", "금", "토"];
 
@@ -146,4 +146,18 @@ export function toolName(n: string | null | undefined): string {
 /** 홈 폴더를 ~ 로 */
 export function tildePath(p: string): string {
   return p.replace(/^\/Users\/[^/]+/, "~").replace(/^[A-Za-z]:\\Users\\[^\\]+/, "~");
+}
+
+/** 삭제 예정까지 남은 일수(올림, 0 이상). 예정 시각이 없으면 null */
+export function daysLeft(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  return Math.max(0, Math.ceil((new Date(iso).getTime() - Date.now()) / 86_400_000));
+}
+
+/** /clear 로 끝난 대화의 한 줄 표시: "끝남 · 삭제 예정 12일 후" · "끝남 · 이력 보관" · "끝남 · 처리 미정" */
+export function endedLabel(e: Ended): string {
+  if (e.state === "keep") return "끝남 · 이력 보관";
+  if (e.state === "ask") return "끝남 · 처리 미정";
+  const n = daysLeft(e.purge_at);
+  return n == null ? "끝남 · 삭제 예약" : n === 0 ? "끝남 · 곧 삭제" : `끝남 · 삭제 예정 ${n}일 후`;
 }

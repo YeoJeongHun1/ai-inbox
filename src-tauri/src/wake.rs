@@ -92,6 +92,9 @@ pub fn waiter_alive(session_id: &str) -> bool {
 
 /// 훅 진입점. 반환값이 종료 코드: 0 = 조용히 끝(아무것도 안 보임) · 2 = Claude 를 깨운다(stderr 가 보인다)
 pub fn run() -> i32 {
+    if crate::llm::is_internal_env() {
+        return 0;
+    }
     let mut raw = Vec::new();
     if std::io::stdin().take(1024 * 1024).read_to_end(&mut raw).is_err() {
         return 0;

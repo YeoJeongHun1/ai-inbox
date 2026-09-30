@@ -94,9 +94,9 @@ PC 가 먼저 보내는 알림: `{"ev":"changed"}`(무언가 바뀜 — 보고 �
 
 | 이름 | 보내는 값 `p` | 받는 값 `r` |
 |---|---|---|
-| `hello` | `{name, app, ticket?, acct?}` | `{desktop, version, can_reply, can_manage, paired?:{pid, psk, room}}` — `paired` 는 페어링 모드에서만. `pid`(16B)·`psk`(32B)는 b64url. `can_manage` 는 0.5.0 부터(없으면 false) |
-| `sessions` | `{filter?: "all"\|"unread"\|"attention"\|"active"\|"archived"}` | `{items:[Session], unread, attention, active, can_manage, archived?, tidy_short?, tidy_idle?}` — `archived`(보관함)·뒤의 세 수는 기록 관리를 허용한 기기만(§4-2) |
-| `chat` | `{sid, before?: seq, limit?: 1..60}` | `{session: SessionHead, turns:[Bubble], has_more, replies:[Reply]}` |
+| `hello` | `{name, app, ticket?, acct?}` | `{desktop, version, can_reply, can_manage, can_schedule, paired?:{pid, psk, room}}` — `paired` 는 페어링 모드에서만. `pid`(16B)·`psk`(32B)는 b64url. `can_manage` 는 0.5.0 부터, `can_schedule` 은 0.10.0 부터(없으면 false) |
+| `sessions` | `{filter?: "all"\|"unread"\|"attention"\|"active"\|"archived", tag?: "<이름>"}` | `{items:[Session], unread, attention, active, can_manage, can_schedule, archived?, tidy_short?, tidy_idle?}` — `archived`(보관함)·뒤의 세 수는 기록 관리를 허용한 기기만(§4-2). `tag`(0.10.0, §4-4) |
+| `chat` | `{sid, before?: seq, limit?: 1..60, tags?: ["<이름>"…], any?: bool}` | `{session: SessionHead, turns:[Bubble], has_more, replies:[Reply]}` |
 | `turn` | `{id}` | `{id, sid, title, markdown, status, needs_input, prev_id, next_id}` |
 | `read` | `{ids:[…]}` 또는 `{sid}` | `{}` |
 | `reply` | `{sid, turn_id?, text, rid, atts?:[id…], quote?: "prompt"\|"response"}` | `Reply` — `quote` 는 메신저식 답장(아래) |
@@ -105,6 +105,14 @@ PC 가 먼저 보내는 알림: `{"ev":"changed"}`(무언가 바뀜 — 보고 �
 | `unpair` | `{}` | `{}` — PC 가 이 기기를 지우고 통로를 닫는다 |
 | `manage` | `{op: "archive"\|"unarchive"\|"pin"\|"unpin"\|"delete", sids:[sid…]}` | `{n, deleted?:[sid…], skipped?:[이름…]}` — 세션 관리(§4-2) |
 | `tidy` | `{kind: "short"\|"idle"}` | `{n}` — 정리 제안대로 한 번에 보관(§4-2) |
+| `sched_add` | `{rid, sid, text, atts?, turn_id?, quote?, when, on_missed?, within_min?, busy?}` | `Sched` (+ `warnings:[문구]`) — 예약 만들기(§4-3) |
+| `sched_warn_off` | `{sid, off?: bool(기본 true)}` | `{}` — 그 세션의 예약 권한 안내를 끄거나(`off:false` 로 다시) 켠다. `sched_add` 와 같은 권한(§4-3) |
+| `sched_list` | `{sid?}` | `{items:[Sched], active, held, can_schedule}` — 걸려 있는 예약 + 최근 7일 끝난 것(§4-3) |
+| `sched_edit` | `{id, rev, text, atts?, rid?, when, on_missed?, within_min?, busy?}` | `Sched` — 발사 전 예약 고치기, `rev` 가 다르면 `conflict`(§4-3) |
+| `sched_cancel` | `{id}` | `{}` — 예약 취소(§4-3) |
+| `sched_act` | `{id, op: "send"\|"drop"}` | `{}` — 받지 못해 대기 중인 예약을 지금 보내거나 버린다(§4-3) |
+| `tag_list` | `{}` | `{items:[{n, c, minor, k}]}` — 전체 요청 태그(§4-4) |
+| `tag_set` | `{turn_id, add?:[이름], remove?:[이름]}` | `{tags:[{n, c}]}` — 요청의 태그 바꾸기(§4-4) |
 
 - `ticket` 은 §5 의 푸시 티켓. 폰은 연결할 때마다 새로 받아 넘긴다.
 - `acct` 는 로그인 사용자 id 로 만든 `hex(SHA-256("conoti-ai-acct/1" ‖ user_id))[0..16]`. 같은 계정의 폰이 여럿이면
@@ -115,7 +123,7 @@ PC 가 먼저 보내는 알림: `{"ev":"changed"}`(무언가 바뀜 — 보고 �
   계정 없이 페어링한 옛 기기는 처음 온 계정에 묶인다. (0.5.1~0.5.2 는 `owner` 로 묶인 계정을 알려 주었다 — 0.5.3 부터 싣지 않는다.)
   ⚠️ 이것은 **보안 경계가 아니다** — `acct` 는 폰이 스스로 알리는 값이다. 기기 키를 가진 폰(= 이미 허용한 폰)이 값을 꾸미는 것은 막지 못한다.
   목적은 정직한 앱에서 계정마다 연결을 나누는 것이고, 접근 통제는 기기 키 + PC 의 허용이 맡는다.
-- 오류 코드: `bad_request` · `not_found` · `rejected` · `unknown_method` · `hello_required` · `account` · `unpaired`(PC 에서 해제됨 — 폰은 저장된 연결을 지운다) ·
+- 오류 코드: `bad_request` · `not_found` · `rejected` · `conflict`(0.10.0 — 예약 `rev` 충돌·이미 발사됨) · `unknown_method` · `hello_required` · `account` · `unpaired`(PC 에서 해제됨 — 폰은 저장된 연결을 지운다) ·
   페어링 중 `denied`(거절·2분 초과) · `busy`(다른 기기가 허용 대기 중).
 - `rid` 는 폰이 만든 UUID. 같은 `rid` 로 다시 보내면 처음 결과를 돌려준다.
 - `text` 는 1~4,000자(이미지를 붙이면 0자도 된다). 제어문자는 줄바꿈·탭만 허용.
@@ -162,6 +170,64 @@ PC 가 먼저 보내는 알림: `{"ev":"changed"}`(무언가 바뀜 — 보고 �
 - `tidy` — `short`: 요청 1개 이하 · `idle`: 30일 넘게 조용함. 고정·실행 중·진행 중·안 읽은 결과·전달 대기 말이 있는 세션은 빠진다.
 - 성공하면 PC 가 모든 폰에 `{"ev":"changed"}` 를 보낸다(PC 화면도 다시 읽는다). 보관한 세션도 새 요청·결과가 오면 저절로 목록으로 돌아온다.
 
+
+### 4-3. 예약 전송 (0.10.0) — 시각·내용은 PC 에만, 폰은 요청만
+
+정한 시각에 세션에 말을 넣는다. **PC 의 AI Inbox 가 켜져 있을 때만** 전달된다(서버 저장 0 — §1 약속 그대로 · PC 가 꺼진 동안 폰에서 거는 예약은 없다). 정본 설명은 `docs/SCHEDULE.md`.
+
+- **권한**: `sched_add`·`sched_edit`·`sched_cancel`·`sched_act` 는 기기별 **"예약 허용"**(`can_schedule`, 기본 끔 — PC 설정 → 폰 연결에서 켠다)과 `can_reply` 가 모두 필요하다.
+  아니면 `rejected`. PC 의 "폰 답 받기 멈춤"이 켜져 있어도 `rejected`. `sched_list` 는 페어링된 기기면 볼 수 있다(읽기만). 보관한 세션의 예약은 기록 관리를 허용한 기기만 본다.
+  `hello`·`sessions` 의 `can_schedule` 은 이 값 그대로다. `sched_add` 는 세션 차단(폰 답 막기)·기기 허용·전체 멈춤을 만들 때 한 번, **발사 순간 한 번 더** 본다 —
+  그사이 기기를 해제했거나 예약 허용·답 보내기를 껐다면 발사하지 않고 알림만 간다(기기를 해제하면 그 기기가 건 예약은 PC 가 거둔다).
+- **`when`** — 셋 중 하나:
+  - `{"after_min": 30}` — 지금부터 N분 뒤(1~43,200).
+  - `{"at": "2026-10-01T00:00:00Z", "tz": "Asia/Seoul"?}` — 절대 시각(RFC 3339). 폰이 자기 시간대로 풀어 보낸다. `tz` 는 표시용(모르면 UTC).
+  - `{"local": "2026-10-01T09:00", "tz": "Asia/Seoul"}` — 현지 시각 + IANA 시간대. **PC 가 푼다**: 서머타임으로 없는 시각은 직후 첫 유효 시각으로 밀고, 두 번 있는 시각은 첫 번째로 잡는다.
+  과거(5초 안 포함)이거나 366일 넘게 먼 시각은 `rejected`.
+- **`on_missed`** — 앱이 꺼져 있었거나 PC 가 절전이라 시각을 놓쳤을 때(예정 시각보다 2분 넘게 늦으면): `run_once`(켜지는 대로 한 번 실행) · `skip`(실행하지 않고 알림만) · `within`(늦어도 `within_min` 분 안이면 실행, 1~1,440, 기본 60). 기본값은 `within` 60분.
+- **`busy`** — 그 시각에 세션이 작업 중일 때: `interrupt`(바로 끼움 — 도구 사이에 읽힌다) · `after_work`(작업이 끝난 뒤) · `after_quiet`(방해금지 시간이 끝난 뒤). 없으면(`null`) PC 설정의 규칙을 따른다
+  (예약 → 세션 규칙 → 태그 규칙 → 방해금지 시간대 → 전역 기본 `after_work` 순).
+- **`rid`** — 폰이 만든 UUID(형식은 `reply` 와 같다). 같은 `rid` 로 `sched_add` 를 다시 보내면 **처음 만든 예약을 그대로** 돌려준다(두 번 만들지 않는다).
+- **이미지**: 폰은 `att` 로 먼저 올리고(`rid` = `sched_add` 의 `rid`, §4-1) `sched_add.atts` 에 id 를 싣는다. PC 는 그 이미지를 예약에 묶어 **예약이 걸려 있는 동안은 1시간이 지나도 지우지 않는다**(발사되면 보낸 말이 이어받는다).
+  `sched_edit` 로 새 이미지를 붙일 때는 `rid` 도 보낸다(이 기기가 그 `rid` 로 올린 것만). 다른 기기·다른 `rid` 의 id 는 `bad_request`. 예약의 이미지는 `att_get` 으로 미리볼 수 있다.
+- **`Sched`**:
+
+```jsonc
+{ "id":"sc0123456789abcdef", "sid":"…", "name":"세션 이름", "text":"…", "quote":null|"prompt"|"response", "turn_id":null|42,
+  "atts":["<id>",…],
+  "at":"2026-10-01T00:30:00.000Z"|null,   // 다음 발사 시각(UTC). 발사된 뒤엔 null
+  "kind":"once|after", "tz":"Asia/Seoul",
+  "on_missed":"run_once|skip|within", "within_min":60|null, "busy":null|"interrupt|after_work|after_quiet",
+  "state":"active|done|cancelled", "rev":1, "created_at":"ISO", "mine":true,   // mine = 이 기기가 만든 예약
+  "run":null|{ "at":"발사 예정이었던 시각", "state":"…", "reason":"…"|null, "note":"…"|null } }
+```
+
+  `run.state`: `pending`(발사됨·판단 전) · `deferred`(바쁜 세션·방해금지·승인 대기 때문에 미룸, `note` 에 이유) · `fired`(세션에 넣는 중) · `delivered`(세션에 들어감) ·
+  `handled`(그 말로 요청이 시작됨) · **`held`(세션이 받을 수 없어 자동으로 보내지 않고 대기 — 사용자가 보내기/버리기)** · `missed`(놓침 정책이 실행하지 않음) · `failed`(정책상 막음 — 허용 세션 목록 밖·기기 허용 꺼짐) · `cancelled`.
+  `run.reason`(held): `ended`(세션이 꺼져 있음) · `terminal`(훅 없는 터미널) · `perm`(권한 승인 대기 10분 넘음) · `busy_limit`(3시간 넘게 못 넣음) · `stuck`(대기열에서 10분 넘게 못 받음) · `rejected` · `cap`(하루 발사 100건 한도). 폰이 번역한다.
+- **`held` 와 알림**: 꺼진 세션·훅 없는 터미널·승인 대기에서 멈춘 세션의 예약은 **대기열에 넣지 않고** `held` 로 둔다. 알림은 **한 번**(발사할 때), 세션이 다시 받을 수 있게 되면 **한 번 더**(`ended`·`terminal`·`perm` 사유만) — 그 뒤엔 없다.
+  자동 전달은 없다: `sched_act {id, op:"send"}` 는 폰 답과 같은 검사(기기 허용·전체 멈춤·세션 차단·**꺼진 세션은 PC 의 "이어서 실행" 설정이 켜져 있어야** — 아니면 `rejected` + 이유)를 통과해야 하고 PC 의 "데스크톱 확인" 옵션이 켜져 있으면 확인 대기로 들어간다.
+  `op:"drop"` 은 항상 된다. 7일 동안 처리하지 않으면 PC 가 버린다.
+- **오류**: `not_found`(없는 예약·세션) · `conflict`(`rev` 불일치 · 이미 발사됨 — 목록을 다시 받아 고치라는 뜻) · `rejected`(권한·정책·형식 밖 값의 설명 문구) · `bad_request`(형식).
+  한도: 세션당 걸려 있는 예약 20개 · 전체 200개 · 하루 발사 100건.
+- **`Session`·`SessionHead` 선택 필드**: `sessions` 항목과 `chat` 응답의 세션 머리(`session`)에 `sched_n`(걸려 있는 예약 수)·`sched_held`(그중 처리를 기다리는 수) — 두 곳이 같은 값이다. 옛 폰은 무시하고, 옛 PC 는 보내지 않는다(없으면 0 으로 본다).
+- **권한 안내 필드**(선택): `sessions` 항목과 `Sched`(`sched_add`·`sched_list`·`sched_edit` 결과)에 `perm` — 세션의 마지막 권한 모드 문자열(`default`·`plan`·`acceptEdits`·`auto`·`dontAsk`·`bypassPermissions`, PC 가 훅으로 안 값 · 모르면 `null` = "확인 불가") · `sched_warn` — 예약할 때 제약·사전 준비 안내를 띄워야 하는가(전부 허용 모드가 아니고 사용자가 그 세션의 안내를 끄지 않았을 때 `true`). `perm == "bypassPermissions"` 는 승인 없이 실행되는 세션이므로 폰은 "예약 내용은 신뢰하는 것만" 한 줄만 고지하면 된다.
+  폰이 띄울 안내 문구는 PC 화면(`ScheduleDialog`)과 같은 내용을 쓰고(`docs/SCHEDULE.md` §5-1), "다시 안 보기"는 `sched_warn_off` 로 PC 에 저장한다. **`bypassPermissions` 세션도 예약을 받는다.** 모드는 마지막 훅 값이라 세션 중에 바뀌면 달라질 수 있다. **`perm == null`(확인 불가)이어도 PC 는 `sched_warn: true` 를 보낸다** — 폰은 "확인하지 못했어요" 경고를 띄운다(`perm` 이 `bypassPermissions` 가 아니고 사용자가 끄지 않았으면 언제나 `true`). **필드 자체가 없는 것은 옛 PC 뿐**이며 그때만 안내를 숨긴다. 옛 폰은 새 필드를 무시하고, 옛 PC 는 필드를 안 보내며 `sched_warn_off` 에 `unknown_method` 를 돌려준다.
+- **푸시(§5)**: 예약이 전달되지 못했을 때 PC 는 폰 앱이 닫혀 있을 때만 같은 푸시 통로로 `POST /v1/relay/push {"ticket":"…","k":"<종류>"}` 를 보낸다(20초에 한 번까지 · 내용 없음). 종류는 못 받는 예약 held·정책상 막힘 failed → `sched_held`, 다시 받을 수 있게 됨 back → `sched_ready`, 놓침 missed → `sched_missed`(§5).
+  서버가 `k` 를 알면 종류별 문구(기기 언어)를 보내고, **옛 서버는 `k` 를 무시하고 일반 문구("새 결과가 도착했어요")를 보낸다**(§5).
+  폰 앱이 열려 있으면 PC 가 `{"ev":"changed"}` 를 보내니 `sched_list` 를 다시 부르면 된다.
+
+### 4-4. 요청 태그 (0.10.0)
+
+- `tag_list {}` → `{items:[{n, c, minor, k}]}` — 전체 태그(이름·색 `#rrggbb`·작은 태그 여부·붙은 요청 수). 페어링된 기기면 누구나.
+- `tag_set {turn_id, add?:[이름], remove?:[이름]}` → `{tags:[{n, c}]}`(바뀐 뒤 그 요청의 태그). `add` 는 직접 붙임(`manual`) — 없는 이름은 **새로 만들고**(색 자동), 있는 이름은 **대소문자 무시로 재사용**한다.
+  `remove` 는 뗌(`off` — 자동 규칙이 다시 붙이지 않는다). 이름은 1~24자·줄바꿈 없음, 한 번에 add·remove 각 10개까지, 전체 태그는 300개까지. **기록 관리 허용(`can_manage`)이 필요**하고(아니면 `rejected`),
+  PC 의 "폰 답 받기 멈춤"이 켜져 있어도 `rejected`. 숨긴 요청·보관 세션(권한 없음)은 `not_found`. 성공하면 `{"ev":"changed"}` 가 간다.
+- `sessions {tag?}` — 그 이름(대소문자 무시)의 태그가 붙은 요청이 **하나라도 있는** 세션만. 없는 태그는 빈 목록. PC 가 **전체 요청 태그**로 거른다(세션 항목의 `tags` 는 여전히 대표 3개).
+- `chat {sid, tags?:[이름…], any?:bool, before?, limit?}` — 요청을 태그로 거른다. 기본은 **모두** 가진 요청만, `any:true` 면 하나라도. 없는 이름은 모두-조건에서는 아무 요청도 통과시키지 않고(빈 결과),
+  하나라도-조건에서는 무시한다(아는 이름이 하나도 없으면 빈 결과 — 전체가 나오지 않는다). `tags` 는 10개까지(넘으면 `bad_request`). 모델 제안(`ai`)·뗀(`off`) 표식은 걸러지지 않는다.
+  모르는 인자는 옛 앱이 무시하므로 옛 PC 에서는 전체 대화가 온다 — 폰은 `hello.version` 으로 판단한다.
+
 ### 객체 모양
 
 ```jsonc
@@ -170,7 +236,7 @@ PC 가 먼저 보내는 알림: `{"ev":"changed"}`(무언가 바뀜 — 보고 �
   "branch":"main", "live":"busy|idle|null", "pinned":false, "model":"claude-opus-5-5",
   "turns":12, "unread":2, "attention":0, "active":1,
   "last_status":"done", "last_needs_input":false, "preview":"…", "preview_ai":true, "last_at":"ISO8601",
-  "archived":false, "agent":"claude|codex" }
+  "archived":false, "agent":"claude|codex", "ended":null }
   // agent(0.6.0~): 세션을 만든 도구. 없으면 claude. codex 세션의 model 은 gpt-… 이고 cost 는 없다
 
 // SessionHead — 대화 머리
@@ -217,6 +283,8 @@ PC 가 먼저 보내는 알림: `{"ev":"changed"}`(무언가 바뀜 — 보고 �
 - 새 결과가 생기면 PC 가 `POST /v1/relay/push {"ticket":"…"}` (인증 헤더 없음).
   서버는 티켓을 풀어 그 사용자의 기기에 **"AI 작업 · 새 결과가 도착했어요"** 만 보낸다(기기 언어로).
   데이터 `{"type":"ai_relay"}`. 세션 이름·요약은 알림에 싣지 않는다.
+- 예약 관련(0.10.0): 같은 요청에 선택 필드 `"k"` 를 더한다(§4-3). 허용값은 `sched_held` · `sched_ready` · `sched_missed` 뿐(`result` 는 k 없음과 같다, `sched` 는 서버의 별칭이며 PC 는 더 이상 보내지 않는다). 서버는 그 밖의 값을 `400 VALIDATION_ERROR` 로 거절한다 — 새 종류는 서버 먼저. 여러 알림이 한꺼번에 모이면 푸시는 하나만 보낸다(못 받음 > 놓침 > 다시 받을 수 있음). 알림 데이터에는 `{"type":"ai_relay","k":"…"}`.
+  **옛 서버(운영)는 `k` 를 읽지 않고** 200 + 일반 문구("새 결과가 도착했어요")를 보내므로 무해하다. 새 서버가 모르는 값이라 400 을 돌려주면 PC 는 `k` 없이 한 번 더 보낸다(알림이 통째로 사라지지 않게). 계약 정본은 서버 쪽 `relay-push-kinds.md`.
 - 제한: 사용자당 15초에 1회(3회까지 몰아 쓰기) · 하루 300회. 티켓이 틀리거나 만료면 `401 ticket_invalid`.
 
 ## 6. PC 쪽 약속
@@ -225,3 +293,15 @@ PC 가 먼저 보내는 알림: `{"ev":"changed"}`(무언가 바뀜 — 보고 �
 - 폰이 부를 수 있는 것은 §4 표뿐이다. 파일 읽기·명령 실행 같은 통로는 없다. 폰의 세션 관리(§4-2)는 PC 의 DB 에만 쓰고 폰에는 사본을 두지 않는다.
 - 폰 답은 기존 전달 경로(채널 → 꺼진 세션 이어가기 → 거절)와 검사(기기 허용 · 세션 차단 · 데스크톱 확인)를 그대로 거친다.
 - 페어링 정보(PC 정적 개인키 · 방 비밀 · 기기별 psk)는 앱 데이터 폴더의 `relay-identity.json`(본인만 읽기 600)에 둔다.
+
+
+### 0.9.0 추가(선택 필드)
+
+`sessions` 항목에 `ended` — `null` 또는 `{cleared_at, state:"purge"|"keep"|"ask", purge_at, asked}`. /clear 로 끝난 대화 표시용(옛 폰은 무시). 이력으로 보관한 세션도 폰 목록에는 그대로 나온다.
+
+`sessions` 항목에 `tags` — `[{n: 이름, c: "#rrggbb"}]`(그 세션의 대표 태그 최대 3, 요청 태그에서 파생). `chat` 응답의 세션 머리에 `tags` — `[{n, c, k: 요청 수}]`(최대 12), 각 요청에 `tags` — `[{n, c}]`(사용자가 붙였거나 규칙이 붙인 것만 — 모델 제안은 받아들이기 전엔 싣지 않는다). 모두 선택 필드(옛 폰은 무시). 태그 편집·거르기는 0.10.0 의 `tag_list`·`tag_set`·`sessions{tag}`·`chat{tags}`(§4-4). 정본 설명은 `docs/TAGS.md`.
+
+### 0.10.0 추가(선택 필드·새 메서드 — 암호 규약·`relay-vectors.json` 은 그대로)
+
+`hello`·`sessions` 에 `can_schedule`, `sessions` 항목에 `sched_n`·`sched_held`·`perm`·`sched_warn`, 새 메서드 `sched_add`·`sched_list`·`sched_edit`·`sched_cancel`·`sched_act`·`sched_warn_off`·`tag_list`·`tag_set`, 새 오류 코드 `conflict`,
+`sessions{tag}`·`chat{tags,any}` 인자, 푸시 선택 필드 `k`(`sched_held`·`sched_ready`·`sched_missed`), `chat` 세션 머리의 `sched_n`·`sched_held`. 옛 폰은 새 필드를 무시하고 옛 PC 는 새 인자를 무시하며 새 메서드에 `unknown_method` 를 돌려준다(폰은 `hello.version` 이 0.10.0 이상일 때만 부른다).

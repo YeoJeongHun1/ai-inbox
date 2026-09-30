@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Archive, CheckCheck, Loader2, Pin, PinOff, Plus, Search, Settings, Smartphone, Trash2 } from "lucide-react";
+import { Archive, CheckCheck, Clock, History, Loader2, Pin, PinOff, Plus, Search, Settings, Smartphone, Trash2 } from "lucide-react";
 import type { Counts, Filter, SessionItem } from "../api";
-import { listTime } from "../format";
+import { endedLabel, listTime } from "../format";
+import { tagColor, useTags } from "../tags";
+import { AboutBadge } from "./About";
 
 interface Props {
   sessions: SessionItem[];
@@ -22,11 +24,20 @@ interface Props {
   /** 기록 — 지난 대화 검색 · 보낸 메시지 · 이미지 */
   onArchive: () => void;
   onReadAll: () => void;
+  /** 대화 이력 찾기(검색 모드 채팅) */
+  onHistoryChat: () => void;
+  historyChatOpen: boolean;
+  /** 예약 전송: 걸려 있는 예약 수 · 받지 못해 처리를 기다리는 수 — 누르면 예약 목록 */
+  sched: { active: number; held: number };
+  onSched: () => void;
+  /** /clear 로 끝난 대화의 결정 창 */
+  onDecide: () => void;
   /** 세션 줄 오른쪽 클릭 메뉴 */
   onSessionAction: (id: string, action: SessionAction) => void;
   /** 목록 아래에 띄울 알림(새 버전 등) */
   banner?: React.ReactNode;
   searchRef: React.RefObject<HTMLInputElement | null>;
+  toast: (m: string) => void;
 }
 
 export type SessionAction = "pin" | "unpin" | "read" | "archive" | "delete";
@@ -93,6 +104,7 @@ const TABS: { key: Filter; label: string; count?: keyof Counts }[] = [
   { key: "unread", label: "안 읽음", count: "unread" },
   { key: "attention", label: "확인 필요", count: "attention" },
   { key: "active", label: "진행 중", count: "active" },
+  { key: "history", label: "이력", count: "kept" },
 ];
 
 function initials(name: string): string {
@@ -108,6 +120,7 @@ function initials(name: string): string {
 }
 
 export function Sidebar(p: Props) {
+  const { byId } = useTags();
   const [menu, setMenu] = useState<{ s: SessionItem; x: number; y: number } | null>(null);
   const closeMenu = useCallback(() => setMenu(null), []);
   return (
@@ -134,6 +147,14 @@ export function Sidebar(p: Props) {
               "폰 연결"
             )}
           </button>
+          <button
+            className={`icon-btn sched-btn ${p.sched.held > 0 ? "warn" : ""}`}
+            title={p.sched.held > 0 ? `예약 ${p.sched.held}건이 전달되지 못했습니다 — 처리하세요` : "예약 전송 — 정한 시각에 세션에 보내기(입력창의 시계 버튼으로 만듭니다)"}
+            onClick={p.onSched}
+          >
+            <Clock size={17} />
+            {(p.sched.held > 0 || p.sched.active > 0) && <span className="sched-badge">{p.sched.held > 0 ? p.sched.held : p.sched.active}</span>}
+          </button>
           <button className="icon-btn" title="기록 — 지난 대화 검색·보낸 메시지·이미지 (⌘⇧F)" onClick={p.onArchive}>
             <Archive size={17} />
           </button>
@@ -146,6 +167,7 @@ export function Sidebar(p: Props) {
         </div>
       </header>
 
+      <div className="search-row">
       <label className="search">
         <Search size={15} />
         <input
@@ -156,18 +178,37 @@ export function Sidebar(p: Props) {
           spellCheck={false}
         />
       </label>
+      <button
+            className={`icon-btn ${p.historyChatOpen ? "on" : ""}`}
+            title="대화 이력 찾기 — 내 작업 이력에서 찾는 대화(세션에 지시하지 않음) (⌘⇧H)"
+            onClick={p.onHistoryChat}
+          >
+            <History size={17} />
+          </button>
+      </div>
 
       <nav className="tabs">
         {TABS.map((t) => {
           const n = t.count ? p.counts[t.count] : 0;
           return (
-            <button key={t.key} className={`tab ${p.filter === t.key ? "on" : ""}`} onClick={() => p.onFilter(t.key)}>
+            <button key={t.key} className={`tab ${p.filter === t.key ? "on" : ""}`} onClick={() => p.onFilter(t.key)} title={t.key === "history" ? "/clear 뒤 이력으로 보관한 대화" : undefined}>
               {t.label}
-              {t.count && n > 0 && <span className={`tab-n ${t.key === "active" ? "plain" : ""}`}>{n}</span>}
+              {t.count && n > 0 && <span className={`tab-n ${t.key === "active" || t.key === "history" ? "plain" : ""}`}>{n}</span>}
             </button>
           );
         })}
       </nav>
+
+      {p.counts.undecided > 0 && !p.query && (
+        <div className="list-bar clear-bar">
+          <span>
+            /clear 로 끝난 대화 <strong>{p.counts.undecided}</strong>개 — 이력으로 남길까요?
+          </span>
+          <button className="list-bar-btn" onClick={p.onDecide} title="기본은 삭제 예약입니다 — 이력으로 보관하거나 그대로 둘 수 있습니다">
+            정하기
+          </button>
+        </div>
+      )}
 
       {p.filter === "unread" && p.counts.unread > 0 && !p.query && (
         <div className="list-bar">
@@ -187,7 +228,8 @@ export function Sidebar(p: Props) {
           return (
             <li
               key={s.id}
-              className={`session ${p.selectedId === s.id ? "on" : ""} ${s.unread ? "has-unread" : ""}`}
+              className={`session ${p.selectedId === s.id && !p.historyChatOpen ? "on" : ""} ${s.unread ? "has-unread" : ""} ${s.ended && s.ended.state !== "keep" ? "ended" : ""} ${s.ended?.state === "keep" ? "kept" : ""}`}
+              title={s.ended ? endedLabel(s.ended) : undefined}
               onClick={() => p.onSelect(s.id)}
               onContextMenu={(e) => {
                 e.preventDefault();
@@ -206,6 +248,19 @@ export function Sidebar(p: Props) {
                   {s.pinned && <Pin size={12} className="s-pin" />}
                   <time className="s-time">{listTime(s.last_at)}</time>
                 </div>
+                {s.ended && <div className={`s-ended st-${s.ended.state}`}>{endedLabel(s.ended)}</div>}
+                {s.tags?.some((id) => byId.has(id)) && (
+                  <div className="s-tags" title="이 세션의 대표 태그 — 요청 태그에서 파생">
+                    {s.tags
+                      .filter((id) => byId.has(id))
+                      .map((id) => (
+                        <span key={id} className="s-tagchip">
+                          <span className="tag-dot" style={{ background: tagColor(byId.get(id)) }} />
+                          {byId.get(id)!.name}
+                        </span>
+                      ))}
+                  </div>
+                )}
                 <div className="row2">
                   <span className="s-preview">
                     {s.active > 0 && s.last_status !== "done" ? (
@@ -227,7 +282,13 @@ export function Sidebar(p: Props) {
         })}
         {p.sessions.length === 0 && (
           <li className="empty-list">
-            {p.query ? "검색 결과가 없습니다." : p.filter === "all" ? "아직 모은 요청이 없습니다." : "해당하는 세션이 없습니다."}
+            {p.query
+              ? "검색 결과가 없습니다."
+              : p.filter === "all"
+                ? "아직 모은 요청이 없습니다."
+                : p.filter === "history"
+                  ? "이력으로 보관한 대화가 없습니다. /clear 된 대화에서 '이력으로 보관'을 고르면 여기에 모입니다."
+                  : "해당하는 세션이 없습니다."}
           </li>
         )}
       </ul>
@@ -245,8 +306,9 @@ export function Sidebar(p: Props) {
       {p.banner}
       <footer className="side-foot">
         <span className={`hook-dot ${p.hookLine.ok ? "ok" : ""}`} />
-        <span className="hook-text">{p.hookLine.text}</span>
+        <span className="hook-text" title={p.hookLine.text}>{p.hookLine.text}</span>
         {p.working && <span className="collecting">수집 중</span>}
+        <AboutBadge toast={p.toast} />
       </footer>
     </aside>
   );

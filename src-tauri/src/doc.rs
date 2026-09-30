@@ -284,6 +284,9 @@ pub fn build(d: &Value) -> String {
     if s(t, "origin") == Some("inbox") {
         l.push("*AI Inbox 앱에서 보낸 말*\n".into());
     }
+    if s(t, "origin") == Some("sched") {
+        l.push("*AI Inbox 예약 전송으로 보낸 말*\n".into());
+    }
     let phone = phone_reply(s(t, "prompt_text"));
     if let Some((title, _)) = &phone {
         l.push(format!("*폰(코노티)에서 보낸 답{}*\n", title.as_ref().map(|x| format!(" — 원래 요청: {x}")).unwrap_or_default()));

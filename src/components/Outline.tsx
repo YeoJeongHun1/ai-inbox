@@ -1,6 +1,8 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CircleHelp, CircleSlash, ListOrdered, Loader2, PauseCircle, Search, X } from "lucide-react";
-import { phoneReply, type OutlineRow } from "../api";
+import { phoneReply, type OutlineRow, type TagFilter } from "../api";
+import { matchFilter } from "../tags";
+import { TagDots } from "./TagUi";
 import { clock, plainLine } from "../format";
 
 /** 오늘은 시:분, 그 전은 월/일 시:분 — 한 세션 안에서는 날짜보다 시각이 요청을 가른다 */
@@ -61,13 +63,15 @@ interface Props {
   currentId: number | null;
   /** 대화에 이미 받아 둔 요청의 최신 읽음 상태 — 목차가 대화와 어긋나지 않게 */
   unreadOf: (r: OutlineRow) => boolean;
+  /** 태그로 거르는 중이면 그 태그의 요청만 목록에 둔다(번호는 세션 안 순서 그대로) */
+  tagFilter: TagFilter | null;
   single: boolean;
   onSingle: (on: boolean) => void;
   onPick: (id: number) => void;
   onClose: () => void;
 }
 
-export const Outline = memo(function Outline({ rows, currentId, unreadOf, single, onSingle, onPick, onClose }: Props) {
+export const Outline = memo(function Outline({ rows, currentId, unreadOf, tagFilter, single, onSingle, onPick, onClose }: Props) {
   const [query, setQuery] = useState("");
   const [unreadOnly, setUnreadOnly] = useState(false);
   const list = useRef<HTMLDivElement>(null);
@@ -81,10 +85,11 @@ export const Outline = memo(function Outline({ rows, currentId, unreadOf, single
     const q = query.trim().toLowerCase();
     return all.filter((r) => {
       if (unreadOnly && !unreadOf(r)) return false;
+      if (tagFilter && !matchFilter(r.tags, tagFilter)) return false;
       if (!q) return true;
       return r.head.toLowerCase().includes(q) || (r.summary ?? "").toLowerCase().includes(q);
     });
-  }, [all, query, unreadOnly, unreadOf]);
+  }, [all, query, unreadOnly, unreadOf, tagFilter]);
   useEffect(() => {
     if (unreadOnly && unreadN === 0) setUnreadOnly(false);
   }, [unreadOnly, unreadN]);
@@ -205,6 +210,7 @@ export const Outline = memo(function Outline({ rows, currentId, unreadOf, single
                     <span className="toc-title">
                       {tag && <span className="toc-tag">{tag}</span>}
                       {outlineTitle(r)}
+                      <TagDots tags={r.tags ?? []} />
                     </span>
                     {sub && <span className="toc-sub">{sub}</span>}
                   </span>

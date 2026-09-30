@@ -223,6 +223,8 @@ impl<'a> Runner<'a> {
         let mut seen_changed = self.shared.changed.load(Ordering::SeqCst);
         let mut sent_changed_at = Instant::now() - CHANGED_GAP;
         let mut seen_finished = self.shared.finished.load(Ordering::SeqCst);
+        let mut seen_sched = self.shared.sched_alert.load(Ordering::SeqCst);
+        let mut push_kinds: Vec<&'static str> = Vec::new();
         let mut push_due = false;
         let mut last_push = Instant::now() - PUSH_GAP;
         loop {
@@ -354,11 +356,23 @@ impl<'a> Runner<'a> {
                 seen_finished = finished;
                 push_due = true;
             }
+            // 예약이 전달되지 못했다는 알림 — 같은 푸시 통로, 종류만 다르다(내용 없음)
+            let sched = self.shared.sched_alert.load(Ordering::SeqCst);
+            if sched != seen_sched {
+                seen_sched = sched;
+                push_due = true;
+                if let Ok(mut k) = self.shared.sched_kinds.lock() {
+                    push_kinds.append(&mut k);
+                }
+            }
             if push_due && last_push.elapsed() >= PUSH_GAP {
                 push_due = false;
+                // 예약 알림이 섞이면 예약 종류 하나만(못 받음 > 놓침 > 다시 받을 수 있음), 없으면 결과 푸시(k 없음)
+                let kind = crate::sched::pick_push_kind(&push_kinds);
+                push_kinds.clear();
                 if self.phones() == 0 && super::push_enabled(self.conn) {
                     last_push = Instant::now();
-                    self.push();
+                    self.push(kind);
                 }
             }
         }
@@ -547,7 +561,7 @@ impl<'a> Runner<'a> {
             match self.add_device(&remote, &p, can_reply) {
                 Ok((pid, psk)) => {
                     let resp = json!({"id": rid, "ok": true, "r": {
-                        "desktop": self.name, "version": self.version, "can_reply": can_reply, "can_manage": can_reply,
+                        "desktop": self.name, "version": self.version, "can_reply": can_reply, "can_manage": can_reply, "can_schedule": false,
                         "paired": {"pid": b64(&pid), "psk": b64(&psk), "room": self.id.room()}
                     }});
                     let f = sess.seal(resp.to_string().as_bytes()).unwrap_or_default();
@@ -590,7 +604,7 @@ impl<'a> Runner<'a> {
         let Some(dev) = device(self.conn, pid) else {
             return (json!({"id": id, "ok": false, "err": "unpaired", "msg": "PC 에서 연결이 해제됐습니다"}), true);
         };
-        let caller = rpc::Caller { pid, can_reply: dev.can_reply, can_manage: dev.can_manage };
+        let caller = rpc::Caller { pid, can_reply: dev.can_reply, can_manage: dev.can_manage, can_schedule: dev.can_schedule };
         let res: rpc::RpcResult = match req["m"].as_str().unwrap_or("") {
             "hello" => {
                 // 기기는 처음 연결한 코노티 계정에 묶인다 — 같은 폰에서 다른 계정으로 로그인하면 이 PC 를 볼 수 없다
@@ -608,7 +622,7 @@ impl<'a> Runner<'a> {
                     "UPDATE relay_device SET last_seen = ?2, ticket = COALESCE(?3, ticket), acct = COALESCE(?4, acct) WHERE pid = ?1",
                     params![pid, time::now_iso(), ticket_of(p), acct_of(p)],
                 );
-                Ok(json!({"desktop": self.name, "version": self.version, "can_reply": dev.can_reply, "can_manage": dev.can_manage}))
+                Ok(json!({"desktop": self.name, "version": self.version, "can_reply": dev.can_reply, "can_manage": dev.can_manage, "can_schedule": dev.can_schedule}))
             }
             "sessions" => rpc::sessions(self.conn, p, &caller),
             "chat" => rpc::chat(self.conn, p, &caller),
@@ -639,6 +653,31 @@ impl<'a> Runner<'a> {
                 }
                 r
             }
+            "sched_list" => rpc::sched_list(self.conn, p, &caller),
+            "sched_warn_off" => rpc::sched_warn_off(self.conn, p, &caller),
+            "sched_add" | "sched_edit" | "sched_cancel" | "sched_act" => {
+                let r = match req["m"].as_str().unwrap_or("") {
+                    "sched_add" => rpc::sched_add(self.conn, p, &caller),
+                    "sched_edit" => rpc::sched_edit(self.conn, p, &caller),
+                    "sched_cancel" => rpc::sched_cancel(self.conn, p, &caller),
+                    _ => rpc::sched_act(self.conn, p, &caller),
+                };
+                if r.is_ok() {
+                    // PC 화면·다른 폰에 알린다(전달 스레드는 2초 안에 처리한다)
+                    (self.hooks.on_local_change)(p["sid"].as_str().map(|s| vec![s.to_string()]).unwrap_or_default());
+                    self.shared.bump_changed();
+                }
+                r
+            }
+            "tag_list" => rpc::tag_list(self.conn, p, &caller),
+            "tag_set" => {
+                let r = rpc::tag_set(self.conn, p, &caller);
+                if r.is_ok() {
+                    (self.hooks.on_local_change)(vec![]);
+                    self.shared.bump_changed();
+                }
+                r
+            }
             "unpair" => {
                 let r = super::remove_device(self.conn, self.shared, pid).map(|_| json!({})).map_err(|e| ("internal", e));
                 if r.is_ok() {
@@ -654,7 +693,7 @@ impl<'a> Runner<'a> {
         };
         // 진단 기록에는 아는 이름만 — 폰이 보낸 글을 그대로 적지 않는다(줄 끼워 넣기·파일 불리기)
         let m = match req["m"].as_str().unwrap_or("") {
-            m @ ("hello" | "sessions" | "chat" | "turn" | "read" | "reply" | "att" | "att_get" | "manage" | "tidy" | "unpair") => m,
+            m @ ("hello" | "sessions" | "chat" | "turn" | "read" | "reply" | "att" | "att_get" | "manage" | "tidy" | "unpair" | "sched_list" | "sched_add" | "sched_edit" | "sched_cancel" | "sched_act" | "sched_warn_off" | "tag_list" | "tag_set") => m,
             _ => "?",
         };
         match res {
@@ -672,7 +711,9 @@ impl<'a> Runner<'a> {
     }
 
     /// 새 결과 알림 — 계정마다 가장 최근 티켓 하나로. 내용은 싣지 않는다(서버가 고정 문구를 보낸다).
-    fn push(&self) {
+    /// `kind` = 푸시 종류 `k`(sched::PUSH_* 중 하나, 서버가 아는 값만). 옛 서버는 `k` 를 읽지 않고 일반 문구를 보낸다.
+    /// 새 서버가 모르는 값이라 400 이면 `k` 없이 한 번 더 — 알림이 통째로 사라지지 않게(RELAY.md §5)
+    fn push(&self, kind: Option<&'static str>) {
         let mut by_acct: HashMap<String, (String, String)> = HashMap::new(); // acct → (last_seen, ticket)
         for d in super::devices(self.conn) {
             let Some(t) = d.ticket.clone() else { continue };
@@ -693,7 +734,15 @@ impl<'a> Runner<'a> {
         std::thread::spawn(move || {
             let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).redirects(0).build();
             for t in tickets {
-                let _ = agent.post(&url).send_json(json!({"ticket": t}));
+                let body = match kind {
+                    Some(k) => json!({"ticket": t, "k": k}),
+                    None => json!({"ticket": t}),
+                };
+                if let Err(ureq::Error::Status(400, _)) = agent.post(&url).send_json(body) {
+                    if kind.is_some() {
+                        let _ = agent.post(&url).send_json(json!({"ticket": t}));
+                    }
+                }
             }
         });
     }
@@ -1155,6 +1204,16 @@ mod tests {
         assert!(doc["r"]["markdown"].as_str().unwrap().contains("반가워요"));
         // 세션 관리(규격 §4-2) — 보관 → 보관함 → 되돌리기 → 지우기
         assert_eq!(hello["r"]["can_manage"], true);
+        // 0.10.0: 예약 허용은 기기별로 꺼져 있다(기본) — hello 에 실린 값 · 예약 rpc 는 거절 · 목록·태그 조회는 통한다
+        assert_eq!(hello["r"]["can_schedule"], false, "{hello}");
+        let sa = rpc_call(&mut ws, &mut ps, json!({"id": 101, "m": "sched_add", "p": {"rid": "rid-e2e-sched-1", "sid": "sess-live", "text": "x", "when": {"after_min": 5}}}));
+        assert_eq!((sa["ok"].clone(), sa["err"].clone()), (json!(false), json!("rejected")), "{sa}");
+        let sl = rpc_call(&mut ws, &mut ps, json!({"id": 102, "m": "sched_list", "p": {}}));
+        assert_eq!((sl["ok"].clone(), sl["r"]["can_schedule"].clone()), (json!(true), json!(false)), "{sl}");
+        let tl = rpc_call(&mut ws, &mut ps, json!({"id": 103, "m": "tag_list", "p": {}}));
+        assert_eq!(tl["ok"], true, "{tl}");
+        let ss0 = rpc_call(&mut ws, &mut ps, json!({"id": 104, "m": "sessions", "p": {}}));
+        assert_eq!(ss0["r"]["can_schedule"], false, "{ss0}");
         let sid = json!(["sess-live"]);
         let r = rpc_call(&mut ws, &mut ps, json!({"id": 5, "m": "manage", "p": {"op": "archive", "sids": sid}}));
         assert_eq!(r["r"]["n"], 1, "{r}");
@@ -1350,3 +1409,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1500));
     }
 }
+
+// 운영 코노티 호환 시험(docs/COMPAT.md) — 구 폰 시뮬레이터와 0.8.0 기준선 대조
+#[cfg(test)]
+#[path = "compat_driver.rs"]
+mod compat_driver;
+#[cfg(test)]
+#[path = "compat_tests.rs"]
+mod compat_tests;

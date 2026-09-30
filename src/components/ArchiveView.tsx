@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Archive, ArchiveRestore, Image as ImageIcon, Layers, MessageSquare, Search, Smartphone, Trash2, X } from "lucide-react";
-import { api, type ArchiveImage, type ArchiveStats, type SentMessage, type SessionRow, type SessionScope, type TurnHit } from "../api";
+import { api, filterActive, NO_FILTER, type TagFilter, type ArchiveImage, type ArchiveStats, type SentMessage, type SessionRow, type SessionScope, type TurnHit } from "../api";
 import { fullTime, listTime } from "../format";
 import { AttStrip, AttThumb, Lightbox, forgetAtt, sizeText } from "./Attachments";
+import { TagFilterChips, TagLabels } from "./TagUi";
 
 type Tab = "turns" | "sessions" | "messages" | "images";
 type Device = "all" | "desktop" | "phone";
@@ -79,6 +80,9 @@ export function ArchiveView({ onClose, onOpenTurn, onSessionsDeleted, toast }: P
   const [device, setDevice] = useState<Device>("all");
   const [imagesOnly, setImagesOnly] = useState(false);
   const [turns, setTurns] = useState<TurnHit[]>([]);
+  /** 대화 검색을 태그로 거른다(검색어와 함께 · 검색어 없이 태그만으로도) */
+  const [tagFilter, setTagFilter] = useState<TagFilter>(NO_FILTER);
+  const tagKey = JSON.stringify(tagFilter);
   const [messages, setMessages] = useState<SentMessage[]>([]);
   const [images, setImages] = useState<ArchiveImage[]>([]);
   const [rows, setRows] = useState<SessionRow[]>([]);
@@ -115,7 +119,7 @@ export function ArchiveView({ onClose, onOpenTurn, onSessionsDeleted, toast }: P
       try {
         if (tab === "turns") {
           const before = append ? (turns[turns.length - 1]?.prompt_at ?? null) : null;
-          const p = await api.archiveTurns(q, before);
+          const p = await api.archiveTurns(q, before, tagFilter);
           if (my !== loadSeq.current) return;
           setTurns((cur) => (append ? [...cur, ...p.items] : p.items));
           setMore(p.has_more);
@@ -143,14 +147,14 @@ export function ArchiveView({ onClose, onOpenTurn, onSessionsDeleted, toast }: P
         if (my === loadSeq.current) setLoading(false);
       }
     },
-    [tab, q, device, imagesOnly, turns, messages, images, rows, scope, shortOnly, idleDays, toast],
+    [tab, q, device, imagesOnly, turns, messages, images, rows, scope, shortOnly, idleDays, toast, tagFilter],
   );
 
   // 탭·검색어·필터가 바뀌면 처음부터
   useEffect(() => {
     setSelected(new Set());
     load(false);
-  }, [tab, q, device, imagesOnly, scope, shortOnly, idleDays]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tab, q, device, imagesOnly, scope, shortOnly, idleDays, tagKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -385,9 +389,10 @@ export function ArchiveView({ onClose, onOpenTurn, onSessionsDeleted, toast }: P
         )}
 
         <div className="archive-body">
+          {tab === "turns" && <TagFilterChips filter={tagFilter} onFilter={setTagFilter} className="archive-tags" />}
           {tab === "turns" &&
-            (q.trim() === "" ? (
-              <p className="archive-empty">검색어를 입력하면 모든 세션의 요청·작업 요약·응답에서 찾습니다. 결과를 누르면 그 대화로 갑니다.</p>
+            (q.trim() === "" && !filterActive(tagFilter) ? (
+              <p className="archive-empty">검색어를 입력하면 모든 세션의 요청·작업 요약·응답에서 찾습니다. 위 태그를 고르면 그 태그의 요청만 모아 봅니다. 결과를 누르면 그 대화로 갑니다.</p>
             ) : (
               <ul className="hit-list">
                 {turns.map((h) => (
@@ -405,6 +410,7 @@ export function ArchiveView({ onClose, onOpenTurn, onSessionsDeleted, toast }: P
                       <span className="hit-where">{h.snippet_in === "prompt" ? "요청" : h.snippet_in === "summary" ? "작업 요약" : h.snippet_in === "response" ? "응답" : "세션"}</span>
                       <time title={fullTime(h.prompt_at)}>{listTime(h.prompt_at)}</time>
                     </div>
+                    <TagLabels tags={h.tags ?? []} />
                     {h.snippet_in !== "prompt" && h.prompt && <div className="hit-prompt">{h.prompt}</div>}
                     <div className="hit-snippet">
                       <Hit text={h.snippet} q={q} />

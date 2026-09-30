@@ -4,19 +4,24 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Copy, X } from "lucide-react";
 import { api, type AppInfo, type CodexStatus, type HookStatus, type RelayKey, type RelayOffer, type RelayStatus, type UpdateState } from "../api";
 import { fullTime } from "../format";
+import { CopyReport, useAbout } from "./About";
+import { ClearSection, HistorySection, ScheduleSection } from "./ClearSettings";
 
 interface Props {
   onClose: () => void;
   onHooksChanged: (s: HookStatus) => void;
+  /** 요청 태그 관리 창을 연다 */
+  onTags: () => void;
   toast: (msg: string) => void;
 }
 
 const NOTIFY_MIN = [0, 30, 60, 120, 300];
 const BACKFILL = [1, 3, 7, 14, 30];
 
-export function Settings({ onClose, onHooksChanged, toast }: Props) {
+export function Settings({ onClose, onHooksChanged, onTags, toast }: Props) {
   const [hooks, setHooks] = useState<HookStatus | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
+  const about = useAbout();
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -120,6 +125,18 @@ export function Settings({ onClose, onHooksChanged, toast }: Props) {
         </section>
 
         <CodexSection toast={toast} />
+        <ClearSection toast={toast} />
+        <HistorySection toast={toast} />
+        <ScheduleSection toast={toast} />
+        <section className="set">
+          <h3>요청 태그</h3>
+          <p className="set-note">한 세션에서 여러 주제를 다룰 때 요청마다 주제 태그를 달아 나눠 봅니다. 자동 태깅 규칙은 이 PC 안에서만 돌고, 모델 제안(선택)은 기본 꺼져 있습니다.</p>
+          <div className="set-row">
+            <button className="btn" onClick={onTags}>
+              태그·자동 규칙 관리…
+            </button>
+          </div>
+        </section>
 
         <PhoneSection toast={toast} />
 
@@ -198,7 +215,16 @@ export function Settings({ onClose, onHooksChanged, toast }: Props) {
           {info && (
             <dl className="kv">
               <dt>버전</dt>
-              <dd>{info.version}</dd>
+              <dd>
+                {about ? (
+                  <>
+                    <span className="about-line">{`v${about.version} · 빌드 ${about.build_time} · DB 스키마 v${about.schema_version}`}</span>
+                    <CopyReport about={about} toast={toast} />
+                  </>
+                ) : (
+                  `v${info.version}`
+                )}
+              </dd>
               <dt>기록</dt>
               <dd>
                 세션 {info.sessions.toLocaleString()} · 요청 {info.turns.toLocaleString()} · DB{" "}
@@ -474,6 +500,18 @@ export function PhoneSection({ toast, autoOffer = false }: { toast: (m: string) 
                     }}
                   />
                   기록 관리 허용
+                </label>
+                <label className="check inline" title="폰에서 예약 전송을 만들고·고치고·취소하고·처리(보내기/버리기). 예약된 말은 정한 시각에 세션에 자동으로 들어가므로 기본은 꺼져 있습니다. 이 PC 의 AI Inbox 가 켜져 있을 때만 전달됩니다.">
+                  <input
+                    type="checkbox"
+                    checked={d.can_schedule}
+                    disabled={!d.can_reply}
+                    onChange={async (e) => {
+                      await api.relaySetDeviceSchedule(d.pid, e.target.checked);
+                      load();
+                    }}
+                  />
+                  예약 허용
                 </label>
                 <button
                   className="btn"

@@ -15,6 +15,8 @@ use crate::{attach, db, text, time};
 pub const REPLY_HEADER: &str = "폰에서 온 사용자 답 (AI Inbox · 코노티)";
 /// 데스크톱 입력창에서 보낸 말의 머리말. 수집할 때 떼고 요청 출처를 `inbox` 로 남긴다(`ingest.rs`).
 pub const INBOX_HEADER: &str = "AI Inbox 앱에서 보낸 사용자 메시지";
+/// 예약 전송(`sched.rs`)이 시각이 되어 넣는 말의 머리말. 수집할 때 떼고 요청 출처를 `sched` 로 남긴다 — 모델이 "지금 사람이 친 말"이 아님을 알게 한다.
+pub const SCHED_HEADER: &str = "AI Inbox 예약 메시지 (사용자가 미리 예약해 둔 시각에 자동으로 전달됨)";
 pub const MAX_REPLY_CHARS: usize = 4000;
 /// 데스크톱 입력창에서 보낸 말의 `conoti_reply.device`
 pub const DESKTOP: &str = "desktop";
@@ -34,10 +36,23 @@ pub fn wrap_desk(body: &str) -> String {
     format!("{INBOX_HEADER}\n\n{}", body.trim())
 }
 
+/// 예약에서 넣는 말. 사용자가 예약할 때 쓴 그대로, 예약 머리말만 붙인다.
+pub fn wrap_sched(body: &str) -> String {
+    format!("{SCHED_HEADER}\n\n{}", body.trim())
+}
+
 /// 데스크톱에서 보낸 말이면 머리말을 뗀 본문
 pub fn strip_inbox(s: &str) -> Option<&str> {
-    let rest = s.strip_prefix(INBOX_HEADER)?;
-    Some(rest.trim_start_matches(['\n', '\r']))
+    strip_header(s).map(|(rest, _)| rest)
+}
+
+/// 앱이 보낸 말(입력창 · 예약)이면 (머리말을 뗀 본문, 요청 출처 `inbox` | `sched`)
+pub fn strip_header(s: &str) -> Option<(&str, &'static str)> {
+    let (rest, origin) = match s.strip_prefix(INBOX_HEADER) {
+        Some(r) => (r, "inbox"),
+        None => (s.strip_prefix(SCHED_HEADER)?, "sched"),
+    };
+    Some((rest.trim_start_matches(['\n', '\r']), origin))
 }
 
 pub fn valid_quote(q: &str) -> bool {
@@ -105,6 +120,18 @@ pub struct Target {
 /// 전달 방식은 바꿀 수 있게 떼어 둔다. `from_desktop`: PC 앞의 사용자가 보냈다(꺼진 세션 이어서 실행을 따로 묻지 않는다).
 pub trait Deliver {
     fn deliver(&self, target: &Target, reply_id: &str, text: &str, from_desktop: bool) -> Outcome;
+
+    /// 예약에서 온 말(`scheduled`)은 **꺼진 세션을 이어서 실행하지 않는다**(사용자 결정: 못 받으면 알림만) — 이 경로를 구현하는 쪽이 지킨다.
+    /// 기본 구현은 옛 시그니처로 넘긴다(시험용 가짜들).
+    fn deliver_opts(&self, target: &Target, reply_id: &str, text: &str, opts: Opts) -> Outcome {
+        self.deliver(target, reply_id, text, opts.from_desktop && !opts.scheduled)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Opts {
+    pub from_desktop: bool,
+    pub scheduled: bool,
 }
 
 pub use crate::deliver::Outcome;
@@ -292,8 +319,20 @@ pub fn accept_reply(
         }
     } else {
         attach::link(conn, rid, atts)?;
+        record_tag_hint(conn, sid, body);
     }
     reply_out(conn, rid).ok_or_else(|| "기록을 읽지 못함".into())
+}
+
+/// 앱이 보낸 말(입력창·폰)은 세션에 채널·대기 훅으로 들어가 UserPromptSubmit 훅이 안 불릴 수 있다 — 보내는 시점에 태그 재료(`#태그`·폴더)를 직접 기록한다.
+/// 대화 기록에서 이 요청을 읽으면 지문이 같을 때 이어진다(`tags::attach_for_turn`). 실패해도 전달을 막지 않는다.
+pub(crate) fn record_tag_hint(conn: &Connection, sid: &str, body: &str) {
+    let sent = text::clip(&text::redact(body), MAX_REPLY_CHARS + 10);
+    if sent.trim().is_empty() {
+        return;
+    }
+    let hp = crate::tags::HookPrompt::from_app(conn, sid, &sent);
+    let _ = crate::tags::record_prompt(conn, &hp);
 }
 
 /// 데스크톱 입력창에서 보낸 말을 기록한다. 사용자가 PC 앞에 있으므로 폰용 겹(기기 허용·멈춤·세션 차단·확인)은
@@ -337,6 +376,7 @@ pub fn accept_desktop(conn: &Connection, sid: &str, body: &str, atts: &[String],
     )
     .map_err(|e| e.to_string())?;
     attach::link(conn, &rid, atts)?;
+    record_tag_hint(conn, sid, body);
     // 보관한 세션에 말을 보냈다 = 다시 쓰는 세션 — 목록으로 되돌린다
     conn.execute("UPDATE session SET hidden = 0, archived_at = NULL WHERE id = ?1 AND hidden = 1", params![sid])
         .map_err(|e| e.to_string())?;
@@ -361,7 +401,7 @@ pub fn record_started(conn: &Connection, sid: Option<&str>, body: &str, how: &st
 pub fn outbox_for(conn: &Connection, sid: &str) -> Vec<Value> {
     let since = time::iso_from_ms(chrono::Utc::now().timestamp_millis() - 15 * 60_000);
     let Ok(mut st) = conn.prepare(
-        "SELECT r.reply_id, r.text, r.state, r.note, r.received_at, r.device, r.quote, t.seq FROM conoti_reply r
+        "SELECT r.reply_id, r.text, r.state, r.note, r.received_at, r.device, r.quote, t.seq, r.sched IS NOT NULL FROM conoti_reply r
            LEFT JOIN turn t ON t.id = r.turn_id
           WHERE r.session_id = ?1 AND r.result_turn IS NULL
             AND (r.state IN ('confirm', 'delivering') OR (r.state IN ('delivered', 'rejected') AND r.received_at >= ?2))
@@ -377,6 +417,7 @@ pub fn outbox_for(conn: &Connection, sid: &str) -> Vec<Value> {
             "note": r.get::<_, Option<String>>(3)?,
             "at": r.get::<_, String>(4)?,
             "from_phone": r.get::<_, Option<String>>(5)?.as_deref() != Some(DESKTOP),
+            "sched": r.get::<_, i64>(8)? != 0,
             // 답장이면 대상 요청 번호·부분(화면이 보낸 말 위에 인용으로)
             "quote": match (r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?) {
                 (Some(part), Some(seq)) => json!({"seq": seq, "part": part}),
@@ -438,6 +479,16 @@ impl Pipeline {
         Pipeline { conn, launched: Default::default(), last_gc: None }
     }
 
+    #[cfg(test)]
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// 예약 전송 틱(`sched.rs`) — 시각이 된 예약을 대기열에 넣고 결과를 따라간다. 파이프라인 틱 앞에 부른다(넣은 줄을 같은 틱에 전달)
+    pub fn tick_schedule(&mut self, now: chrono::DateTime<chrono::Utc>, probe: &dyn crate::sched::Probe) -> crate::sched::TickReport {
+        crate::sched::tick(&self.conn, now, probe)
+    }
+
     pub fn tick(&mut self, deliverer: &dyn Deliver) -> PipelineReport {
         let mut rep = PipelineReport::default();
         if self.last_gc.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(600)) {
@@ -476,15 +527,15 @@ impl Pipeline {
         }
         self.launched.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(20));
         let confirm_on = flag(&self.conn, "conoti.confirm");
-        type Row = (String, String, String, String, Option<i64>, Option<String>, Option<String>, Option<String>);
+        type Row = (String, String, String, String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>);
         let rows: Vec<Row> = {
             let Ok(mut st) = self.conn.prepare(
-                "SELECT r.reply_id, r.session_id, r.kind, r.text, r.turn_id, r.device, r.acked, r.note FROM conoti_reply r
+                "SELECT r.reply_id, r.session_id, r.kind, r.text, r.turn_id, r.device, r.acked, r.note, r.sched FROM conoti_reply r
                   WHERE r.state = 'delivering' ORDER BY r.received_at LIMIT 20",
             ) else {
                 return;
             };
-            let Ok(rows) = st.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?, x.get(6)?, x.get(7)?)))
+            let Ok(rows) = st.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?, x.get(6)?, x.get(7)?, x.get(8)?)))
             else {
                 return;
             };
@@ -492,7 +543,7 @@ impl Pipeline {
         };
         // 한 세션에는 한 번에 하나씩, 앞의 것이 들어가 요청이 시작된 뒤에 다음 것
         let mut busy: std::collections::HashSet<String> = self.launched.keys().cloned().collect();
-        for (reply_id, sid, kind, reply_text, turn_id, device, acked, old_note) in rows {
+        for (reply_id, sid, kind, reply_text, turn_id, device, acked, old_note, sched) in rows {
             let desk = device.as_deref() == Some(DESKTOP);
             if busy.contains(&sid) {
                 // 같은 세션의 앞 말 뒤에 줄 서 있다 — 앞 말이 들어가거나 세션이 일하는 동안 이 말의 시계도 멈춘다
@@ -560,7 +611,9 @@ impl Pipeline {
                 _ => None,
             };
             let reply_text = with_quote(quote_line, &reply_text);
-            let wrapped = if desk {
+            let wrapped = if sched.is_some() {
+                wrap_sched(&reply_text)
+            } else if desk {
                 wrap_desk(&reply_text)
             } else {
                 let title: String = turn_id
@@ -598,7 +651,7 @@ impl Pipeline {
             }
             let target = Target { session_id: sid.clone(), cwd };
             busy.insert(sid.clone());
-            match deliverer.deliver(&target, &reply_id, &wrapped, desk) {
+            match deliverer.deliver_opts(&target, &reply_id, &wrapped, Opts { from_desktop: desk, scheduled: sched.is_some() }) {
                 Outcome::Done(how) => {
                     let _ = self.conn.execute(
                         "UPDATE conoti_reply SET state = 'delivered', delivered_at = ?2, note = ?3 WHERE reply_id = ?1",
@@ -653,7 +706,7 @@ impl Pipeline {
                     let found: Option<i64> = self
                         .conn
                         .query_row(
-                            "SELECT id FROM turn WHERE prompt_at >= ?2 AND (prompt_text LIKE ?3 OR origin = 'inbox')
+                            "SELECT id FROM turn WHERE prompt_at >= ?2 AND (prompt_text LIKE ?3 OR origin IN ('inbox', 'sched'))
                                AND (session_id = ?1 OR session_id IN (SELECT id FROM session WHERE first_at >= ?2))
                                AND id NOT IN (SELECT result_turn FROM conoti_reply WHERE result_turn IS NOT NULL)
                              ORDER BY prompt_at LIMIT 1",

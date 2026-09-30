@@ -559,7 +559,8 @@ pub fn delete_if_orphan(conn: &Connection, id: &str) {
 fn orphan_delete_locked(conn: &Connection, id: &str) {
     let used: i64 = conn
         .query_row(
-            "SELECT (SELECT COUNT(*) FROM reply_attachment WHERE att_id = ?1) + (SELECT COUNT(*) FROM att_upload WHERE att_id = ?1)",
+            "SELECT (SELECT COUNT(*) FROM reply_attachment WHERE att_id = ?1) + (SELECT COUNT(*) FROM att_upload WHERE att_id = ?1)
+                  + (SELECT COUNT(*) FROM schedule_att WHERE att_id = ?1)",
             params![id],
             |r| r.get(0),
         )
@@ -609,6 +610,7 @@ pub fn gc(conn: &Connection) -> usize {
     // 고른 뒤 지우기 전에 다시 쓰일 수 있다 — 지울 때 조건을 한 번 더 걸고, 지워진 것만 파일을 치운다
     const ORPHAN: &str = "NOT EXISTS (SELECT 1 FROM reply_attachment r WHERE r.att_id = a.id)
                 AND NOT EXISTS (SELECT 1 FROM att_upload u WHERE u.att_id = a.id)
+                AND NOT EXISTS (SELECT 1 FROM schedule_att sa WHERE sa.att_id = a.id)
                 AND ((a.touched_by = 'phone' AND a.touched_at < ?1) OR a.touched_at < ?2)";
     let rows: Vec<(String, String)> = conn
         .prepare(&format!("SELECT id, ext FROM attachment a WHERE {ORPHAN}"))
@@ -729,6 +731,18 @@ pub fn phone_can_see(conn: &Connection, id: &str, archived: bool) -> bool {
                    JOIN conoti_reply r ON r.reply_id = ra.reply_id
                    JOIN session s ON s.id = r.session_id
                   WHERE ra.att_id = ?1 AND (s.hidden = 0 OR ?2)",
+                params![id, archived],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+        // 걸려 있는 예약에 붙은 이미지(폰이 예약 목록에서 미리보기)
+        || conn
+            .query_row(
+                "SELECT COUNT(*) FROM schedule_att sa
+                   JOIN schedule sc ON sc.id = sa.schedule_id
+                   JOIN session s ON s.id = sc.session_id
+                  WHERE sa.att_id = ?1 AND (s.hidden = 0 OR ?2)",
                 params![id, archived],
                 |r| r.get::<_, i64>(0),
             )

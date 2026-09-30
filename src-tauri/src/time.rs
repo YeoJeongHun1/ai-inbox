@@ -30,3 +30,7 @@ pub fn diff_ms(from: &str, to: &str) -> Option<i64> {
 pub fn age_ms(ts: &str) -> Option<i64> {
     parse(ts).map(|d| (Utc::now() - d).num_milliseconds())
 }
+
+pub fn ms_of_iso(ts: &str) -> Option<i64> {
+    parse(ts).map(|d| d.timestamp_millis())
+}

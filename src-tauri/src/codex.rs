@@ -132,8 +132,13 @@ fn inherited(key: &str) -> bool {
 }
 
 fn codex_cmd() -> Result<Command, String> {
+    codex_cmd_for(false)
+}
+
+/// `stdin_prompt` — 말을 인자가 아닌 표준입력으로 넘기는 호출(모델 조회)은 npm 래퍼(.cmd)로도 된다(줄바꿈이 인자에 없다)
+pub(crate) fn codex_cmd_for(stdin_prompt: bool) -> Result<Command, String> {
     let bin = find_codex().ok_or("codex 실행 파일을 찾지 못함 — Codex CLI 를 설치했는지 확인하세요")?;
-    if cfg!(windows) && bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat")) {
+    if cfg!(windows) && !stdin_prompt && bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat")) {
         // Rust 는 .cmd/.bat 에 줄바꿈이 든 인자를 넘기지 않는다(InvalidInput) — 넣는 말은 항상 여러 줄이다
         return Err("Windows 에서는 npm 래퍼(codex.cmd)로 여러 줄 말을 넘길 수 없습니다 — codex.exe 가 있는 설치가 필요합니다".into());
     }
@@ -299,7 +304,7 @@ pub fn exec_running(thread_id: &str) -> bool {
 
 /// 넣을 글은 머리말로 시작해야 한다 — 인자로 넘길 때 `-` 로 시작해 옵션으로 읽히는 일이 없게
 fn safe_prompt(text: &str) -> Result<(), String> {
-    if text.starts_with(crate::conoti::REPLY_HEADER) || text.starts_with(crate::conoti::INBOX_HEADER) {
+    if text.starts_with(crate::conoti::REPLY_HEADER) || text.starts_with(crate::conoti::INBOX_HEADER) || text.starts_with(crate::conoti::SCHED_HEADER) {
         Ok(())
     } else {
         Err("머리말 없는 글은 넣지 않습니다".into())

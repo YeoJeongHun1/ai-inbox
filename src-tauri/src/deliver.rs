@@ -99,6 +99,27 @@ pub fn live_entry(session_id: &str) -> Option<Live> {
     None
 }
 
+/// 세션이 지금 하는 일 — 예약 전송의 "바쁜 세션 정책"이 본다(`sched.rs`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Work {
+    /// 쉬는 중이거나 꺼져 있음(꺼짐은 `Route::Ended` 로 따로 안다)
+    Idle,
+    Busy,
+    /// 권한 승인을 기다리는 중 — 사람이 승인하기 전에는 아무 말도 처리하지 못한다
+    PermWait,
+}
+
+pub fn work_state(session_id: &str) -> Work {
+    if crate::codex::is_codex(session_id) {
+        return if crate::codex::exec_running(session_id) || codex_busy(session_id) { Work::Busy } else { Work::Idle };
+    }
+    match live_entry(session_id) {
+        Some(l) if l.waiting_for.is_some() => Work::PermWait,
+        Some(l) if l.status.as_deref() == Some("busy") => Work::Busy,
+        _ => Work::Idle,
+    }
+}
+
 pub fn route(session_id: &str) -> Route {
     if crate::codex::is_codex(session_id) {
         return codex_route(session_id);
@@ -174,7 +195,12 @@ pub struct LocalDeliver {
 
 impl conoti::Deliver for LocalDeliver {
     fn deliver(&self, t: &conoti::Target, reply_id: &str, text: &str, from_desktop: bool) -> Outcome {
-        let may_launch = from_desktop || self.bg_resume;
+        self.deliver_opts(t, reply_id, text, conoti::Opts { from_desktop, scheduled: false })
+    }
+
+    fn deliver_opts(&self, t: &conoti::Target, reply_id: &str, text: &str, opts: conoti::Opts) -> Outcome {
+        // 예약에서 온 말은 꺼진 세션·쉬는 백그라운드 세션을 이어서 실행하지 않는다 — 폰 답을 위해 켜 둔 설정(bg_resume)이 있어도(못 받으면 알림만)
+        let may_launch = !opts.scheduled && (opts.from_desktop || self.bg_resume);
         if crate::codex::is_codex(&t.session_id) {
             return deliver_codex(t, text, may_launch);
         }
@@ -299,7 +325,7 @@ const INHERITED_ENV: &[&str] = &[
     "CLAUDE_EFFORT",
 ];
 
-fn claude_cmd() -> Result<Command, String> {
+pub(crate) fn claude_cmd() -> Result<Command, String> {
     let claude = find_claude().ok_or("claude 실행 파일을 찾지 못함")?;
     let mut c = Command::new(claude);
     for k in INHERITED_ENV {
@@ -364,7 +390,7 @@ fn launch_error(out: &std::process::Output) -> String {
 
 /// 넣을 글은 머리말로 시작해야 한다 — 인자로 넘길 때 `-` 로 시작해 옵션으로 읽히는 일이 없게
 fn safe_prompt(text: &str) -> Result<(), String> {
-    if text.starts_with(conoti::REPLY_HEADER) || text.starts_with(conoti::INBOX_HEADER) {
+    if text.starts_with(conoti::REPLY_HEADER) || text.starts_with(conoti::INBOX_HEADER) || text.starts_with(conoti::SCHED_HEADER) {
         Ok(())
     } else {
         Err("머리말 없는 글은 넣지 않습니다".into())

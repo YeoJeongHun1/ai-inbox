@@ -275,6 +275,9 @@ fn flush_outbox(out: &Out, sid: &str) -> usize {
 }
 
 pub fn run() {
+    if crate::llm::is_internal_env() {
+        return;
+    }
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));

@@ -46,6 +46,10 @@ pub struct SessionItem {
     archived: bool,
     /// claude | codex
     agent: &'static str,
+    /// /clear 로 끝난 대화면 그 처리(삭제 예약·보관·미정) — 화면이 흐리게 그린다
+    ended: Option<crate::lifecycle::Ended>,
+    /// 대표 태그 id(요청 태그에서 파생 — 큰 태그·요청 수 순, 최대 3)
+    tags: Vec<i64>,
 }
 
 /// 세션 표의 agent 값 → 화면·폰에 싣는 이름
@@ -96,10 +100,17 @@ fn preview(status: &str, prompt: Option<String>, response: Option<String>, summa
 #[tauri::command]
 pub fn list_sessions(state: State<AppState>, filter: String, query: String) -> R<Vec<SessionItem>> {
     let conn = state.conn.lock().map_err(e)?;
-    list_sessions_on(&conn, &filter, &query)
+    list_sessions_for(&conn, &filter, &query, false)
 }
 
+/// 폰(코노티)이 보는 목록 — 이력으로 보관한 세션도 보통 세션처럼 들어 있다(폰은 이력 탭이 없다)
 pub fn list_sessions_on(conn: &Connection, filter: &str, query: &str) -> R<Vec<SessionItem>> {
+    list_sessions_for(conn, filter, query, true)
+}
+
+/// `filter`: all | unread | attention | active | archived(보관함) | history(/clear 뒤 이력으로 보관한 것).
+/// `with_kept` 가 false 면 이력 보관 세션은 history 에서만 나온다.
+pub fn list_sessions_for(conn: &Connection, filter: &str, query: &str, with_kept: bool) -> R<Vec<SessionItem>> {
     let q = query.trim().to_string();
     let like = format!("%{}%", q.replace('%', "\\%").replace('_', "\\_"));
     let sql = format!(
@@ -115,10 +126,12 @@ pub fn list_sessions_on(conn: &Connection, filter: &str, query: &str) -> R<Vec<S
                 lt.id, lt.status, lt.needs_input, lt.origin, lt.prompt_text, lt.response_text, lt.summary,
                 COALESCE(lt.ended_at, lt.last_activity_at, lt.prompt_at),
                 (SELECT prompt_text FROM turn t WHERE t.session_id = s.id AND t.hidden = 0 ORDER BY seq LIMIT 1),
-                s.hidden, s.agent
+                s.hidden, s.agent, s.cleared_at, s.clear_state, s.purge_at, s.clear_asked
            FROM session s
            JOIN turn lt ON lt.id = (SELECT id FROM turn t WHERE t.session_id = s.id AND t.hidden = 0 ORDER BY seq DESC LIMIT 1)
-          WHERE s.hidden = ?3
+          WHERE ((?3 = 'history' AND s.clear_state = 'keep')
+                 OR (?3 = 'archived' AND s.hidden = 1)
+                 OR (?3 NOT IN ('history','archived') AND s.hidden = 0 AND (?4 = 1 OR COALESCE(s.clear_state, '') <> 'keep')))
             AND (?1 = '' OR s.live_name LIKE ?2 ESCAPE '\\' OR s.title LIKE ?2 ESCAPE '\\'
                  OR s.agent_name LIKE ?2 ESCAPE '\\' OR s.project_dir LIKE ?2 ESCAPE '\\'
                  OR EXISTS (SELECT 1 FROM turn t WHERE t.session_id = s.id AND t.hidden = 0
@@ -129,7 +142,7 @@ pub fn list_sessions_on(conn: &Connection, filter: &str, query: &str) -> R<Vec<S
     );
     let mut st = conn.prepare(&sql).map_err(e)?;
     let rows = st
-        .query_map(params![q, like, (filter == "archived") as i64], |r| {
+        .query_map(params![q, like, filter, with_kept as i64], |r| {
             let dir: Option<String> = r.get(4)?;
             let (name, named) = display_name(r.get(1)?, r.get(2)?, r.get(3)?, r.get(22)?, &dir);
             let status: String = r.get(15)?;
@@ -158,10 +171,18 @@ pub fn list_sessions_on(conn: &Connection, filter: &str, query: &str) -> R<Vec<S
                 last_at: r.get(21)?,
                 archived: r.get::<_, i64>(23)? != 0,
                 agent: agent_of(r.get(24)?),
+                ended: crate::lifecycle::ended_of(r.get(25)?, r.get(26)?, r.get(27)?, r.get(28)?),
+                tags: Vec::new(),
             })
         })
         .map_err(e)?;
     let mut out: Vec<SessionItem> = rows.flatten().collect();
+    let top = crate::tags::session_top_tags(conn, 3);
+    for s in &mut out {
+        if let Some(t) = top.get(&s.id) {
+            s.tags = t.clone();
+        }
+    }
     match filter {
         "unread" => out.retain(|s| s.unread > 0),
         "attention" => out.retain(|s| s.attention > 0),
@@ -220,6 +241,8 @@ pub struct TurnBubble {
     last_step: Option<(String, Option<String>, Option<String>)>,
     /// 요청에 붙은 이미지 id — 본문 끝의 경로 목록을 떼어 낸 것(`attach::split_block`)
     atts: Vec<String>,
+    /// 요청 태그(뗀 것 제외) — 수동·자동·모델 제안 순
+    tags: Vec<crate::tags::TurnTag>,
 }
 
 const BUBBLE_COLS: &str = "id, seq, origin, prompt_source, peer_name, prompt_at, prompt_text, slash_command, understanding,
@@ -284,6 +307,7 @@ fn bubble(r: &Row) -> rusqlite::Result<TurnBubble> {
             .get::<_, Option<String>>(41)?
             .and_then(|j| serde_json::from_str::<(String, Option<String>, Option<String>)>(&j).ok()),
         atts,
+        tags: Vec::new(),
     })
 }
 
@@ -325,6 +349,8 @@ pub struct SessionHeader {
     attach_command: Option<String>,
     /// claude | codex
     agent: &'static str,
+    /// /clear 로 끝난 대화면 그 처리
+    ended: Option<crate::lifecycle::Ended>,
 }
 
 fn send_mode_of(sid: &str) -> (&'static str, Option<String>) {
@@ -372,7 +398,7 @@ fn session_header_row(conn: &Connection, sid: &str) -> R<SessionHeader> {
                     (SELECT CAST(TOTAL(input_tokens + cache_create_5m + cache_create_1h + cache_read) AS INTEGER) FROM turn t WHERE t.session_id = s.id),
                     (SELECT CAST(TOTAL(api_calls) AS INTEGER) FROM turn t WHERE t.session_id = s.id),
                     (SELECT CASE WHEN mode = 1 THEN 1 ELSE 0 END FROM conoti_session c WHERE c.session_id = s.id),
-                    s.hidden, s.agent
+                    s.hidden, s.agent, s.cleared_at, s.clear_state, s.purge_at, s.clear_asked
                FROM session s WHERE s.id = ?1",
             f = FINISHED_SQL
         ),
@@ -412,6 +438,7 @@ fn session_header_row(conn: &Connection, sid: &str) -> R<SessionHeader> {
                 send_mode: "",
                 attach_command: None,
                 agent,
+                ended: crate::lifecycle::ended_of(r.get(26)?, r.get(27)?, r.get(28)?, r.get(29)?),
                 id,
             })
         },
@@ -455,11 +482,23 @@ pub fn get_chat(state: State<AppState>, session_id: String, before_seq: Option<i
 }
 
 pub fn get_chat_on(conn: &Connection, session_id: &str, before_seq: Option<i64>, limit: Option<i64>) -> R<ChatPage> {
+    get_chat_filtered(conn, session_id, before_seq, limit, None)
+}
+
+/// 태그로 거른 대화(고른 태그가 붙은 요청만). `filter` 가 없거나 비었으면 전체.
+#[tauri::command]
+pub fn get_chat_tagged(state: State<AppState>, session_id: String, filter: crate::tags::TagFilter, before_seq: Option<i64>, limit: Option<i64>) -> R<ChatPage> {
+    let conn = state.conn.lock().map_err(e)?;
+    get_chat_filtered(&conn, &session_id, before_seq, limit, Some(&filter))
+}
+
+pub fn get_chat_filtered(conn: &Connection, session_id: &str, before_seq: Option<i64>, limit: Option<i64>, filter: Option<&crate::tags::TagFilter>) -> R<ChatPage> {
     let limit = limit.unwrap_or(80).clamp(1, 500);
     let before = before_seq.unwrap_or(i64::MAX);
+    let extra = filter.and_then(|f| f.sql("turn")).map(|w| format!(" AND {w}")).unwrap_or_default();
     let mut st = conn
         .prepare(&format!(
-            "SELECT {BUBBLE_COLS} FROM turn WHERE session_id = ?1 AND hidden = 0 AND seq < ?2 ORDER BY seq DESC LIMIT ?3"
+            "SELECT {BUBBLE_COLS} FROM turn WHERE session_id = ?1 AND hidden = 0 AND seq < ?2{extra} ORDER BY seq DESC LIMIT ?3"
         ))
         .map_err(e)?;
     let mut turns: Vec<TurnBubble> = st
@@ -470,7 +509,16 @@ pub fn get_chat_on(conn: &Connection, session_id: &str, before_seq: Option<i64>,
     let has_more = turns.len() as i64 > limit;
     turns.truncate(limit as usize);
     turns.reverse();
+    fill_tags(conn, &mut turns);
     Ok(ChatPage { session: session_header(conn, session_id)?, turns, has_more })
+}
+
+fn fill_tags(conn: &Connection, turns: &mut [TurnBubble]) {
+    let ids: Vec<i64> = turns.iter().map(|t| t.id).collect();
+    let mut map = crate::tags::tags_of_turns(conn, &ids);
+    for t in turns {
+        t.tags = map.remove(&t.id).unwrap_or_default();
+    }
 }
 
 // ── 요청 하나 상세 ──────────────────────────────────────────────────────────
@@ -527,9 +575,10 @@ pub fn get_turn_on(conn: &Connection, turn_id: i64) -> R<TurnDetail> {
     let sid: String = conn
         .query_row("SELECT session_id FROM turn WHERE id = ?1", params![turn_id], |r| r.get(0))
         .map_err(e)?;
-    let turn = conn
+    let mut turn = conn
         .query_row(&format!("SELECT {BUBBLE_COLS} FROM turn WHERE id = ?1"), params![turn_id], bubble)
         .map_err(e)?;
+    fill_tags(conn, std::slice::from_mut(&mut turn));
 
     let mut st = conn
         .prepare("SELECT seq, at, kind, name, text FROM turn_step WHERE turn_id = ?1 ORDER BY seq")
@@ -787,6 +836,8 @@ pub struct OutlineRow {
     pub summary: Option<String>,
     /// 붙인 이미지 수
     pub atts: usize,
+    /// 요청 태그(뗀 것 제외)
+    pub tags: Vec<crate::tags::TurnTag>,
 }
 
 const OUTLINE_HEAD: usize = 240;
@@ -823,11 +874,18 @@ pub fn session_outline_on(conn: &Connection, sid: &str) -> R<Vec<OutlineRow>> {
                 unread: r.get::<_, i64>(9)? != 0,
                 summary: r.get(10)?,
                 atts: ids.len(),
+                tags: Vec::new(),
             })
         })
         .map_err(e)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(e)?;
+    let mut rows = rows;
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let mut map = crate::tags::tags_of_turns(conn, &ids);
+    for r in &mut rows {
+        r.tags = map.remove(&r.id).unwrap_or_default();
+    }
     Ok(rows)
 }
 
@@ -944,23 +1002,42 @@ pub struct Counts {
     pub unread: i64,
     pub attention: i64,
     pub active: i64,
+    /// /clear 뒤 이력으로 보관한 세션 수(이력 탭)
+    pub kept: i64,
+    /// /clear 됐는데 아직 확인·결정하지 않은 세션 수
+    pub undecided: i64,
 }
 
 pub fn counts_of(conn: &Connection) -> Counts {
+    counts_for(conn, false)
+}
+
+/// 폰(코노티)이 보는 개수 — 폰 목록엔 이력으로 보관한 세션도 보통 세션처럼 들어 있으므로(`list_sessions_on`)
+/// 배지 수도 그 세션을 센다. 0.8.0 과 같은 값이다(옛 폰은 항목 합과 배지를 나란히 그린다).
+pub fn counts_on(conn: &Connection) -> Counts {
+    counts_for(conn, true)
+}
+
+fn counts_for(conn: &Connection, with_kept: bool) -> Counts {
+    let keep = if with_kept { "" } else { "AND COALESCE(s.clear_state, '') <> 'keep'" };
     conn.query_row(
         &format!(
             "SELECT
                (SELECT COUNT(*) FROM turn t JOIN session s ON s.id = t.session_id
-                 WHERE s.hidden = 0 AND t.hidden = 0 AND t.read_at IS NULL AND t.status IN {f}),
+                 WHERE s.hidden = 0 {keep} AND t.hidden = 0 AND t.read_at IS NULL AND t.status IN {f}),
                (SELECT COUNT(*) FROM turn t JOIN session s ON s.id = t.session_id
-                 WHERE s.hidden = 0 AND t.hidden = 0
+                 WHERE s.hidden = 0 {keep} AND t.hidden = 0
                    AND (t.status = 'waiting' OR (t.needs_input = 1 AND t.read_at IS NULL AND t.status = 'done'))),
                (SELECT COUNT(*) FROM turn t JOIN session s ON s.id = t.session_id
-                 WHERE s.hidden = 0 AND t.hidden = 0 AND t.status IN ('running','background','waiting'))",
+                 WHERE s.hidden = 0 {keep} AND t.hidden = 0 AND t.status IN ('running','background','waiting')),
+               (SELECT COUNT(*) FROM session s WHERE s.clear_state = 'keep'
+                  AND EXISTS (SELECT 1 FROM turn t WHERE t.session_id = s.id AND t.hidden = 0)),
+               (SELECT COUNT(*) FROM session s WHERE s.cleared_at IS NOT NULL AND s.clear_asked = 0 AND s.hidden = 0
+                  AND EXISTS (SELECT 1 FROM turn t WHERE t.session_id = s.id AND t.hidden = 0))",
             f = FINISHED_SQL
         ),
         [],
-        |r| Ok(Counts { unread: r.get(0)?, attention: r.get(1)?, active: r.get(2)? }),
+        |r| Ok(Counts { unread: r.get(0)?, attention: r.get(1)?, active: r.get(2)?, kept: r.get(3)?, undecided: r.get(4)? }),
     )
     .unwrap_or_default()
 }
@@ -992,6 +1069,54 @@ pub fn install_hooks() -> R<install::HookStatus> {
 #[tauri::command]
 pub fn uninstall_hooks() -> R<install::HookStatus> {
     install::uninstall()
+}
+
+/// 화면 한쪽에 늘 보이는 "버전 · 빌드 시각" 과 정보 창 — 문제 신고에 쓰는 값만(경로는 사용자 화면용)
+#[derive(Serialize)]
+pub struct About {
+    /// tauri.conf.json 의 version (Cargo.toml·package.json 과 같아야 한다 — `about_versions_agree` 시험)
+    pub version: String,
+    /// 컴파일 시각 "YYYY-MM-DD HH:mm"(빌드한 PC 의 시각)
+    pub build_time: String,
+    /// 열려 있는 DB 의 스키마 버전
+    pub schema_version: i64,
+    pub data_dir: String,
+}
+
+pub const BUILD_TIME: &str = env!("AI_INBOX_BUILD_AT");
+
+#[tauri::command]
+pub fn about(app: tauri::AppHandle, state: State<AppState>) -> R<About> {
+    let schema_version = {
+        let conn = state.conn.lock().map_err(e)?;
+        db::get_meta(&conn, "schema_version").and_then(|v| v.parse().ok()).unwrap_or(db::SCHEMA_VERSION)
+    };
+    Ok(About {
+        version: app.package_info().version.to_string(),
+        build_time: BUILD_TIME.to_string(),
+        schema_version,
+        data_dir: paths::data_dir().to_string_lossy().into_owned(),
+    })
+}
+
+#[cfg(test)]
+mod about_tests {
+    /// 버전의 원천은 tauri.conf.json — Cargo.toml·package.json 이 어긋나면 화면·업데이트 판정이 갈린다
+    #[test]
+    fn about_versions_agree() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let pkg: serde_json::Value = serde_json::from_str(include_str!("../../package.json")).unwrap();
+        let v = conf["version"].as_str().unwrap();
+        assert_eq!(v, env!("CARGO_PKG_VERSION"), "tauri.conf.json ≠ Cargo.toml");
+        assert_eq!(v, pkg["version"].as_str().unwrap(), "tauri.conf.json ≠ package.json");
+    }
+
+    #[test]
+    fn build_time_shape() {
+        let t = super::BUILD_TIME;
+        assert_eq!(t.len(), 16, "{t}");
+        assert!(t.as_bytes()[4] == b'-' && t.as_bytes()[10] == b' ' && t.as_bytes()[13] == b':', "{t}");
+    }
 }
 
 #[derive(Serialize)]
@@ -1044,6 +1169,8 @@ pub fn set_setting(state: State<AppState>, key: String, value: i64) -> R<()> {
         "notify" | "notify_body" => value == 0 || value == 1,
         "notify_min_sec" => (0..=86_400).contains(&value),
         "codex_enabled" => value == 0 || value == 1,
+        // /clear 된 대화의 기본 처리: 0 매번 묻기(정할 때까지 자동 삭제 없음) · 1 삭제 예약(기본) · 2 이력으로 보관
+        "clear_default" => (0..=2).contains(&value),
         _ => return Err(format!("알 수 없는 설정: {key}")),
     };
     if !ok {
@@ -1391,6 +1518,20 @@ pub fn relay_set_device_manage(state: State<AppState>, shared: Relay, pid: Strin
     Ok(())
 }
 
+/// 이 기기가 폰에서 예약 전송을 만들고·고치고·취소하고·처리할 수 있는지(기본 끔)
+#[tauri::command]
+pub fn relay_set_device_schedule(state: State<AppState>, shared: Relay, pid: String, can_schedule: bool) -> R<()> {
+    let conn = state.conn.lock().map_err(e)?;
+    let n = conn
+        .execute("UPDATE relay_device SET can_schedule = ?2 WHERE pid = ?1", params![pid, can_schedule as i64])
+        .map_err(e)?;
+    if n == 0 {
+        return Err("그런 기기가 없습니다".into());
+    }
+    shared.bump_changed();
+    Ok(())
+}
+
 #[tauri::command]
 pub fn relay_set_device_reply(state: State<AppState>, shared: Relay, pid: String, can_reply: bool) -> R<()> {
     let conn = state.conn.lock().map_err(e)?;
@@ -1641,9 +1782,9 @@ pub fn attachment_reveal(state: State<AppState>, id: String) -> R<()> {
 // ── 기록 보관함 ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn archive_turns(state: State<AppState>, query: String, before: Option<String>, limit: Option<i64>) -> R<crate::archive::Page<crate::archive::TurnHit>> {
+pub fn archive_turns(state: State<AppState>, query: String, before: Option<String>, limit: Option<i64>, tags: Option<crate::tags::TagFilter>) -> R<crate::archive::Page<crate::archive::TurnHit>> {
     let conn = state.conn.lock().map_err(e)?;
-    crate::archive::search_turns(&conn, &query, before.as_deref(), limit.unwrap_or(40))
+    crate::archive::search_turns_tagged(&conn, &query, before.as_deref(), limit.unwrap_or(40), tags.as_ref())
 }
 
 #[tauri::command]
@@ -1778,6 +1919,124 @@ mod relay_status_tests {
 }
 
 // ── 새 버전 ──────────────────────────────────────────────────────────────────
+
+// ── /clear 로 끝난 대화 ──────────────────────────────────────────────────────
+
+/// 끝난 대화의 처리를 고른다 — keep(이력으로 보관) · purge(삭제 예약) · ask(보류). 바뀐 세션 수
+#[tauri::command]
+pub fn clear_decide(app: tauri::AppHandle, state: State<AppState>, ids: Vec<String>, decision: String) -> R<usize> {
+    if ids.len() > 500 {
+        return Err("한 번에 500개까지만 고를 수 있습니다".into());
+    }
+    let n = {
+        let conn = state.conn.lock().map_err(e)?;
+        crate::lifecycle::decide(&conn, &ids, &decision)?
+    };
+    crate::sessions_changed(&app, ids);
+    Ok(n)
+}
+
+/// /clear 됐지만 아직 정하지 않은(결정 대기) 세션들 — 결정 창용
+#[derive(Serialize)]
+pub struct ClearRow {
+    id: String,
+    name: String,
+    project_name: Option<String>,
+    turns: i64,
+    last_at: Option<String>,
+    ended: crate::lifecycle::Ended,
+}
+
+/// `only_undecided`: true 면 아직 안내를 확인하지 않은 것만, false 면 삭제 예약·미정 전체(보관 제외)
+#[tauri::command]
+pub fn clear_list(state: State<AppState>, only_undecided: bool) -> R<Vec<ClearRow>> {
+    let conn = state.conn.lock().map_err(e)?;
+    let mut st = conn
+        .prepare(
+            "SELECT s.id, s.live_name, s.title, s.agent_name, s.project_dir,
+                    (SELECT prompt_text FROM turn t WHERE t.session_id = s.id AND t.hidden = 0 ORDER BY seq LIMIT 1),
+                    (SELECT COUNT(*) FROM turn t WHERE t.session_id = s.id AND t.hidden = 0),
+                    (SELECT MAX(COALESCE(ended_at, last_activity_at, prompt_at)) FROM turn t WHERE t.session_id = s.id AND t.hidden = 0),
+                    s.cleared_at, s.clear_state, s.purge_at, s.clear_asked
+               FROM session s
+              WHERE s.cleared_at IS NOT NULL AND (?1 = 0 OR s.clear_asked = 0) AND (?1 = 1 OR COALESCE(s.clear_state,'') <> 'keep')
+                AND EXISTS (SELECT 1 FROM turn t WHERE t.session_id = s.id AND t.hidden = 0)
+              ORDER BY s.cleared_at DESC LIMIT 300",
+        )
+        .map_err(e)?;
+    let rows = st
+        .query_map(params![only_undecided as i64], |r| {
+            let dir: Option<String> = r.get(4)?;
+            let (name, _) = display_name(r.get(1)?, r.get(2)?, r.get(3)?, r.get(5)?, &dir);
+            Ok(ClearRow {
+                id: r.get(0)?,
+                name,
+                project_name: project_name(&dir),
+                turns: r.get(6)?,
+                last_at: r.get(7)?,
+                ended: crate::lifecycle::ended_of(r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?).unwrap_or_default(),
+            })
+        })
+        .map_err(e)?;
+    Ok(rows.flatten().collect())
+}
+
+/// 안내를 확인만 하고 기본 처리를 그대로 두기 — 결정 대기에서 뺀다
+#[tauri::command]
+pub fn clear_ack(app: tauri::AppHandle, state: State<AppState>, ids: Vec<String>) -> R<()> {
+    {
+        let conn = state.conn.lock().map_err(e)?;
+        for id in &ids {
+            conn.execute("UPDATE session SET clear_asked = 1 WHERE id = ?1 AND cleared_at IS NOT NULL", params![id]).map_err(e)?;
+        }
+    }
+    crate::sessions_changed(&app, ids);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_overview(state: State<AppState>) -> R<crate::lifecycle::Overview> {
+    let conn = state.conn.lock().map_err(e)?;
+    Ok(crate::lifecycle::overview(&conn))
+}
+
+// ── 대화 이력 검색(채팅 모드) ──────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn history_status(state: State<AppState>) -> R<crate::history::Status> {
+    let conn = state.conn.lock().map_err(e)?;
+    Ok(crate::history::status(&conn))
+}
+
+/// 설정 한 칸: enabled(0/1) · consent(0/1 — 대화 발췌가 고른 구독 서비스로 간다는 안내에 동의) · provider(auto|claude|codex) · model_claude · model_codex
+#[tauri::command]
+pub fn history_set(state: State<AppState>, key: String, value: String) -> R<()> {
+    let conn = state.conn.lock().map_err(e)?;
+    crate::history::set(&conn, &key, &value)
+}
+
+/// 설치·로그인된 구독 CLI(Claude Code · Codex)를 새로 감지한다 — CLI 를 몇 번 부르므로 1~2초 걸린다(앱 잠금을 잡지 않는다)
+#[tauri::command]
+pub async fn history_detect() -> R<crate::llm::Detection> {
+    tauri::async_runtime::spawn_blocking(crate::llm::detect).await.map_err(e)
+}
+
+/// 이전 버전이 저장한 API 키 파일을 지운다(더는 쓰지 않는다)
+#[tauri::command]
+pub fn history_forget_key() -> R<()> {
+    crate::history::forget_legacy_key()
+}
+
+#[tauri::command]
+pub async fn history_ask(messages: Vec<crate::history::ChatMsg>, local_only: Option<bool>, tags: Option<crate::tags::TagFilter>) -> R<crate::history::Answer> {
+    // 검색은 자기 DB 연결로, 네트워크를 기다리는 동안 앱 잠금을 잡지 않는다
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open(&paths::db_path()).map_err(e)?;
+        crate::history::ask(&conn, &messages, local_only.unwrap_or(false), tags.as_ref())
+    })
+    .await
+    .map_err(e)?
+}
 
 #[tauri::command]
 pub fn update_state(app: tauri::AppHandle) -> crate::update::UpdateState {

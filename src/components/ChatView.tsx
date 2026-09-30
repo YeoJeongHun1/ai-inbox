@@ -9,6 +9,7 @@ import {
   CircleHelp,
   CircleSlash,
   ChevronLeft,
+  Clock,
   ChevronRight,
   FileText,
   ListOrdered,
@@ -20,10 +21,13 @@ import {
   Smartphone,
   Star,
   SquareTerminal,
+  Tag as TagIcon,
 } from "lucide-react";
 import {
   api,
+  filterActive,
   isUnread,
+  NO_FILTER,
   phoneReply,
   quoteExcerpt,
   quoteLabel,
@@ -35,16 +39,20 @@ import {
   type OutlineRow,
   type Quote,
   type QuotePart,
+  type TagFilter,
   type QuoteTarget,
   type ReplyRow,
   type ToastFn,
   type Turn,
 } from "../api";
-import { clock, dayKey, dayParts, duration, modelName, numeral, statusView, tokens, toolName, usd } from "../format";
+import { clock, dayKey, dayParts, daysLeft, duration, fullTime, modelName, numeral, statusView, tokens, toolName, usd } from "../format";
 import { AttStrip, Lightbox } from "./Attachments";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
 import { Outline, outlineTitle } from "./Outline";
+import { TagBar } from "./TagBar";
+import { TagBadges, TagPicker } from "./TagUi";
+import { useTags } from "../tags";
 
 interface Props {
   sessionId: string;
@@ -57,6 +65,8 @@ interface Props {
   toast: ToastFn;
   /** 세션이 기록에서 지워졌다(폰에서 지운 경우 등) — 대화를 닫는다 */
   onGone: () => void;
+  /** 태그 관리 창을 연다 */
+  onManageTags: () => void;
 }
 
 /** 요청 목록을 열어 둔 채로 두는지 — 이 PC 화면 설정일 뿐이라 브라우저 저장소에 */
@@ -91,7 +101,7 @@ function keepSame(prev: Turn[], next: Turn[]): Turn[] {
   return same ? prev : out;
 }
 
-export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead, onReadAll, toast, onGone }: Props) {
+export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead, onReadAll, toast, onGone, onManageTags }: Props) {
   const [page, setPage] = useState<ChatPage | null>(null);
   const [older, setOlder] = useState<Turn[]>([]);
   const olderRef = useRef(older);
@@ -101,7 +111,20 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
   const [outbox, setOutbox] = useState<OutboxItem[]>([]);
   /** 아직 받아 오지 않은 이전 요청 중 안 읽은 것 — 대화를 받을 때마다 잰다 */
   const [restUnread, setRestUnread] = useState(0);
-  const [seed, setSeed] = useState<{ text: string; atts: AttMeta[]; n: number } | null>(null);
+  const [seed, setSeed] = useState<{ text: string; atts: AttMeta[]; n: number; prepend?: boolean } | null>(null);
+  // ── 태그로 거르기 — 고른 태그가 붙은 요청만(서버가 골라 준다) ──
+  const [filter, setFilter] = useState<TagFilter>(NO_FILTER);
+  const filterOn = filterActive(filter);
+  const filterKey = JSON.stringify(filter);
+  const [filtered, setFiltered] = useState<Turn[] | null>(null);
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
+  const filteredRef = useRef(filtered);
+  filteredRef.current = filtered;
+  const [tagTick, setTagTick] = useState(0);
+  const tagsSnap = useTags();
+  const [picker, setPicker] = useState<{ id: number; anchor: DOMRect } | null>(null);
+  const lastFilterKey = useRef(filterKey);
   // 메신저식 답장 — 한 세션에서 여러 작업이 돌 때 어느 요청·결과를 두고 하는 말인지
   const [quote, setQuote] = useState<QuoteTarget | null>(null);
   useEffect(() => setQuote(null), [sessionId]);
@@ -111,7 +134,13 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
   const jumpToSeq = useCallback((seq: number) => {
     const t = turnsRef.current.find((x) => x.seq === seq);
     const el = t && scroller.current?.querySelector(`[data-turn="${t.id}"]`);
-    el?.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (el) el.scrollIntoView({ block: "center", behavior: "smooth" });
+    else if (t && filterActive(filterRef.current)) {
+      // 태그로 거른 화면에 없는 요청 — 거르기를 풀고 그 자리로
+      setFilter(NO_FILTER);
+      jumpTo.current = t.id;
+      setJumpTick((n) => n + 1);
+    }
   }, []);
   const [viewer, setViewer] = useState<{ ids: string[]; index: number } | null>(null);
   const openImages = useCallback((ids: string[], index: number) => setViewer({ ids, index }), []);
@@ -176,8 +205,51 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
     setSingle(false);
     setFocusId(null);
     setCurrentId(null);
+    setFilter(NO_FILTER);
+    setFiltered(null);
+    setPicker(null);
     load();
   }, [sessionId, load]);
+
+  // 태그로 거른 요청 — 대화가 바뀌거나 태그가 바뀔 때마다 다시 받는다(서버가 고른다: 안 받아 둔 이전 요청 포함, 최대 500)
+  useEffect(() => {
+    if (!filterOn) {
+      setFiltered(null);
+      return;
+    }
+    let dead = false;
+    api
+      .getChatTagged(sessionId, filterRef.current, undefined, 500)
+      .then((p) => {
+        if (dead) return;
+        setFiltered((prev) => keepSame(prev ?? [], p.turns));
+      })
+      .catch(() => {});
+    return () => {
+      dead = true;
+    };
+  }, [sessionId, filterOn, filterKey, refreshKey, tagsSnap.ov, tagTick]);
+  // 거르기를 바꾸거나 풀면 가장 최근 요청으로
+  useEffect(() => {
+    if (lastFilterKey.current === filterKey) return;
+    lastFilterKey.current = filterKey;
+    toBottom();
+  }, [filterKey, filtered]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** 태그를 고친 뒤 — 받아 둔 요청(최근·이전)의 태그와 거른 목록을 새로 */
+  const refreshTags = useCallback(async () => {
+    await load();
+    const old = olderRef.current;
+    if (old.length) {
+      try {
+        const p = await api.getChat(sessionId, old[old.length - 1].seq + 1, old.length);
+        setOlder(p.turns);
+      } catch {
+        /* 다음 갱신에서 */
+      }
+    }
+    setTagTick((n) => n + 1);
+  }, [load, sessionId]);
 
   useEffect(() => {
     if (needOutline) loadOutline();
@@ -219,6 +291,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
     };
     setPage((p) => (p ? { ...p, turns: mark(p.turns) } : p));
     setOlder((o) => mark(o));
+    setFiltered((f) => (f ? mark(f) : f));
     setOutline((rows) => {
       if (!rows) return rows;
       let hit = false;
@@ -300,6 +373,8 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
 
   const pick = useCallback(
     async (id: number) => {
+      // 태그로 거른 화면에 없는 요청을 목차에서 골랐다 — 거르기를 풀고 그 자리로
+      if (filterActive(filterRef.current) && !filteredRef.current?.some((t) => t.id === id)) setFilter(NO_FILTER);
       await ensureLoaded(id);
       if (single) {
         setFocusId(id);
@@ -338,13 +413,15 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
   }, [single, setMode]);
 
   // 하나씩 보기의 앞뒤 요청 — 목차 순서(아직 없으면 받아 둔 대화 순서)
-  const order: { id: number }[] = outline ?? turns;
+  /** 화면에 그리는 요청 — 태그로 거르면 서버가 골라 준 것, 아니면 받아 둔 전부 */
+  const visible = filterOn ? (filtered ?? []) : turns;
+  const order: { id: number }[] = filterOn ? visible : (outline ?? turns);
   const focusIndex = focusId != null ? order.findIndex((r) => r.id === focusId) : -1;
   const step = (d: number) => {
     const next = order[focusIndex + d];
     if (next) pick(next.id);
   };
-  const shownTurns = useMemo(() => (single && focusId != null ? turns.filter((t) => t.id === focusId) : turns), [single, focusId, turns]);
+  const shownTurns = useMemo(() => (single && focusId != null ? visible.filter((t) => t.id === focusId) : visible), [single, focusId, visible]);
 
   // 처음 열 때: 안 읽은 첫 결과로, 없으면 맨 아래로. 이후 갱신: 바닥 근처면 따라 내려간다.
   useLayoutEffect(() => {
@@ -362,7 +439,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
       return;
     }
     if (nearBottom.current && !single) el.scrollTop = el.scrollHeight;
-  }, [page, outbox]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [page, outbox, filtered]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 목차에서 고른 요청으로 — 요청 말풍선이 위에 오게, 잠깐 테두리로 짚어 준다
   useLayoutEffect(() => {
@@ -503,7 +580,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
 
   const jumpUnread = () => {
     const el = scroller.current;
-    const next = turns.find(isUnread);
+    const next = visible.find(isUnread);
     if (!el || !next) return;
     if (single) {
       setFocusId(next.id);
@@ -519,7 +596,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
 
   let lastDay = "";
   return (
-    <section className="chat">
+    <section className={`chat ${s.ended ? `ended st-${s.ended.state}` : ""}`}>
       <header className="chat-head" data-tauri-drag-region>
         <div className="chat-title">
           <h1 className={s.named ? "" : "unnamed"}>{s.name}</h1>
@@ -624,6 +701,62 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
         </div>
       )}
 
+      {s.ended && (
+        <div className={`ended-bar st-${s.ended.state}`}>
+          <Clock size={14} />
+          <span>
+            {s.ended.state === "keep" ? (
+              <>/clear 로 끝난 대화입니다. <strong>이력으로 보관 중</strong> — 자동으로 지워지지 않고 이력 탭·이력 찾기에서 볼 수 있습니다.</>
+            ) : s.ended.state === "ask" ? (
+              <>/clear 로 끝난 대화입니다. 아직 처리를 정하지 않았습니다 — <strong>자동으로 지워지지 않습니다.</strong></>
+            ) : (
+              <>
+                /clear 로 끝난 대화입니다. <strong>{daysLeft(s.ended.purge_at) ?? "?"}일 뒤({fullTime(s.ended.purge_at).slice(0, 10)})</strong> 이 앱의 사본이 삭제됩니다 — Claude Code 에서{" "}
+                <code>/resume</code>·<code>/rewind</code> 로 되돌릴 수 있는 기간이 끝난 뒤입니다. 이어서 쓰면 취소됩니다.
+              </>
+            )}
+          </span>
+          {s.ended.state !== "keep" && (
+            <button
+              className="more"
+              onClick={async () => {
+                await api.clearDecide([sessionId], "keep");
+                await load();
+                onRead();
+                toast("이력으로 보관합니다 — 이력 탭에서 볼 수 있습니다");
+              }}
+            >
+              이력으로 보관
+            </button>
+          )}
+          {s.ended.state !== "purge" && (
+            <button
+              className="more"
+              onClick={async () => {
+                await api.clearDecide([sessionId], "purge");
+                await load();
+                onRead();
+                toast("삭제 예약했습니다");
+              }}
+            >
+              삭제 예약
+            </button>
+          )}
+          {s.ended.state === "purge" && !s.ended.asked && (
+            <button
+              className="more"
+              onClick={async () => {
+                await api.clearAck([sessionId]);
+                await load();
+                onRead();
+              }}
+            >
+              그대로 두기
+            </button>
+          )}
+        </div>
+      )}
+
       {pending.length > 0 && (
         <div className="confirm-bar">
           {pending.map((r) => (
@@ -656,6 +789,16 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
         </div>
       )}
 
+      <TagBar
+        sessionId={sessionId}
+        refreshKey={refreshKey + tagTick}
+        filter={filter}
+        onFilter={setFilter}
+        onManage={onManageTags}
+        onContext={(text) => setSeed({ text, atts: [], n: Date.now(), prepend: true })}
+        toast={toast}
+      />
+
       <div className={`chat-body ${tocOpen ? "with-toc" : ""}`}>
         <div className="chat-scroll" ref={scroller} onScroll={onScroll}>
           {single && (
@@ -681,7 +824,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
             </div>
           )}
           <div className="chat-inner">
-            {hasMoreOlder && !single && (
+            {hasMoreOlder && !single && !filterOn && (
               <button className="load-older" onClick={loadOlder}>
                 이전 요청 더 보기
               </button>
@@ -704,12 +847,14 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
                       <span>안 읽은 결과 {unreadCount}</span>
                     </div>
                   )}
-                  <UserBubble t={t} onOpenImages={openImages} onReply={reply} onJump={jumpToSeq} />
+                  <UserBubble t={t} onOpenImages={openImages} onReply={reply} onJump={jumpToSeq} onTags={(anchor) => setPicker({ id: t.id, anchor })} onTagsChanged={refreshTags} />
                   <AiBubble t={t} open={openTurnId === t.id} onOpenTurn={onOpenTurn} onReply={reply} />
                 </div>
               );
             })}
+            {filterOn && filtered && filtered.length === 0 && <p className="tag-empty">고른 태그가 붙은 요청이 없습니다.</p>}
             {!single &&
+              !filterOn &&
               outbox.map((o) => (
               <OutboxBubble
                 key={o.rid}
@@ -748,6 +893,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
             rows={outline}
             currentId={single ? focusId : currentId}
             unreadOf={unreadOf}
+            tagFilter={filterOn ? filter : null}
             single={single}
             onSingle={setMode}
             onPick={pick}
@@ -768,6 +914,17 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
           load();
         }}
       />
+      {picker && (
+        <TagPicker
+          turnId={picker.id}
+          sessionId={sessionId}
+          current={(visible.find((t) => t.id === picker.id) ?? turnById.get(picker.id))?.tags ?? []}
+          anchor={picker.anchor}
+          onClose={() => setPicker(null)}
+          onChanged={refreshTags}
+          toast={toast}
+        />
+      )}
       {viewer && <Lightbox ids={viewer.ids} index={viewer.index} onClose={() => setViewer(null)} toast={toast} />}
     </section>
   );
@@ -797,7 +954,7 @@ function OutboxBubble({
     <div className="user-row">
       <div className={`user pending s-${o.state}`}>
         <div className="who">
-          {o.from_phone ? <span className="via-phone">나 · 폰에서</span> : "나 · AI Inbox"}
+          {o.from_phone ? <span className="via-phone">나 · 폰에서</span> : o.sched ? "나 · AI Inbox 예약" : "나 · AI Inbox"}
           <time>{clock(o.at)}</time>
         </div>
         {o.quote && (
@@ -836,11 +993,15 @@ const UserBubble = memo(function UserBubble({
   onOpenImages,
   onReply,
   onJump,
+  onTags,
+  onTagsChanged,
 }: {
   t: Turn;
   onOpenImages: (ids: string[], index: number) => void;
   onReply: (t: Turn, part: QuotePart) => void;
   onJump: (seq: number) => void;
+  onTags: (anchor: DOMRect) => void;
+  onTagsChanged: () => void;
 }) {
   const [more, setMore] = useState(false);
   const phone = phoneReply(t.prompt_text);
@@ -857,6 +1018,8 @@ const UserBubble = memo(function UserBubble({
             `${t.peer_name ?? "다른 세션"} 이 보냄`
           ) : t.origin === "inbox" ? (
             "나 · AI Inbox"
+          ) : t.origin === "sched" ? (
+            "나 · AI Inbox 예약"
           ) : t.origin === "channel" ? (
             "채널에서 옴"
           ) : (
@@ -868,6 +1031,9 @@ const UserBubble = memo(function UserBubble({
           <button className="reply-btn" title="이 요청에 답장" onClick={() => onReply(t, "prompt")}>
             <Reply size={13} />
           </button>
+          <button className="reply-btn" title="이 요청의 태그 고치기" onClick={(e) => onTags(e.currentTarget.getBoundingClientRect())}>
+            <TagIcon size={13} />
+          </button>
         </div>
         {quote && <QuoteBlock q={quote} onJump={onJump} />}
         {t.slash_command && <code className="slash">{t.slash_command}</code>}
@@ -878,6 +1044,7 @@ const UserBubble = memo(function UserBubble({
           </button>
         )}
         <AttStrip ids={t.atts ?? []} onOpen={onOpenImages} />
+        {t.tags?.length > 0 && <TagBadges tags={t.tags} turnId={t.id} onChanged={onTagsChanged} />}
       </div>
     </div>
   );

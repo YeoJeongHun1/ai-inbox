@@ -9,7 +9,11 @@ import { Settings } from "./components/Settings";
 import { PairDialog } from "./components/PairDialog";
 import { PhoneDialog } from "./components/PhoneDialog";
 import { NewTaskDialog } from "./components/NewTaskDialog";
+import { ScheduleList } from "./components/ScheduleList";
 import { ArchiveView } from "./components/ArchiveView";
+import { ClearDialog } from "./components/ClearDialog";
+import { HistoryChat } from "./components/HistoryChat";
+import { TagManager } from "./components/TagManager";
 import { UpdateBar, WhatsNew } from "./components/UpdateBar";
 import "./App.css";
 
@@ -34,7 +38,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [openTurn, setOpenTurn] = useState<number | null>(null);
-  const [counts, setCounts] = useState<Counts>({ unread: 0, attention: 0, active: 0 });
+  const [counts, setCounts] = useState<Counts>({ unread: 0, attention: 0, active: 0, kept: 0, undecided: 0 });
   const [chatKey, setChatKey] = useState(0);
   const [docKey, setDocKey] = useState(0);
   const [working, setWorking] = useState(false);
@@ -42,7 +46,26 @@ export default function App() {
   const [pair, setPair] = useState<{ name: string; sas: string } | null>(null);
   const [phoneOpen, setPhoneOpen] = useState(false);
   const [newTask, setNewTask] = useState(false);
+  /** 예약 목록 창 · 걸려 있는/처리 대기 예약 수 */
+  const [schedOpen, setSchedOpen] = useState(false);
+  const [schedCount, setSchedCount] = useState({ active: 0, held: 0 });
+  useEffect(() => {
+    const load = () => api.schedCounts().then(setSchedCount).catch(() => {});
+    load();
+    const un = listen("sched-changed", load);
+    const t = setInterval(load, 60_000);
+    return () => {
+      clearInterval(t);
+      un.then((f) => f());
+    };
+  }, []);
   const [archive, setArchive] = useState(false);
+  /** 대화 이력 찾기(검색 모드 채팅)를 메인에 띄웠나 */
+  const [historyChat, setHistoryChat] = useState(false);
+  /** 요청 태그 관리 창 */
+  const [tagMgr, setTagMgr] = useState(false);
+  /** /clear 로 끝난 대화 결정 창 */
+  const [clearDlg, setClearDlg] = useState<{ onlyUndecided: boolean } | null>(null);
   /** 방금 띄운 새 작업(짧은 ID) — 목록에 나타나면 연다 */
   const openWhenListed = useRef<{ short: string; until: number } | null>(null);
   const [phone, setPhone] = useState<{ devices: number; online: number } | null>(null);
@@ -139,18 +162,35 @@ export default function App() {
     // 폰이 연결을 청하면 허용 창
     const un3 = listen<{ name: string; sas: string }>("relay-pair", (e) => setPair(e.payload));
     const un4 = listen("open-phone", () => setPhoneOpen(true));
+    // /clear 로 세션이 끝났다 — 기본 처리(설정)를 알리고 이력으로 남길지 묻는다
+    const un5 = listen<{ count: number; default: string }>("clear-detected", (e) => {
+      const d = e.payload.default;
+      const msg =
+        d === "keep"
+          ? `/clear 된 대화 ${e.payload.count}개를 이력으로 보관했습니다`
+          : d === "ask"
+            ? `/clear 된 대화 ${e.payload.count}개 — 이력으로 남길지 정해 주세요(정할 때까지 지우지 않습니다)`
+            : `/clear 된 대화 ${e.payload.count}개는 삭제 예약됩니다 — 이력으로 남길까요?`;
+      toast(msg, { label: "정하기", run: () => setClearDlg({ onlyUndecided: true }) });
+    });
     const hookTimer = window.setInterval(() => api.appInfo().then((i) => setHookLast(i.hook_last_at)), 30_000);
     return () => {
       un1.then((f) => f());
       un2.then((f) => f());
       un3.then((f) => f());
       un4.then((f) => f());
+      un5.then((f) => f());
       window.clearInterval(hookTimer);
     };
-  }, [loadList]);
+  }, [loadList, toast]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "h") {
+        e.preventDefault();
+        setHistoryChat((v) => !v);
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "f") {
         e.preventDefault();
         setArchive(true);
@@ -186,6 +226,7 @@ export default function App() {
 
   const select = (id: string) => {
     if (id !== selected) setOpenTurn(null);
+    setHistoryChat(false);
     setSelected(id);
   };
 
@@ -256,6 +297,7 @@ export default function App() {
   return (
     <div className={`app ${openTurn ? "with-doc" : ""}`}>
       <Sidebar
+        toast={toast}
         sessions={sessions}
         filter={filter}
         onFilter={setFilter}
@@ -274,10 +316,27 @@ export default function App() {
         banner={<UpdateBar state={upd} relayUpgrade={relayUpgrade} progress={updProgress} onChanged={loadUpdate} toast={toast} />}
         onSessionAction={onSessionAction}
         onReadAll={() => readAll(null, "모든 세션").catch((e) => toast(String(e)))}
+        onHistoryChat={() => setHistoryChat((v) => !v)}
+        historyChatOpen={historyChat}
+        sched={schedCount}
+        onSched={() => setSchedOpen(true)}
+        onDecide={() => setClearDlg({ onlyUndecided: true })}
         searchRef={searchRef}
       />
 
-      {selected ? (
+      {historyChat ? (
+        <HistoryChat
+          onSettings={() => setSettings(true)}
+          toast={toast}
+          onOpenTurn={(sid, turnId) => {
+            // 이력 보관 세션은 이력 탭에서만 보이므로 목록 필터를 맞춰 준다
+            setQuery("");
+            setHistoryChat(false);
+            setSelected(sid);
+            setOpenTurn(turnId);
+          }}
+        />
+      ) : selected ? (
         <ChatView
           key={selected}
           sessionId={selected}
@@ -288,6 +347,7 @@ export default function App() {
           onReadAll={readAll}
           toast={toast}
           onGone={onGone}
+          onManageTags={() => setTagMgr(true)}
         />
       ) : (
         <section className="chat empty">
@@ -313,9 +373,16 @@ export default function App() {
             loadUpdate();
           }}
           onHooksChanged={() => refreshHooks()}
+          onTags={() => {
+            setSettings(false);
+            setTagMgr(true);
+          }}
           toast={toast}
         />
       )}
+      {tagMgr && <TagManager onClose={() => setTagMgr(false)} toast={toast} onChanged={onDocChanged} />}
+      {clearDlg && <ClearDialog onlyUndecided={clearDlg.onlyUndecided} onClose={() => setClearDlg(null)} onChanged={onDocChanged} toast={toast} />}
+      {schedOpen && <ScheduleList toast={toast} onClose={() => setSchedOpen(false)} onOpenSession={(sid) => (setQuery(""), setFilter("all"), select(sid))} />}
       {phoneOpen && <PhoneDialog onClose={() => setPhoneOpen(false)} toast={toast} />}
       {archive && (
         <ArchiveView

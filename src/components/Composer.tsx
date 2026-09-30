@@ -1,8 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ArrowUp, ImagePlus, Lock, Reply, X } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
+import { ArrowUp, Clock, ImagePlus, Lock, Reply, X } from "lucide-react";
 import { api, quoteLabel, type AttMeta, type QuoteTarget, type SessionHeader, type SendMode } from "../api";
 import { DraftTray, MAX_ATTS, hasFiles, imagesFromClipboard, useAttachDraft } from "./Attachments";
+import { tagColor, useTags } from "../tags";
+import { ScheduleDialog } from "./ScheduleDialog";
+import { ScheduleList } from "./ScheduleList";
+
+/** 캐럿 바로 앞의 `#낱말` — 공백·여는 괄호·따옴표 뒤에서 시작한 것만(URL 조각·마크다운 제목은 제외) */
+const HASH_AT_CARET = /(?:^|[\s(\[{"'「『“‘,;:])#([\p{L}\p{N}_\-·]*)$/u;
 
 /** 세션을 오가도 쓰던 글이 남게(앱을 끄면 사라진다 — 디스크에 두지 않는다) */
 const drafts = new Map<string, string>();
@@ -26,7 +33,7 @@ const HINT: Record<SendMode, string> = {
 interface Props {
   session: SessionHeader;
   /** 되돌려 받은 글·이미지(보내지 못한 말 "다시 쓰기") — n 이 바뀔 때마다 입력창에 채운다 */
-  seed: { text: string; atts: AttMeta[]; n: number } | null;
+  seed: { text: string; atts: AttMeta[]; n: number; prepend?: boolean } | null;
   onSent: () => void;
   toast: (m: string) => void;
   /** 답장 대상(요청·결과에 달린 "답장"으로 고른 것) — 보내면 비운다 */
@@ -43,10 +50,57 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
   const ref = useRef<HTMLTextAreaElement>(null);
   const picker = useRef<HTMLInputElement>(null);
   const att = useAttachDraft(sid, toast);
+  const { ov } = useTags();
+  const [caret, setCaret] = useState(0);
+  const [pick, setPick] = useState(0);
+  const [tagOff, setTagOff] = useState(false);
+  /** 예약 전송: 입력창의 글을 정한 시각에 보내기 · 이 세션의 예약 목록 */
+  const [schedDlg, setSchedDlg] = useState(false);
+  const [schedList, setSchedList] = useState(false);
+  const [schedN, setSchedN] = useState(0);
+  const [schedHeld, setSchedHeld] = useState(0);
+  useEffect(() => {
+    const load = () =>
+      api
+        .schedList(sid)
+        .then((l) => {
+          setSchedN(l.filter((i) => i.state === "active").length);
+          setSchedHeld(l.filter((i) => i.run?.state === "held").length);
+        })
+        .catch(() => {});
+    load();
+    const un = listen("sched-changed", load);
+    return () => {
+      un.then((f) => f());
+    };
+  }, [sid]);
+
+  // `#` 뒤에 글자를 치면 이미 있는 태그를 제안한다(공백이 든 이름은 #태그 로 쓸 수 없어 뺀다)
+  const hashQuery = tagOff ? null : HASH_AT_CARET.exec(text.slice(0, caret))?.[1] ?? null;
+  const suggestions =
+    hashQuery === null
+      ? []
+      : (ov?.tags ?? [])
+          .filter((t) => !/\s/.test(t.name) && t.name.toLowerCase().includes(hashQuery.toLowerCase()) && t.name.toLowerCase() !== hashQuery.toLowerCase())
+          .sort((a, b) => Number(b.name.toLowerCase().startsWith(hashQuery.toLowerCase())) - Number(a.name.toLowerCase().startsWith(hashQuery.toLowerCase())) || b.turns - a.turns)
+          .slice(0, 6);
+  const applyTag = (name: string) => {
+    const before = text.slice(0, caret);
+    const m = HASH_AT_CARET.exec(before);
+    if (!m) return;
+    const start = caret - m[1].length; // '#' 바로 뒤
+    const next = text.slice(0, start) + name + " " + text.slice(caret);
+    setText(next);
+    const pos = start + name.length + 1;
+    requestAnimationFrame(() => {
+      ref.current?.setSelectionRange(pos, pos);
+      setCaret(pos);
+    });
+  };
 
   useEffect(() => {
     if (seed) {
-      setText(seed.text);
+      setText((cur) => (seed.prepend ? seed.text + cur : seed.text));
       if (seed.atts.length) att.addSaved(seed.atts);
       ref.current?.focus();
     }
@@ -139,6 +193,14 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
         else toast("이미지 파일만 붙일 수 있습니다");
       }}
     >
+      {(schedN > 0 || schedHeld > 0) && (
+        <div className={`sched-chip-row ${schedHeld > 0 ? "warn" : ""}`}>
+          <Clock size={13} />
+          <button className="more" onClick={() => setSchedList(true)}>
+            {schedHeld > 0 ? `예약 ${schedHeld}건이 전달되지 못했습니다 — 처리하기` : `예약 ${schedN}건 대기 중`}
+          </button>
+        </div>
+      )}
       {quote && (
         <div className="quote-bar">
           <Reply size={14} />
@@ -153,6 +215,26 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
       )}
       <DraftTray items={att.items} onRemove={att.remove} />
       <div className="composer-box">
+        {suggestions.length > 0 && (
+          <ul className="tag-suggest" role="listbox" aria-label="태그 제안">
+            {suggestions.map((t, i) => (
+              <li
+                key={t.id}
+                role="option"
+                aria-selected={i === pick}
+                className={i === pick ? "on" : ""}
+                onMouseDown={(e) => {
+                  e.preventDefault(); // 입력창의 포커스를 잃지 않게
+                  applyTag(t.name);
+                }}
+              >
+                <span className="ts-dot" style={{ background: tagColor(t) }} />
+                #{t.name}
+                <span className="ts-n">{t.turns}</span>
+              </li>
+            ))}
+          </ul>
+        )}
         <button
           type="button"
           className="attach-btn"
@@ -181,7 +263,13 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
           maxLength={4000}
           placeholder={att.items.length ? "이미지와 함께 보낼 말 (비워 둬도 됩니다)" : "이 세션에 이어서 시킬 일"}
           spellCheck={false}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            setCaret(e.target.selectionStart ?? e.target.value.length);
+            setPick(0);
+            setTagOff(false);
+          }}
+          onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
           onPaste={(e) => {
             const files = imagesFromClipboard(e.clipboardData);
             if (!files.length) return; // 글자 붙여넣기는 그대로
@@ -191,6 +279,23 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
           onKeyDown={(e) => {
             // 한글 조합 중의 Enter 는 글자 확정이다 — 보내지 않는다
             if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+            if (suggestions.length > 0) {
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                e.preventDefault();
+                setPick((p) => (p + (e.key === "ArrowDown" ? 1 : suggestions.length - 1)) % suggestions.length);
+                return;
+              }
+              if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+                e.preventDefault();
+                applyTag(suggestions[Math.min(pick, suggestions.length - 1)].name);
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setTagOff(true);
+                return;
+              }
+            }
             if (e.key === "Escape" && quote) {
               e.preventDefault();
               onClearQuote();
@@ -202,12 +307,39 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
             }
           }}
         />
+        <button
+          type="button"
+          className="attach-btn"
+          title="예약해서 보내기 — 정한 시각에 이 세션에 넣습니다(AI Inbox 가 켜져 있을 때만)"
+          disabled={!canSend}
+          onClick={() => setSchedDlg(true)}
+        >
+          <Clock size={17} />
+        </button>
         <button className="send-btn" title="보내기 (Enter · 줄바꿈은 Shift+Enter)" disabled={!canSend} onClick={send}>
           <ArrowUp size={17} />
         </button>
       </div>
+      {schedDlg && (
+        <ScheduleDialog
+          sessionId={sid}
+          sessionName={session.name}
+          text={text}
+          attIds={att.ids}
+          quote={quote}
+          toast={toast}
+          onClose={() => setSchedDlg(false)}
+          onDone={() => {
+            setSchedDlg(false);
+            setText("");
+            att.clear();
+            onClearQuote();
+          }}
+        />
+      )}
+      {schedList && <ScheduleList sessionId={sid} toast={toast} onClose={() => setSchedList(false)} onOpenSession={() => {}} />}
       <div className="composer-hint">
-        <span>{(session.agent === "codex" && CODEX_HINT[session.send_mode]) || HINT[session.send_mode]}</span>
+        <span>{(session.agent === "codex" && CODEX_HINT[session.send_mode]) || HINT[session.send_mode]} · #태그 를 쓰면 이 요청에 그 태그가 붙습니다</span>
         {session.attach_command && (session.send_mode === "approve" || session.send_mode === "queue") && (
           <button
             className="hint-cmd"

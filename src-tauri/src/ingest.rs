@@ -10,7 +10,7 @@
 //! 백그라운드 작업 완료 알림(task-notification)·한도 리셋 후 이어가기(auto-continuation)는
 //! 새 요청이 아니라 **같은 요청의 연장**이다 — 결과 보고는 대개 그 뒤에 나온다.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ mod cx;
 
 /// 파서 규칙이 바뀌면 올린다 → 다음 실행 때 백필 기간 안의 파일을 처음부터 다시 읽는다
 /// (읽음·별표 같은 사용자 상태는 upsert 가 건드리지 않으므로 보존된다).
-pub const PARSER_VERSION: &str = "13";
+pub const PARSER_VERSION: &str = "14";
 
 const FINISHED: &[&str] = &["done", "interrupted", "stopped"];
 /// 이보다 오래 조용하고 프로세스도 없으면 멈춘 것으로 본다.
@@ -201,6 +201,8 @@ struct TurnAcc {
     efforts: BTreeMap<String, i64>,
     tools: BTreeMap<String, i64>,
     files: BTreeMap<String, i64>,
+    /// 읽거나 고친 경로·명령 속 절대경로(태깅 신호, `tags::collect_touched`)
+    touched: BTreeSet<String>,
     subs: Vec<Sub>,
     sub_by_tool: HashMap<String, usize>,
     pending_ask: Option<String>,
@@ -255,6 +257,7 @@ impl TurnAcc {
             efforts: BTreeMap::new(),
             tools: BTreeMap::new(),
             files: BTreeMap::new(),
+            touched: BTreeSet::new(),
             subs: Vec::new(),
             sub_by_tool: HashMap::new(),
             pending_ask: None,
@@ -378,6 +381,8 @@ struct FileState {
     last_status: Option<(String, bool)>,
     /// Codex 기록 파일이면 그쪽 해석 상태
     cx: Option<cx::CxState>,
+    /// 앱이 모델을 부르려고 띄운 세션의 기록(작업 폴더가 `llm-scratch`) — 세션으로 만들지 않는다
+    internal: bool,
 }
 
 impl FileState {
@@ -395,6 +400,7 @@ impl FileState {
             side: Vec::new(),
             last_status: None,
             cx: codex.then(cx::CxState::default),
+            internal: false,
         }
     }
 
@@ -423,6 +429,12 @@ pub struct Report {
     pub working: bool,
     /// 이번 틱에 읽은 파일 수
     pub processed: usize,
+    /// 이번 틱에 새로 /clear 로 끝난 것으로 표시한 세션(화면에 결정 안내를 띄운다)
+    pub cleared: Vec<String>,
+    /// 만료·되살림으로 세션이 지워지거나 표시가 바뀌었다
+    pub lifecycle_changed: bool,
+    /// 요청 태그가 새로 붙었다(훅 기록 ↔ 대화 기록이 이어짐) — 태그 목록·개수를 다시 읽게 한다
+    pub tags_changed: bool,
 }
 
 pub struct Ingestor {
@@ -443,6 +455,8 @@ pub struct Ingestor {
     codex_live: Option<HashSet<String>>,
     /// 세션 표에 마지막으로 쓴 Codex 세션의 live_status
     codex_written: HashMap<String, Option<String>>,
+    /// 방금 SessionEnd(reason=clear) 를 받은 세션과 그 시각(ms) — 뒤따르는 SessionStart(source=clear) 를 잇는다
+    last_clear: Option<(String, i64)>,
 }
 
 impl Ingestor {
@@ -509,6 +523,7 @@ impl Ingestor {
             codex_index_mtime: -1,
             codex_live: None,
             codex_written: HashMap::new(),
+            last_clear: None,
         }
     }
 
@@ -522,6 +537,16 @@ impl Ingestor {
         self.scan_codex(&mut rep);
         self.refresh_codex(&mut rep);
         self.recheck_open(&mut rep);
+        // 만료·되살림 검사 — 1분에 한 번(첫 틱 포함)
+        if self.tick_no % 40 == 1 {
+            crate::tags::sweep_hints(&self.conn, chrono::Utc::now().timestamp_millis());
+            let r = crate::lifecycle::sweep(&self.conn, chrono::Utc::now().timestamp_millis());
+            if !r.revived.is_empty() || !r.purged.is_empty() {
+                rep.lifecycle_changed = true;
+                rep.changed.extend(r.revived);
+                rep.changed.extend(r.purged);
+            }
+        }
         rep
     }
 
@@ -539,7 +564,7 @@ impl Ingestor {
             return;
         }
         entries.sort();
-        let tx = self.conn.unchecked_transaction().ok();
+        let began = self.conn.execute_batch("BEGIN").is_ok();
         for path in entries {
             // 훅이 만드는 파일은 수 KB — 그보다 훨씬 크면 우리 것이 아니다
             if std::fs::metadata(&path).map(|m| m.len() > 1024 * 1024).unwrap_or(true) {
@@ -549,58 +574,86 @@ impl Ingestor {
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let _ = std::fs::remove_file(&path);
             let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
-            let event = v.get("hook_event_name").and_then(Value::as_str).unwrap_or("?").to_string();
-            let sid = v.get("session_id").and_then(Value::as_str).map(str::to_string);
-            let at = v
-                .get("received_at_ms")
-                .and_then(Value::as_i64)
-                .map(time::iso_from_ms)
-                .unwrap_or_else(time::now_iso);
-            let mut detail = serde_json::Map::new();
-            for k in ["message", "notification_type", "title", "source", "reason", "agent_type", "permission_mode"] {
-                match v.get(k) {
-                    Some(Value::String(x)) => {
-                        detail.insert(k.into(), Value::String(text::safe(x, 1000)));
-                    }
-                    Some(x @ (Value::Bool(_) | Value::Number(_))) => {
-                        detail.insert(k.into(), x.clone());
-                    }
-                    _ => {}
+            self.apply_hook(&v, rep);
+        }
+        if began {
+            let _ = self.conn.execute_batch("COMMIT");
+        }
+    }
+
+    /// 훅 이벤트 한 건을 DB 에 반영한다(스풀 파일에서 읽은 JSON).
+    fn apply_hook(&mut self, v: &Value, rep: &mut Report) {
+        let event = v.get("hook_event_name").and_then(Value::as_str).unwrap_or("?").to_string();
+        let sid = v.get("session_id").and_then(Value::as_str).map(str::to_string);
+        let at = v
+            .get("received_at_ms")
+            .and_then(Value::as_i64)
+            .map(time::iso_from_ms)
+            .unwrap_or_else(time::now_iso);
+        let mut detail = serde_json::Map::new();
+        for k in ["message", "notification_type", "title", "source", "reason", "agent_type", "permission_mode"] {
+            match v.get(k) {
+                Some(Value::String(x)) => {
+                    detail.insert(k.into(), Value::String(text::safe(x, 1000)));
                 }
-            }
-            let _ = self.conn.execute(
-                "INSERT INTO hook_event (session_id, event, at, detail) VALUES (?1, ?2, ?3, ?4)",
-                params![sid, event, at, Value::Object(detail.clone()).to_string()],
-            );
-            let _ = db::set_meta(&self.conn, "hook_last_at", &at);
-            let Some(sid) = sid else { continue };
-            self.ensure_session(&sid, v.get("transcript_path").and_then(Value::as_str));
-            let live = self.live.entry(sid.clone()).or_default();
-            match event.as_str() {
-                "Stop" => live.stop_hook_at = Some(at.clone()),
-                "Notification" => {
-                    let msg = text::safe(detail.get("message").and_then(Value::as_str).unwrap_or(""), 500);
-                    live.notify_at = Some(at.clone());
-                    live.notify_msg = Some(msg.clone());
-                    let _ = self.conn.execute(
-                        "UPDATE session SET notify_at = ?2, notify_msg = ?3 WHERE id = ?1",
-                        params![sid, at, msg],
-                    );
-                }
-                "SessionEnd" => {
-                    let reason = detail.get("reason").and_then(Value::as_str).map(str::to_string);
-                    let _ = self.conn.execute(
-                        "UPDATE session SET ended_at = ?2, end_reason = ?3 WHERE id = ?1",
-                        params![sid, at, reason],
-                    );
+                Some(x @ (Value::Bool(_) | Value::Number(_))) => {
+                    detail.insert(k.into(), x.clone());
                 }
                 _ => {}
             }
-            rep.changed.insert(sid);
         }
-        if let Some(tx) = tx {
-            let _ = tx.commit();
+        let _ = self.conn.execute(
+            "INSERT INTO hook_event (session_id, event, at, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![sid, event, at, Value::Object(detail.clone()).to_string()],
+        );
+        let _ = db::set_meta(&self.conn, "hook_last_at", &at);
+        let Some(sid) = sid else { return };
+        self.ensure_session(&sid, v.get("transcript_path").and_then(Value::as_str));
+        let live = self.live.entry(sid.clone()).or_default();
+        match event.as_str() {
+            "Stop" => live.stop_hook_at = Some(at.clone()),
+            "Notification" => {
+                let msg = text::safe(detail.get("message").and_then(Value::as_str).unwrap_or(""), 500);
+                live.notify_at = Some(at.clone());
+                live.notify_msg = Some(msg.clone());
+                let _ = self.conn.execute(
+                    "UPDATE session SET notify_at = ?2, notify_msg = ?3 WHERE id = ?1",
+                    params![sid, at, msg],
+                );
+            }
+            "SessionEnd" => {
+                let reason = detail.get("reason").and_then(Value::as_str).map(str::to_string);
+                let _ = self.conn.execute(
+                    "UPDATE session SET ended_at = ?2, end_reason = ?3 WHERE id = ?1",
+                    params![sid, at, reason],
+                );
+                if reason.as_deref() == Some("clear") {
+                    if crate::lifecycle::on_clear(&self.conn, &sid, &at) {
+                        rep.cleared.push(sid.clone());
+                    }
+                    self.last_clear = Some((sid.clone(), time::ms_of_iso(&at).unwrap_or(0)));
+                }
+            }
+            "UserPromptSubmit" => {
+                // 요청 시점 태깅: 재료(#태그·지문·저장소 폴더)로 태그를 정해 남기고, 같은 요청이 이미 기록에 있으면 바로 잇는다
+                if let Some(hp) = crate::tags::HookPrompt::from_spool(v) {
+                    let (_, _, attached) = crate::tags::record_prompt(&self.conn, &hp);
+                    rep.tags_changed = true;
+                    let _ = attached;
+                }
+            }
+            "SessionStart" if detail.get("source").and_then(Value::as_str) == Some("clear") => {
+                // 방금 /clear 된 세션의 후속 — SessionEnd 와 몇십 ms 안에 온다
+                if let Some((old, ms)) = self.last_clear.take() {
+                    let now = time::ms_of_iso(&at).unwrap_or(0);
+                    if (now - ms).abs() <= crate::lifecycle::PAIR_WINDOW_MS {
+                        crate::lifecycle::link_successor(&self.conn, &old, &sid);
+                    }
+                }
+            }
+            _ => {}
         }
+        rep.changed.insert(sid);
     }
 
     fn ensure_session(&self, sid: &str, transcript: Option<&str>) {
@@ -637,6 +690,10 @@ impl Ingestor {
                 } else {
                     None
                 };
+                // 앱이 모델을 부르려고 띄운 `claude -p`(llm.rs) — 사용자 세션이 아니다
+                if v.get("cwd").and_then(Value::as_str).is_some_and(paths::is_internal_cwd) {
+                    continue;
+                }
                 let status = crate::deliver::input_status(v.get("status").and_then(Value::as_str).map(str::to_string));
                 seen.insert(sid.to_string(), (pid, status, name));
             }
@@ -893,8 +950,11 @@ impl Ingestor {
         st.size = size;
         st.mtime_ms = mtime;
 
-        if st.cx.as_ref().is_some_and(|c| c.skip) {
-            // Codex 하위 에이전트 스레드 — 위치만 기억하고 세션으로 만들지 않는다(세션 ID 를 비워 표시)
+        if patch.cwd.as_deref().is_some_and(paths::is_internal_cwd) {
+            st.internal = true;
+        }
+        if st.internal || st.cx.as_ref().is_some_and(|c| c.skip) {
+            // Codex 하위 에이전트 스레드(또는 앱이 모델을 부르려고 띄운 세션 — llm.rs) — 위치만 기억하고 세션으로 만들지 않는다(세션 ID 를 비워 표시)
             st.session_id.clear();
             st.open = None;
             st.side.clear();
@@ -1353,6 +1413,11 @@ impl Ingestor {
                 params![turn_id, path, n],
             );
         }
+        crate::tags::save_touched(&self.conn, turn_id, &acc.touched);
+        // 요청 시점 훅이 정해 둔 태그가 있으면 잇는다(Codex 는 훅이 없다)
+        if !acc.codex && crate::tags::attach_for_turn(&self.conn, sid, turn_id, &acc.prompt_text, &acc.prompt_at) {
+            rep.tags_changed = true;
+        }
         let _ = self.conn.execute("DELETE FROM turn_subagent WHERE turn_id = ?1", params![turn_id]);
         for (i, s) in acc.subs.iter().enumerate() {
             let dur = match (&s.started_at, &s.ended_at) {
@@ -1771,8 +1836,8 @@ fn start_turn(st: &mut FileState, line_start: u64, acc: TurnAcc, closed: &mut Ve
 
 /// AI Inbox 입력창에서 보낸 말이면 머리말을 떼고 출처를 `inbox` 로 남긴다
 fn inbox_or<'a>(body: &str, origin: &'a str) -> (String, &'a str) {
-    match crate::conoti::strip_inbox(body) {
-        Some(rest) => (rest.to_string(), "inbox"),
+    match crate::conoti::strip_header(body) {
+        Some((rest, o)) => (rest.to_string(), o),
         None => (body.to_string(), origin),
     }
 }
@@ -1947,6 +2012,7 @@ fn on_assistant(acc: &mut TurnAcc, line: &Line, at: Option<String>, patch: &mut 
                 let input = b.get("input").cloned().unwrap_or(Value::Null);
                 let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
                 *acc.tools.entry(name.clone()).or_default() += 1;
+                crate::tags::collect_touched(&mut acc.touched, &name, &input);
                 if matches!(name.as_str(), "Edit" | "Write" | "NotebookEdit" | "MultiEdit") {
                     if let Some(p) = input.get("file_path").or_else(|| input.get("notebook_path")).and_then(Value::as_str) {
                         *acc.files.entry(p.to_string()).or_default() += 1;
@@ -2023,20 +2089,22 @@ fn on_system(acc: &mut TurnAcc, line: &Line, at: Option<String>) {
 
 // ── 잡동사니 ─────────────────────────────────────────────────────────────────
 
-/// 훅이 쓰다 만 임시 파일(.tmp)이 한 시간 넘게 남아 있으면 지운다.
+/// 훅이 쓰다 만 임시 파일(.tmp)이 한 시간 넘게, 앱이 안 읽어 간 훅 파일(.json — 요청 글 앞부분이 들어 있다)이 2주 넘게 남아 있으면 지운다.
 fn clean_stale_spool() {
     let Ok(rd) = std::fs::read_dir(paths::spool_dir()) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("tmp") {
-            continue;
-        }
+        let limit = match p.extension().and_then(|x| x.to_str()) {
+            Some("tmp") => 3600,
+            Some("json") => 14 * 24 * 3600,
+            _ => continue,
+        };
         let old = e
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|m| m.elapsed().ok())
-            .map(|d| d.as_secs() > 3600)
+            .map(|d| d.as_secs() > limit)
             .unwrap_or(false);
         if old {
             let _ = std::fs::remove_file(&p);
@@ -2175,7 +2243,82 @@ mod tests {
             codex_index_mtime: -1,
             codex_live: Some(HashSet::new()),
             codex_written: HashMap::new(),
+            last_clear: None,
         }
+    }
+
+    /// 앱이 모델을 부르려고 띄운 세션(작업 폴더 `llm-scratch`)은 사용자 세션으로 모이지 않는다 — 되먹임(가짜 세션·태그·이력 검색 대상) 방지
+    #[test]
+    fn internal_model_call_transcripts_are_not_collected() {
+        let scratch = paths::llm_scratch_dir().join("x");
+        let dir = std::env::temp_dir().join(format!("aiinbox-internal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut lines = Vec::new();
+        for (sid, cwd) in [("internal-sess-1", scratch.to_string_lossy().to_string()), ("normal-sess-1", "/w/proj".to_string())] {
+            let mut u = human("u1", "2026-09-30T01:00:00.000Z", "발췌 질문");
+            u["cwd"] = json!(cwd);
+            u["sessionId"] = json!(sid);
+            let mut a = said("2026-09-30T01:00:05.000Z", "답");
+            a["cwd"] = json!(cwd);
+            let f = dir.join(format!("{sid}.jsonl"));
+            std::fs::write(&f, format!("{}\n{}\n", u, a)).unwrap();
+            lines.push((sid, f));
+        }
+        let mut ing = ingestor();
+        let mut rep = Report::default();
+        for (sid, f) in &lines {
+            let md = std::fs::metadata(f).unwrap();
+            ing.files.insert(f.clone(), FileState::fresh(sid.to_string(), 0, 0, false, false));
+            ing.process_file(f, md.len(), 0, &mut rep);
+        }
+        let n = |sid: &str| ing.conn.query_row("SELECT COUNT(*) FROM turn WHERE session_id = ?1", [sid], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(n("internal-sess-1"), 0, "내부 호출 세션의 요청은 모으지 않는다");
+        assert_eq!(ing.conn.query_row("SELECT COUNT(*) FROM session WHERE id = 'internal-sess-1'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(n("normal-sess-1"), 1, "보통 세션은 그대로");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// /clear 훅 쌍(SessionEnd reason=clear → SessionStart source=clear)이 옛 세션을 "끝난 대화"로 표시하고 후속 세션을 잇는다
+    #[test]
+    fn clear_hooks_mark_the_old_session_and_link_the_successor() {
+        let mut ing = ingestor();
+        ing.conn.execute("INSERT INTO session (id, last_at) VALUES ('old-session-1', '2026-09-01T00:00:00.000Z')", []).unwrap();
+        ing.conn
+            .execute(
+                "INSERT INTO turn (session_id, prompt_uuid, seq, prompt_at, status) VALUES ('old-session-1', 'u1', 1, '2026-09-01T00:00:00.000Z', 'done')",
+                [],
+            )
+            .unwrap();
+        let mut rep = Report::default();
+        let ms = 1_790_000_000_000i64;
+        ing.apply_hook(&json!({"hook_event_name":"SessionEnd","session_id":"old-session-1","reason":"clear","received_at_ms":ms}), &mut rep);
+        ing.apply_hook(&json!({"hook_event_name":"SessionStart","session_id":"new-session-1","source":"clear","received_at_ms":ms + 50}), &mut rep);
+        let (cleared, state, to): (Option<String>, Option<String>, Option<String>) = ing
+            .conn
+            .query_row("SELECT cleared_at, clear_state, cleared_to FROM session WHERE id = 'old-session-1'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert!(cleared.is_some());
+        assert_eq!(state.as_deref(), Some("purge"), "기본은 삭제 예약");
+        assert_eq!(to.as_deref(), Some("new-session-1"));
+        assert_eq!(rep.cleared, vec!["old-session-1".to_string()]);
+        // 새 세션은 끝난 대화가 아니다
+        let n: i64 = ing.conn.query_row("SELECT COUNT(*) FROM session WHERE id = 'new-session-1' AND cleared_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        // clear 가 아닌 종료(prompt_input_exit)는 표시하지 않는다
+        ing.conn.execute("INSERT INTO session (id) VALUES ('exit-session-1')", []).unwrap();
+        ing.apply_hook(&json!({"hook_event_name":"SessionEnd","session_id":"exit-session-1","reason":"prompt_input_exit","received_at_ms":ms}), &mut rep);
+        let n: i64 = ing.conn.query_row("SELECT COUNT(*) FROM session WHERE id = 'exit-session-1' AND cleared_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        // 화면 목록: 끝난 대화 정보가 실려 나가고, 이력으로 보관하면 전체에서 빠져 이력 탭에만 나온다(폰 목록엔 남는다)
+        let all = crate::api::list_sessions_for(&ing.conn, "all", "", false).unwrap();
+        let hit = all.iter().find(|s| serde_json::to_value(s).unwrap()["id"] == "old-session-1").unwrap();
+        assert_eq!(serde_json::to_value(hit).unwrap()["ended"]["state"], "purge");
+        crate::lifecycle::decide(&ing.conn, &["old-session-1".to_string()], "keep").unwrap();
+        assert!(crate::api::list_sessions_for(&ing.conn, "all", "", false).unwrap().is_empty());
+        assert_eq!(crate::api::list_sessions_for(&ing.conn, "history", "", false).unwrap().len(), 1);
+        assert_eq!(crate::api::list_sessions_on(&ing.conn, "all", "").unwrap().len(), 1, "폰 목록엔 이력 보관 세션도 남는다");
+        let c = crate::api::counts_of(&ing.conn);
+        assert_eq!((c.kept, c.undecided), (1, 0));
     }
 
     /// 실제 ~/.codex 기록을 메모리 DB 로 읽어 요약만 찍는다(내용은 찍지 않는다).
@@ -2286,6 +2429,53 @@ mod tests {
     }
 
     #[test]
+    fn hook_tags_attach_when_the_request_is_read_and_history_is_never_backfilled() {
+        let mut ing = ingestor();
+        ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
+        let alpha = crate::tags::create_tag(&ing.conn, "알파", "", false).unwrap();
+        crate::tags::add_rule(&ing.conn, alpha, "keyword", "알파", "user").unwrap();
+        // 옛 요청(훅 기록 없음)과 지금 요청(훅이 먼저 도착) — 같은 낱말이 있어도 옛 요청은 미분류로 남는다
+        let (mut closed, _) = run(&[
+            human("u0", &at(-4000), "알파 옛 요청"),
+            said(&at(-3999), "끝"),
+            human("u1", &at(0), "알파 화면 고쳐줘"),
+            said(&at(1), "고쳤습니다"),
+            human("u2", &at(5), "다음 요청"),
+        ]);
+        let mut rep = Report::default();
+        let entry = crate::hook::spool_entry(
+            &json!({"hook_event_name":"UserPromptSubmit","session_id":"s","cwd":"/nowhere","prompt":"알파 화면 고쳐줘"}),
+            chrono::Utc::now().timestamp_millis() as u64,
+        )
+        .unwrap();
+        ing.apply_hook(&entry, &mut rep);
+        assert!(rep.tags_changed);
+        for acc in closed.iter_mut() {
+            ing.flush_turn("s", acc, &mut rep);
+        }
+        let tagged = |uuid: &str| -> Vec<(i64, String, Option<String>)> {
+            ing.conn
+                .prepare("SELECT x.tag_id, x.state, x.src FROM turn_tag x JOIN turn t ON t.id = x.turn_id WHERE t.prompt_uuid = ?1")
+                .unwrap()
+                .query_map(params![uuid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        assert!(tagged("u0").is_empty(), "훅이 없던 옛 요청은 백필로 분류하지 않는다");
+        assert_eq!(tagged("u1"), vec![(alpha, "auto".into(), Some("hook".into()))]);
+        // 다시 읽기(PARSER_VERSION 재파싱·틱마다의 재기록)에도 중복이 없고 옛 요청은 여전히 미분류
+        for acc in closed.iter_mut() {
+            ing.flush_turn("s", acc, &mut rep);
+        }
+        assert_eq!(tagged("u1").len(), 1);
+        assert!(tagged("u0").is_empty());
+        // Ingestor::new 가 파서 버전이 달라 다시 읽게 해도 태그를 붙이지 않는다
+        ing.conn.execute("DELETE FROM source_file", []).unwrap();
+        assert_eq!(ing.conn.query_row("SELECT COUNT(*) FROM turn_tag", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
     fn deleted_open_request_does_not_churn_every_tick() {
         let mut ing = ingestor();
         ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
@@ -2352,6 +2542,43 @@ mod tests {
         assert_eq!(hidden(&ing), 0);
         let since: Option<String> = ing.conn.query_row("SELECT archived_at FROM session WHERE id = 's'", [], |r| r.get(0)).unwrap();
         assert!(since.is_none());
+    }
+
+    #[test]
+    fn tool_targets_become_tag_signals_and_survive_recollection() {
+        let ing = ingestor();
+        let mut rep = Report::default();
+        ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
+        let tool = |at: &str, id: &str, name: &str, input: Value| {
+            json!({"type":"assistant","timestamp":at,"requestId":format!("r-{id}"),
+                   "message":{"content":[{"type":"tool_use","id":id,"name":name,"input":input}],"usage":{"output_tokens":1}}})
+        };
+        let (mut closed, _) = run(&[
+            human("u1", &at(-30), "알파 화면 고쳐줘"),
+            tool(&at(-29), "t1", "Read", json!({"file_path": "/w/alpha/lib/main.dart"})),
+            tool(&at(-28), "t2", "Bash", json!({"command": "cd /w/alpha && ls /usr/bin /tmp/x /w/beta/notes.md"})),
+            tool(&at(-27), "t3", "Grep", json!({"pattern": "x", "path": "/w/alpha/lib"})),
+            said(&at(-26), "끝"),
+            human("u2", &at(-20), "다음"),
+        ]);
+        let acc = &mut closed[0];
+        assert!(acc.touched.contains("/w/alpha/lib/main.dart"));
+        assert!(acc.touched.contains("/w/alpha"), "cd 뒤 경로");
+        assert!(acc.touched.contains("/w/beta/notes.md"));
+        assert!(!acc.touched.iter().any(|p| p.starts_with("/usr") || p.starts_with("/tmp")), "시스템 경로는 신호가 아니다");
+        ing.flush_turn("s", acc, &mut rep);
+        let tid: i64 = ing.conn.query_row("SELECT id FROM turn WHERE session_id = 's'", [], |r| r.get(0)).unwrap();
+        let saved: String = ing.conn.query_row("SELECT paths FROM turn_touch WHERE turn_id = ?1", [tid], |r| r.get(0)).unwrap();
+        assert!(saved.contains("/w/alpha/lib/main.dart"));
+        // 사용자가 붙인 태그는 같은 요청을 다시 써도(재수집) 남는다 — 요청 ID 가 그대로라서
+        ing.conn.execute("INSERT INTO tag (name, created_at) VALUES ('수동', 't')", []).unwrap();
+        ing.conn.execute("INSERT INTO turn_tag (turn_id, tag_id, state, at) VALUES (?1, 1, 'manual', 't')", [tid]).unwrap();
+        ing.flush_turn("s", acc, &mut rep);
+        let (again, n): (i64, i64) = ing
+            .conn
+            .query_row("SELECT id, (SELECT COUNT(*) FROM turn_tag WHERE turn_id = turn.id AND state = 'manual') FROM turn WHERE session_id = 's'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((again, n), (tid, 1));
     }
 
     #[test]

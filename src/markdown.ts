@@ -92,6 +92,7 @@ export function buildTurnMarkdown(d: TurnDetail): string {
   L.push("");
   if (t.origin === "peer") L.push(`*다른 세션 \`${t.peer_name ?? "?"}\` 이 보낸 요청*\n`);
   if (t.origin === "inbox") L.push("*AI Inbox 앱에서 보낸 말*\n");
+  if (t.origin === "sched") L.push("*AI Inbox 예약 전송으로 보낸 말*\n");
   const phone = phoneReply(t.prompt_text);
   if (phone) L.push(`*폰(코노티)에서 보낸 답${phone.title ? ` — 원래 요청: ${phone.title}` : ""}*\n`);
   if (t.prompt_source === "mid-turn") L.push("*앞 요청이 진행되는 중에 보낸 말*\n");

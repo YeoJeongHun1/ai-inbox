@@ -6,6 +6,101 @@ export type Status = "running" | "background" | "waiting" | "done" | "interrupte
 export type Agent = "claude" | "codex";
 export const AGENT_LABEL: Record<Agent, string> = { claude: "Claude Code", codex: "Codex" };
 
+/** /clear 로 끝난 대화의 처리 — purge 삭제 예약 · keep 이력으로 보관 · ask 아직 안 정함(자동 삭제 없음) */
+export type EndedState = "purge" | "keep" | "ask";
+
+export interface Ended {
+  cleared_at: string;
+  state: EndedState;
+  /** 삭제 예정 시각(state = purge) */
+  purge_at: string | null;
+  /** 사용자가 안내를 확인·결정했나 — false 면 결정 안내 대상 */
+  asked: boolean;
+}
+
+/** 요청 태그 표식 — auto(규칙) · manual(사용자) · ai(모델 제안 — 받아들이기 전) */
+export interface TurnTag {
+  id: number;
+  state: "auto" | "manual" | "ai";
+}
+
+export interface TagRule {
+  id: number;
+  kind: "path" | "keyword";
+  pattern: string;
+  source: "user" | "default" | "suggested" | "hook";
+}
+
+export interface TagInfo {
+  id: number;
+  name: string;
+  color: string;
+  /** 작은 태그(종류 표식) — 사이드바·대표 태그에서 뒤로 */
+  minor: boolean;
+  turns: number;
+  rules: TagRule[];
+  /** `#태그` 로 직접 지목한 횟수 */
+  hashtag_uses: number;
+  /** `#태그` 로 쓰는 이름을 낱말 규칙으로 승격하자는 제안(그 낱말) */
+  promote: string | null;
+}
+
+export interface TagOverview {
+  tags: TagInfo[];
+  untagged: number;
+  total: number;
+  ai_pending: number;
+}
+
+export interface SessionTags {
+  /** [태그 id, 이 세션에서 붙은 요청 수] */
+  tags: [number, number][];
+  untagged: number;
+  total: number;
+}
+
+/** 태그로 거르기 — tags 중 하나라도(all=false) 또는 모두(all=true) 가진 요청, untagged 는 태그 없는 요청 포함 */
+export interface TagFilter {
+  tags: number[];
+  untagged: boolean;
+  all: boolean;
+}
+export const NO_FILTER: TagFilter = { tags: [], untagged: false, all: false };
+export const filterActive = (f: TagFilter) => f.tags.length > 0 || f.untagged;
+
+export interface FolderSuggestion {
+  name: string;
+  pattern: string;
+  turns: number;
+  depth: number;
+  path: string;
+}
+
+export interface RuleCandidate {
+  kind: "path";
+  pattern: string;
+  path: string;
+}
+
+export interface TagAiStatus {
+  enabled: boolean;
+  consent: boolean;
+  /** 지금 쓰게 될 구독 서비스(마지막 감지 기준) — 없으면 null */
+  active: LlmProvider | null;
+  model: string;
+  calls_today: number;
+  daily_cap: number;
+}
+
+export interface TagAiPending {
+  turn_id: number;
+  session_id: string;
+  session_name: string;
+  seq: number;
+  prompt: string;
+  tag_id: number;
+}
+
 export interface SessionItem {
   id: string;
   name: string;
@@ -29,6 +124,9 @@ export interface SessionItem {
   last_from_ai: boolean;
   last_at: string | null;
   agent: Agent;
+  ended: Ended | null;
+  /** 대표 태그 id(요청 태그에서 파생 — 큰 태그·요청 수 순, 최대 3) */
+  tags: number[];
 }
 
 export interface Turn {
@@ -76,6 +174,8 @@ export interface Turn {
   last_step: [string, string | null, string | null] | null;
   /** 요청에 붙은 이미지 id (본문 끝의 경로 목록을 떼어 낸 것) */
   atts: string[];
+  /** 요청 태그(뗀 것 제외) */
+  tags: TurnTag[];
 }
 
 export interface SessionHeader {
@@ -112,6 +212,7 @@ export interface SessionHeader {
   /** 실행 중인 백그라운드 세션을 터미널에서 여는 명령 */
   attach_command: string | null;
   agent: Agent;
+  ended: Ended | null;
 }
 
 export interface CodexStatus {
@@ -140,6 +241,8 @@ export interface OutboxItem {
   atts: AttMeta[];
   /** 답장이면 대상 요청 번호·부분 */
   quote: { seq: number; part: QuotePart } | null;
+  /** 예약 전송이 시각이 되어 넣은 말 */
+  sched?: boolean;
 }
 
 export type AttSize = "thumb" | "view" | "orig";
@@ -174,6 +277,7 @@ export interface TurnHit {
   atts: string[];
   /** 보관한 세션의 요청 */
   archived: boolean;
+  tags: TurnTag[];
 }
 
 /** 기록 창 "세션" 탭의 줄 */
@@ -270,7 +374,194 @@ export interface Counts {
   unread: number;
   attention: number;
   active: number;
+  /** 이력으로 보관한 세션 수(이력 탭) */
+  kept: number;
+  /** /clear 됐는데 아직 확인하지 않은 세션 수 */
+  undecided: number;
 }
+
+export interface ClearRow {
+  id: string;
+  name: string;
+  project_name: string | null;
+  turns: number;
+  last_at: string | null;
+  ended: Ended;
+}
+
+export interface ClearOverview {
+  purge: number;
+  keep: number;
+  ask: number;
+  undecided: number;
+  next_purge_at: string | null;
+  retention_days: number;
+  grace_days: number;
+  default_state: EndedState;
+  purged_sessions: number;
+}
+
+export type LlmProvider = "claude" | "codex";
+
+export interface CliInfo {
+  installed: boolean;
+  version: string | null;
+  /** true 로그인 · false 로그인 안 됨 · null 알 수 없음 */
+  logged_in: boolean | null;
+  login_kind: string | null;
+  safe_mode: boolean;
+}
+
+export interface LlmDetection {
+  claude: CliInfo;
+  codex: CliInfo;
+  at_ms: number;
+}
+
+export interface HistoryStatus {
+  enabled: boolean;
+  consent: boolean;
+  /** 설정한 공급자 */
+  provider: "auto" | LlmProvider;
+  /** 지금 실제로 쓰게 될 공급자(마지막 감지 기준) — 없으면 모델 없이 찾기만 */
+  active: LlmProvider | null;
+  detection: LlmDetection | null;
+  model_claude: string;
+  model_codex: string;
+  model: string;
+  calls_today: number;
+  daily_cap: number;
+  /** 이전 버전이 저장한 API 키 파일이 남아 있다(더는 쓰지 않음) */
+  legacy_key: boolean;
+}
+
+export interface HistoryMsg {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface HistorySource {
+  n: number;
+  session_id: string;
+  turn_id: number;
+  seq: number;
+  at: string;
+  session_name: string;
+  project: string | null;
+  ended: EndedState | null;
+  prompt: string;
+  cited: boolean;
+  tags: TurnTag[];
+}
+
+export interface HistoryAnswer {
+  text: string;
+  sources: HistorySource[];
+  model: string | null;
+  hits: number;
+  ms: number;
+  range: [string, string] | null;
+}
+
+// ── 예약 전송(0.10.0) ──
+
+export type SchedPolicy = "interrupt" | "after_work" | "after_quiet";
+export type SchedMissed = "run_once" | "skip" | "within";
+export type SchedWhen = { kind: "after"; min: number } | { kind: "at"; local: string; tz: string };
+
+export interface SchedRun {
+  occurrence_at: string;
+  /** pending · deferred · fired · delivered · handled · held · missed · failed · cancelled */
+  state: string;
+  reason: string | null;
+  note: string | null;
+  reply_id: string | null;
+}
+
+export interface SchedItem {
+  id: string;
+  session_id: string;
+  session_name: string;
+  text: string;
+  quote: QuotePart | null;
+  turn_id: number | null;
+  created_at: string;
+  updated_at: string;
+  rev: number;
+  kind: "once" | "after";
+  tz: string;
+  next_due_at: string | null;
+  on_missed: SchedMissed;
+  missed_within_min: number | null;
+  busy_policy: SchedPolicy | null;
+  state: "active" | "done" | "cancelled" | "paused";
+  run: SchedRun | null;
+  atts: AttMeta[];
+  warnings?: string[];
+  /** 훅이 남긴 세션의 권한 모드(모르면 null) · 예약 시 사전 준비 안내가 필요한가 */
+  perm?: string | null;
+  sched_warn?: boolean;
+}
+
+/** 세션 권한 분류(bypass = 전부 허용) — Rust `sched::perm_kind` 와 같은 값 */
+export type PermKind = "bypass" | "auto" | "accept_edits" | "default" | "plan" | "dont_ask" | "unknown";
+export interface PermInfo {
+  perm: string | null;
+  kind: PermKind;
+  dismissed: boolean;
+  warn: boolean;
+  notice: boolean;
+}
+
+export interface SchedNew {
+  session_id: string;
+  text: string;
+  atts: string[];
+  quote_turn: number | null;
+  quote_part: QuotePart | null;
+  when: SchedWhen;
+  on_missed: SchedMissed;
+  missed_within_min: number | null;
+  busy_policy: SchedPolicy | null;
+}
+
+export interface SchedEdit {
+  rev: number;
+  text: string;
+  atts: string[];
+  when: SchedWhen;
+  on_missed: SchedMissed;
+  missed_within_min: number | null;
+  busy_policy: SchedPolicy | null;
+}
+
+export interface SchedWindow {
+  id: number;
+  name: string;
+  /** 월(1)~일(64) 비트 */
+  days: number;
+  start: string;
+  end: string;
+  tz: string;
+  enabled: boolean;
+}
+
+export interface SchedSettings {
+  paused: boolean;
+  busy_default: SchedPolicy;
+  perm: "default" | "allowlist";
+  allow: { session_id: string; name: string }[];
+  windows: SchedWindow[];
+  rules: { id: number; scope: "session" | "tag"; key: string; action: SchedPolicy; label: string }[];
+  active: number;
+  held: number;
+}
+
+export const POLICY_LABEL: Record<SchedPolicy, string> = {
+  interrupt: "바로 끼움(일하는 중이어도 도구 사이에)",
+  after_work: "작업이 끝난 뒤",
+  after_quiet: "방해금지 시간이 끝난 뒤",
+};
 
 export interface HookStatus {
   settings_path: string;
@@ -282,6 +573,15 @@ export interface HookStatus {
   /** 훅은 있는데 첨부 이미지 폴더 읽기 허용이 빠짐 */
   read_missing: boolean;
   command: string;
+}
+
+/** 화면에 늘 보이는 버전·빌드 시각(정보 창·설정 공용) */
+export interface About {
+  version: string;
+  /** "YYYY-MM-DD HH:mm" — 빌드한 PC 의 시각 */
+  build_time: string;
+  schema_version: number;
+  data_dir: string;
 }
 
 export interface AppInfo {
@@ -320,6 +620,8 @@ export interface RelayDevice {
   can_reply: boolean;
   /** 폰에서 세션 관리(보관함 보기·보관·고정·기록에서 지우기) */
   can_manage: boolean;
+  /** 폰에서 예약 전송 만들기·고치기·취소·처리(기본 끔) */
+  can_schedule: boolean;
   created_at: string;
   last_seen: string | null;
 }
@@ -403,11 +705,12 @@ export interface OutlineRow {
   unread: boolean;
   summary: string | null;
   atts: number;
+  tags: TurnTag[];
 }
 
 export type RelayKey = "enabled" | "env" | "push" | "paused" | "confirm" | "bg_resume";
 
-export type Filter = "all" | "unread" | "attention" | "active";
+export type Filter = "all" | "unread" | "attention" | "active" | "history";
 
 /** 폰 답이 세션에 들어갈 때 붙는 머리말 (Rust conoti::REPLY_HEADER 와 같아야 한다) */
 export const REPLY_HEADER = "폰에서 온 사용자 답 (AI Inbox · 코노티)";
@@ -479,6 +782,7 @@ export const api = {
   installHooks: () => invoke<HookStatus>("install_hooks"),
   uninstallHooks: () => invoke<HookStatus>("uninstall_hooks"),
   appInfo: () => invoke<AppInfo>("app_info"),
+  about: () => invoke<About>("about"),
   setSetting: (key: string, value: number) => invoke<void>("set_setting", { key, value }),
   rescan: () => invoke<void>("rescan"),
   relayStatus: () => invoke<RelayStatus>("relay_status"),
@@ -490,6 +794,7 @@ export const api = {
     invoke<void>("relay_decide_pair", { approve, canReply, sas }),
   relayRemoveDevice: (pid: string) => invoke<void>("relay_remove_device", { pid }),
   relaySetDeviceReply: (pid: string, canReply: boolean) => invoke<void>("relay_set_device_reply", { pid, canReply }),
+  relaySetDeviceSchedule: (pid: string, canSchedule: boolean) => invoke<void>("relay_set_device_schedule", { pid, canSchedule }),
   relaySetDeviceManage: (pid: string, canManage: boolean) => invoke<void>("relay_set_device_manage", { pid, canManage }),
   conotiSetSessionMode: (sessionId: string, mode: number) => invoke<void>("conoti_set_session_mode", { sessionId, mode }),
   conotiDecide: (replyId: string, approve: boolean) => invoke<void>("conoti_decide", { replyId, approve }),
@@ -509,7 +814,8 @@ export const api = {
   attachmentGet: (id: string, size: AttSize) => invoke<ArrayBuffer>("attachment_get", { id, size }),
   attachmentMeta: (ids: string[]) => invoke<AttMeta[]>("attachment_meta", { ids }),
   attachmentReveal: (id: string) => invoke<void>("attachment_reveal", { id }),
-  archiveTurns: (query: string, before: string | null) => invoke<Page<TurnHit>>("archive_turns", { query, before, limit: 40 }),
+  archiveTurns: (query: string, before: string | null, tags?: TagFilter) =>
+    invoke<Page<TurnHit>>("archive_turns", { query, before, limit: 40, tags: tags && filterActive(tags) ? tags : null }),
   archiveMessages: (query: string, device: "all" | "desktop" | "phone", imagesOnly: boolean, before: string | null) =>
     invoke<Page<SentMessage>>("archive_messages", { query, device, imagesOnly, before, limit: 60 }),
   archiveImages: (query: string, before: string | null) => invoke<Page<ArchiveImage>>("archive_images", { query, before, limit: 120 }),
@@ -522,6 +828,58 @@ export const api = {
   archiveTidy: (kind: "short" | "idle") => invoke<number>("archive_tidy", { kind }),
   /** 지운 세션 id 와, 진행 중이거나 전달 대기 말이 있어 남긴 세션 이름 */
   archiveDeleteSessions: (ids: string[]) => invoke<{ deleted: string[]; skipped: string[] }>("archive_delete_sessions", { ids }),
+  /** /clear 로 끝난 대화의 처리: keep(이력으로 보관) · purge(삭제 예약) · ask(보류) */
+  clearDecide: (ids: string[], decision: EndedState) => invoke<number>("clear_decide", { ids, decision }),
+  /** onlyUndecided: 아직 안내를 확인하지 않은 것만 · 아니면 삭제 예약·미정 전체 */
+  clearList: (onlyUndecided: boolean) => invoke<ClearRow[]>("clear_list", { onlyUndecided }),
+  /** 기본 처리를 그대로 두고 안내만 확인 */
+  clearAck: (ids: string[]) => invoke<void>("clear_ack", { ids }),
+  clearOverview: () => invoke<ClearOverview>("clear_overview"),
+  historyStatus: () => invoke<HistoryStatus>("history_status"),
+  historySet: (key: "enabled" | "consent" | "provider" | "model_claude" | "model_codex", value: string) => invoke<void>("history_set", { key, value }),
+  historyDetect: () => invoke<LlmDetection>("history_detect"),
+  /** 빈 문자열이면 지운다. 값은 다시 돌려받지 못한다 */
+  historyForgetKey: () => invoke<void>("history_forget_key"),
+  schedAdd: (n: SchedNew) => invoke<SchedItem>("sched_add", { new: n }),
+  schedList: (sessionId?: string) => invoke<SchedItem[]>("sched_list", { sessionId: sessionId ?? null }),
+  schedCounts: () => invoke<{ active: number; held: number }>("sched_counts"),
+  schedUpdate: (id: string, edit: SchedEdit) => invoke<SchedItem>("sched_update", { id, edit }),
+  schedCancel: (id: string) => invoke<void>("sched_cancel", { id }),
+  schedAct: (id: string, op: "send" | "drop") => invoke<void>("sched_act", { id, op }),
+  schedSettings: () => invoke<SchedSettings>("sched_settings"),
+  schedSetSetting: (key: "paused" | "busy_default" | "perm", value: string) => invoke<void>("sched_set_setting", { key, value }),
+  schedPermInfo: (sessionId: string) => invoke<PermInfo>("sched_perm_info", { sessionId }),
+  schedWarnOff: (sessionId: string, off: boolean) => invoke<void>("sched_warn_off", { sessionId, off }),
+  schedAllowSet: (sessionId: string, on: boolean) => invoke<void>("sched_allow_set", { sessionId, on }),
+  schedWindowSave: (w: { id: number | null; name: string; days: number; start: string; end: string; tz: string; enabled: boolean }) => invoke<number>("sched_window_save", w),
+  schedWindowDelete: (id: number) => invoke<void>("sched_window_delete", { id }),
+  schedRuleSet: (scope: "session" | "tag", key: string, action: SchedPolicy | "") => invoke<void>("sched_rule_set", { scope, key, action }),
+  historyAsk: (messages: HistoryMsg[], localOnly = false, tags?: TagFilter) =>
+    invoke<HistoryAnswer>("history_ask", { messages, localOnly, tags: tags && filterActive(tags) ? tags : null }),
+  // ── 요청 태그 ──
+  getChatTagged: (sessionId: string, filter: TagFilter, beforeSeq?: number, limit?: number) =>
+    invoke<ChatPage>("get_chat_tagged", { sessionId, filter, beforeSeq: beforeSeq ?? null, limit: limit ?? null }),
+  tagOverview: () => invoke<TagOverview>("tag_overview"),
+  tagSession: (sessionId: string) => invoke<SessionTags>("tag_session", { sessionId }),
+  tagCreate: (name: string, color = "", minor = false) => invoke<number>("tag_create", { name, color, minor }),
+  tagUpdate: (id: number, patch: { name?: string; color?: string; minor?: boolean }) =>
+    invoke<void>("tag_update", { id, name: patch.name ?? null, color: patch.color ?? null, minor: patch.minor ?? null }),
+  tagMerge: (from: number, to: number) => invoke<void>("tag_merge", { from, to }),
+  tagDelete: (id: number) => invoke<void>("tag_delete", { id }),
+  tagRuleAdd: (tagId: number, kind: "path" | "keyword", pattern: string, suggested = false) =>
+    invoke<number>("tag_rule_add", { tagId, kind, pattern, suggested }),
+  tagRuleRemove: (id: number) => invoke<void>("tag_rule_remove", { id }),
+  tagResetDefaults: () => invoke<number>("tag_reset_defaults"),
+  turnTagSet: (turnIds: number[], tagId: number, on: boolean) => invoke<void>("turn_tag_set", { turnIds, tagId, on }),
+  tagSuggestFolders: () => invoke<FolderSuggestion[]>("tag_suggest_folders"),
+  tagSuggestForTurn: (turnId: number, tagId: number) => invoke<RuleCandidate[]>("tag_suggest_for_turn", { turnId, tagId }),
+  tagContext: (sessionId: string, filter: TagFilter, label: string) => invoke<string>("tag_context", { sessionId, filter, label }),
+  tagAiStatus: () => invoke<TagAiStatus>("tag_ai_status"),
+  tagAiSet: (key: "enabled" | "consent", value: string) => invoke<void>("tag_ai_set", { key, value }),
+  tagAiSuggest: () => invoke<{ asked: number; suggested: number }>("tag_ai_suggest"),
+  tagAiPending: (limit?: number) => invoke<TagAiPending[]>("tag_ai_pending", { limit: limit ?? null }),
+  tagAiDecide: (turnId: number, tagId: number, accept: boolean) => invoke<void>("tag_ai_decide", { turnId, tagId, accept }),
+  tagAiDecideAll: (accept: boolean) => invoke<number>("tag_ai_decide_all", { accept }),
   updateState: () => invoke<UpdateState>("update_state"),
   updateAck: () => invoke<void>("update_ack"),
   updateSetCheck: (on: boolean) => invoke<void>("update_set_check", { on }),

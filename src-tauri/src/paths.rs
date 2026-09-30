@@ -112,3 +112,22 @@ pub fn make_private_file(path: &std::path::Path) {
     #[cfg(not(unix))]
     let _ = path;
 }
+
+/// 앱이 구독 CLI(`claude -p`·`codex exec`)로 모델을 부를 때 쓰는 빈 작업 폴더. 이 폴더에서 돈 세션은 사용자의 세션이 아니다 —
+/// 수집기·훅이 건너뛴다(`is_internal_cwd`).
+pub fn llm_scratch_dir() -> PathBuf {
+    data_dir().join("llm-scratch")
+}
+
+fn strip_private(p: &str) -> &str {
+    // macOS: /var·/tmp 는 /private/... 의 링크다 — 프로세스가 보고하는 경로가 어느 쪽이든 같게
+    p.strip_prefix("/private").filter(|r| r.starts_with('/')).unwrap_or(p)
+}
+
+/// 이 작업 폴더가 앱 내부 모델 호출용인가(그 안의 하위 폴더 포함)
+pub fn is_internal_cwd(cwd: &str) -> bool {
+    let dir = llm_scratch_dir();
+    let Some(d) = dir.to_str() else { return false };
+    let (c, d) = (strip_private(cwd.trim_end_matches('/')), strip_private(d.trim_end_matches('/')));
+    !d.is_empty() && (c == d || c.strip_prefix(d).is_some_and(|r| r.starts_with('/')))
+}

@@ -9,9 +9,14 @@ mod deliver;
 mod doc;
 pub mod hook;
 pub mod install;
+mod history;
+mod llm;
 mod ingest;
+mod lifecycle;
 mod paths;
 mod relay;
+mod sched;
+mod tags;
 
 pub use paths::set_data_dir_override;
 mod text;
@@ -159,6 +164,31 @@ fn notify(app: &AppHandle, f: &ingest::Finished) {
         .show();
 }
 
+/// /clear 로 끝난 세션을 알린다 — 화면에 결정 안내(이력으로 보관 / 삭제 예약). 이름·내용은 실어 보내지 않고 개수만 알리고, 화면이 목록에서 읽는다.
+fn announce_cleared(app: &AppHandle, ids: &[String]) {
+    let state = app.state::<AppState>();
+    let (default, shown) = {
+        let Ok(conn) = state.conn.lock() else { return };
+        let shown = ids
+            .iter()
+            .filter(|id| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM turn WHERE session_id = ?1 AND hidden = 0",
+                    [id.as_str()],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false)
+            })
+            .count();
+        (lifecycle::default_state(&conn), shown)
+    };
+    if shown == 0 {
+        return;
+    }
+    let _ = app.emit("clear-detected", serde_json::json!({ "count": shown, "default": default }));
+}
+
 fn spawn_ingest(app: AppHandle, rescan: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("ingest".into())
@@ -201,6 +231,12 @@ fn spawn_ingest(app: AppHandle, rescan: Arc<AtomicBool>) {
                         ChangedPayload { sessions: rep.changed.iter().cloned().collect(), counts, working: rep.working },
                     );
                 }
+                if rep.tags_changed {
+                    let _ = app.emit("tags-changed", ());
+                }
+                if !rep.cleared.is_empty() {
+                    announce_cleared(&app, &rep.cleared);
+                }
                 for f in &rep.finished {
                     notify(&app, f);
                 }
@@ -226,8 +262,21 @@ fn spawn_phone(app: AppHandle, kick: Arc<AtomicBool>) {
             let mut pipe = conoti::Pipeline::new(conn);
             let mut last_confirm = 0usize;
             loop {
+                // 예약 전송: 시각이 된 예약을 대기열에 넣는다(같은 틱에 아래 파이프라인이 전달)
+                let srep = pipe.tick_schedule(chrono::Utc::now(), &sched::LiveProbe);
+                if !srep.alerts.is_empty() {
+                    for a in &srep.alerts {
+                        let _ = app.notification().builder().title(format!("⏰ {}", a.title())).body(format!("{} — {}", a.session_name, a.note)).show();
+                    }
+                    // 폰에는 내용 없는 알림만(푸시) — 연결돼 있으면 changed 로 화면이 새로 불러온다
+                    app.state::<Arc<relay::Shared>>().bump_sched_alert(srep.alerts.iter().map(|a| a.push_kind()).collect());
+                }
+                if !srep.alerts.is_empty() || !srep.changed_sessions.is_empty() {
+                    let _ = app.emit("sched-changed", ());
+                }
                 let deliverer = deliver::LocalDeliver { bg_resume: deliver::bg_resume_enabled() };
-                let rep = pipe.tick(&deliverer);
+                let mut rep = pipe.tick(&deliverer);
+                rep.changed_sessions.extend(srep.changed_sessions);
                 if !rep.changed_sessions.is_empty() || rep.needs_confirm != last_confirm {
                     if rep.needs_confirm > last_confirm {
                         let _ = app
@@ -427,6 +476,7 @@ pub fn run() {
             api::install_hooks,
             api::uninstall_hooks,
             api::app_info,
+            api::about,
             api::set_setting,
             api::rescan,
             api::save_markdown,
@@ -439,6 +489,7 @@ pub fn run() {
             api::relay_remove_device,
             api::relay_set_device_reply,
             api::relay_set_device_manage,
+            api::relay_set_device_schedule,
             api::conoti_set_session_mode,
             api::conoti_decide,
             api::conoti_pending,
@@ -463,6 +514,49 @@ pub fn run() {
             api::archive_set_archived,
             api::archive_tidy,
             api::archive_delete_sessions,
+            api::clear_decide,
+            api::clear_list,
+            api::clear_ack,
+            api::clear_overview,
+            api::history_status,
+            api::history_set,
+            api::history_detect,
+            sched::sched_add,
+            sched::sched_list,
+            sched::sched_counts,
+            sched::sched_update,
+            sched::sched_cancel,
+            sched::sched_act,
+            sched::sched_settings,
+            sched::sched_set_setting,
+            sched::sched_allow_set,
+            sched::sched_perm_info,
+            sched::sched_warn_off,
+            sched::sched_window_save,
+            sched::sched_window_delete,
+            sched::sched_rule_set,
+            api::history_forget_key,
+            api::history_ask,
+            api::get_chat_tagged,
+            tags::tag_overview,
+            tags::tag_session,
+            tags::tag_create,
+            tags::tag_update,
+            tags::tag_merge,
+            tags::tag_delete,
+            tags::tag_rule_add,
+            tags::tag_rule_remove,
+            tags::tag_reset_defaults,
+            tags::turn_tag_set,
+            tags::tag_suggest_folders,
+            tags::tag_suggest_for_turn,
+            tags::tag_context,
+            tags::tag_ai_status,
+            tags::tag_ai_set,
+            tags::tag_ai_suggest,
+            tags::tag_ai_pending,
+            tags::tag_ai_decide,
+            tags::tag_ai_decide_all,
             api::update_state,
             api::update_ack,
             api::update_set_check,

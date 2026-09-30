@@ -8,7 +8,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// 요청 1건 = 1행. v2: 요청 ID 는 세션 안에서만 유일하다(다른 세션의 같은 ID 가 덮어쓰지 않게).
 const TURN_COLUMNS: &str = r#"
@@ -104,7 +104,78 @@ CREATE TABLE IF NOT EXISTS session (
     pinned          INTEGER NOT NULL DEFAULT 0,
     hidden          INTEGER NOT NULL DEFAULT 0,  -- 보관(목록·폰에서 뺌)
     archived_at     TEXT,       -- 보관한 시각(v6) — 이 뒤에 온 요청·결과가 있으면 목록으로 되돌린다
-    agent           TEXT        -- 어느 도구의 세션인가(v9): NULL = Claude Code · 'codex' = OpenAI Codex
+    agent           TEXT,       -- 어느 도구의 세션인가(v9): NULL = Claude Code · 'codex' = OpenAI Codex
+    cleared_at      TEXT,       -- /clear 로 끝난 시각(v11, SessionEnd reason=clear) — NULL = 끝나지 않음
+    cleared_to      TEXT,       -- /clear 뒤 이어서 시작된 새 세션(SessionStart source=clear)
+    clear_state     TEXT,       -- 끝난 대화의 처리(v11): 'purge' 삭제 예약 · 'keep' 이력으로 보관 · 'ask' 아직 안 정함(자동 삭제 없음)
+    purge_at        TEXT,       -- 삭제 예정 시각(clear_state = 'purge')
+    clear_asked     INTEGER NOT NULL DEFAULT 0,  -- 사용자가 확인·결정했나 — 0 이면 "결정해 주세요" 안내를 띄운다
+    kept_at         TEXT
+);
+-- (session_clear_state 인덱스는 열 추가 마이그레이션 뒤에 만든다 — 옛 DB 에서 이 묶음이 먼저 돌기 때문)
+
+-- 삭제 예약 세션을 지운 기록(v11). 값(대화 내용·이름)은 남기지 않고 건수만
+CREATE TABLE IF NOT EXISTS purge_log (
+    id       INTEGER PRIMARY KEY,
+    at       TEXT NOT NULL,
+    sessions INTEGER NOT NULL,
+    turns    INTEGER NOT NULL,
+    reason   TEXT NOT NULL
+);
+
+-- 요청 태그(v12) — 한 세션 안에서 여러 주제를 다룰 때 주제별로 나눠 보려는 표식. 사용자 데이터라 이 표들은 재수집이 건드리지 않는다.
+CREATE TABLE IF NOT EXISTS tag (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    color      TEXT NOT NULL DEFAULT '',      -- '#rrggbb' · 빈 값 = 이름으로 정한 자동 색
+    minor      INTEGER NOT NULL DEFAULT 0,    -- 1 = 작은 태그(종류 표식) — 사이드바·대표 태그에서 뒤로
+    created_at TEXT NOT NULL
+);
+-- 자동 태깅 규칙: kind = path(요청이 건드린 경로·작업 폴더에 들어 있는 조각) | keyword(요청·응답 글 속 낱말)
+CREATE TABLE IF NOT EXISTS tag_rule (
+    id      INTEGER PRIMARY KEY,
+    tag_id  INTEGER NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    kind    TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    source  TEXT NOT NULL DEFAULT 'user',     -- user | default | suggested
+    UNIQUE (tag_id, kind, pattern)
+);
+-- 요청 ↔ 태그. state: auto(규칙) · manual(사용자가 붙임) · ai(모델 제안 — 사용자가 받아들이기 전) · off(사용자가 뗌 — 자동으로 다시 붙이지 않는다)
+CREATE TABLE IF NOT EXISTS turn_tag (
+    turn_id INTEGER NOT NULL REFERENCES turn(id) ON DELETE CASCADE,
+    tag_id  INTEGER NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+    state   TEXT NOT NULL,
+    score   REAL NOT NULL DEFAULT 0,
+    at      TEXT NOT NULL,
+    src     TEXT,                              -- hook = 요청 시점 훅이 정함(0.9.1) · NULL = 0.9.0 의 뒤늦은 규칙 계산(v13 이 지운다)
+    PRIMARY KEY (turn_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS turn_tag_tag ON turn_tag (tag_id, turn_id) WHERE state IN ('auto', 'manual');
+-- 자동 태깅을 마친 요청: 규칙 판(meta tags.rev)이나 요청 내용(turn.updated_at)이 바뀌면 다시 본다
+CREATE TABLE IF NOT EXISTS turn_tagged (
+    turn_id      INTEGER PRIMARY KEY REFERENCES turn(id) ON DELETE CASCADE,
+    rev          INTEGER NOT NULL,
+    turn_updated TEXT,
+    at           TEXT NOT NULL,
+    ai_at        TEXT                          -- 모델에 제안을 물어본 시각(같은 요청을 두 번 묻지 않는다)
+);
+-- 요청 시점 훅 기록: 요청을 보낼 때 정한 태그(원문은 없다). 대화 기록에서 같은 요청을 읽으면 turn_id 로 이어진다
+CREATE TABLE IF NOT EXISTS turn_hint (
+    id         INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    key        TEXT NOT NULL,                  -- 프롬프트 지문(정규화한 앞 500자의 SHA-256 앞 8바이트)
+    at_ms      INTEGER NOT NULL,
+    src        TEXT NOT NULL,                  -- hashtag | rule | project | kind | inherit | none
+    tag_ids    TEXT NOT NULL DEFAULT '',
+    exact      INTEGER NOT NULL DEFAULT 0,     -- 1 = 앱이 직접 기록(입력창·폰) — 지문이 같을 때만 잇는다
+    turn_id    INTEGER                         -- 이어진 요청(아직 없으면 NULL)
+);
+CREATE INDEX IF NOT EXISTS turn_hint_session ON turn_hint (session_id, at_ms);
+CREATE INDEX IF NOT EXISTS turn_hint_turn ON turn_hint (turn_id) WHERE turn_id IS NOT NULL;
+-- 요청이 읽거나 고친 경로(작업 폴더·Read·Edit·Grep·Bash 속 절대경로) — 태깅 신호. 이 PC 안에만 있다
+CREATE TABLE IF NOT EXISTS turn_touch (
+    turn_id INTEGER PRIMARY KEY REFERENCES turn(id) ON DELETE CASCADE,
+    paths   TEXT NOT NULL
 );
 
 -- turn 표는 TURN_COLUMNS 로 만든다 (마이그레이션에서 재사용)
@@ -184,6 +255,7 @@ CREATE TABLE IF NOT EXISTS relay_device (
     phone_pub  TEXT NOT NULL,     -- 폰 정적 공개키(hex)
     can_reply  INTEGER NOT NULL DEFAULT 1,
     can_manage INTEGER NOT NULL DEFAULT 0,  -- 폰에서 세션 관리(보관함 보기·보관·고정·기록에서 지우기) 허용(v7) — 페어링 때 답 보내기 허용 값을 따른다
+    can_schedule INTEGER NOT NULL DEFAULT 0, -- 폰에서 예약 전송을 만들기·고치기·취소·처리(v14) — 기본 끔, PC 설정에서 기기마다 켠다
     created_at TEXT NOT NULL,
     last_seen  TEXT,
     ticket     TEXT,              -- 푸시 티켓(서버가 봉인한 값 — 알림만 보낼 수 있다)
@@ -208,10 +280,81 @@ CREATE TABLE IF NOT EXISTS conoti_reply (
     acked        TEXT,           -- (v3 평문 카드 시절) 서버에 알린 상태
     device       TEXT,           -- 보낸 폰(relay_device.pid)
     wait_from    TEXT,           -- 폰 말의 10분 시계 시작점. 세션이 앞 작업을 하는 동안은 계속 뒤로 밀린다(v8)
-    quote        TEXT            -- 답장 대상(v10): 'prompt' | 'response' — turn_id 의 요청·결과에 단 답. NULL = 그냥 이어서
+    quote        TEXT,           -- 답장 대상(v10): 'prompt' | 'response' — turn_id 의 요청·결과에 단 답. NULL = 그냥 이어서
+    sched        TEXT            -- 예약 전송에서 온 줄(v14): 예약 회차 키(schedule_run). NULL = 예약이 아님 — 꺼진 세션을 이어서 실행하지 않는다
 );
 CREATE INDEX IF NOT EXISTS conoti_reply_state ON conoti_reply (state);
 CREATE INDEX IF NOT EXISTS conoti_reply_received ON conoti_reply (received_at);
+
+-- ── 예약 전송(v14) — 정본 문서는 docs/SCHEDULE.md ────────────────────────────
+-- 예약은 대기열(conoti_reply) 밖에 둔다 — 시각이 되는 순간에만 대기열에 한 줄을 넣는다(그 줄의 received_at = 발사 시각이라 3시간 상한이 발사 기준)
+CREATE TABLE IF NOT EXISTS schedule (
+    id               TEXT PRIMARY KEY,           -- 'sc' + hex16
+    rid              TEXT,                       -- 폰이 만든 예약의 멱등 키(같은 rid 로 다시 만들면 처음 것을 돌려준다)
+    session_id       TEXT NOT NULL,
+    text             TEXT NOT NULL,
+    quote            TEXT,                       -- 답장 대상('prompt'|'response') · turn_id 의 요청
+    turn_id          INTEGER,
+    created_by       TEXT NOT NULL,              -- 'desktop' (폰 예약은 2단계)
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    rev              INTEGER NOT NULL DEFAULT 1, -- 낙관적 잠금
+    kind             TEXT NOT NULL,              -- once | after (cron 은 2단계)
+    tz               TEXT NOT NULL,              -- 만든 곳의 IANA 시간대
+    cron             TEXT,                       -- 2단계
+    until_at         TEXT,                       -- 2단계
+    max_runs         INTEGER,                    -- 2단계
+    runs             INTEGER NOT NULL DEFAULT 0,
+    next_due_at      TEXT,                       -- UTC ISO. NULL = 더 발사할 회차 없음
+    on_missed        TEXT NOT NULL,              -- run_once | skip | within (놓친 예약 처리 — 예약마다)
+    missed_within_min INTEGER,
+    busy_policy      TEXT,                       -- NULL(규칙을 따름) | interrupt | after_work | after_quiet (바쁜 세션 처리 — 예약마다 덮어쓰기)
+    state            TEXT NOT NULL               -- active | done | cancelled | paused
+);
+-- 회차. 상태: pending(발사됨·판단 전) · deferred(바쁜 세션/방해금지 창 뒤로 미룸) · fired(대기열에 넣음) · delivered · handled ·
+--            held(못 받아 대기 — 사용자가 보내기/버리기) · missed(놓침) · failed(정책상 막음) · cancelled
+CREATE TABLE IF NOT EXISTS schedule_run (
+    schedule_id   TEXT NOT NULL,
+    occurrence_at TEXT NOT NULL,                 -- 원래 발사 시각(UTC ISO)
+    created_at    TEXT NOT NULL,                 -- 발사 처리를 시작한 시각(미룸·3시간 상한의 기준)
+    fired_at      TEXT,
+    reply_id      TEXT,                          -- conoti_reply 로 넘긴 줄
+    state         TEXT NOT NULL,
+    reason        TEXT,                          -- held 사유 코드: ended | terminal | perm | busy_limit | stuck | policy | cap | rejected
+    note          TEXT,
+    notified_at   TEXT,                          -- 폰·화면 알림 1회(조건부 UPDATE 로 한 번만)
+    renotified_at TEXT,                          -- 다시 받을 수 있게 됐을 때 알림 1회
+    PRIMARY KEY (schedule_id, occurrence_at)
+);
+CREATE TABLE IF NOT EXISTS schedule_att (
+    schedule_id TEXT NOT NULL,
+    att_id      TEXT NOT NULL,
+    ord         INTEGER NOT NULL,
+    PRIMARY KEY (schedule_id, ord)
+);
+-- 방해금지 창(시간대 규칙). days = 월(1)~일(64) 비트
+CREATE TABLE IF NOT EXISTS quiet_window (
+    id       INTEGER PRIMARY KEY,
+    name     TEXT NOT NULL DEFAULT '',
+    days     INTEGER NOT NULL DEFAULT 127,
+    start_hm TEXT NOT NULL,
+    end_hm   TEXT NOT NULL,
+    tz       TEXT NOT NULL,
+    enabled  INTEGER NOT NULL DEFAULT 1
+);
+-- 바쁜 세션 규칙: scope = session(key = 세션 ID) | tag(key = 태그 id) — action = interrupt | after_work | after_quiet
+CREATE TABLE IF NOT EXISTS busy_rule (
+    id     INTEGER PRIMARY KEY,
+    scope  TEXT NOT NULL,
+    key    TEXT NOT NULL,
+    action TEXT NOT NULL,
+    UNIQUE (scope, key)
+);
+-- 예약을 받을 수 있는 세션 목록(설정 "허용 세션 목록"일 때만 쓴다)
+CREATE TABLE IF NOT EXISTS sched_allow (
+    session_id TEXT PRIMARY KEY,
+    added_at   TEXT NOT NULL
+);
 
 -- ── 이미지 첨부(v5) ─────────────────────────────────────────────────────────
 -- 파일은 데이터 폴더 attachments/<id 앞 2자>/<id>.<ext>. id = 저장한 바이트의 SHA-256 → 같은 이미지는 한 벌(attach.rs)
@@ -378,16 +521,103 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             conn.execute_batch("ALTER TABLE conoti_reply ADD COLUMN quote TEXT;")?;
         }
     }
-    if current < SCHEMA_VERSION {
+    if current < 11 && had_turn {
+        // v10 → v11: /clear 로 끝난 대화의 처리(삭제 예약·보관). 기존 데이터는 바꾸지 않고 열 추가만 한다 —
+        // 그 전에 /clear 된 세션은 '아직 안 정함'(자동 삭제 없음)으로 표시만 한다(되돌릴 수 없는 삭제를 소급하지 않는다).
+        // 바꾸기 전에 DB 사본을 한 벌 남긴다(이미 있으면 그대로).
+        backup_before(conn, "v10");
+        for (col, ddl) in [
+            ("cleared_at", "ALTER TABLE session ADD COLUMN cleared_at TEXT;"),
+            ("cleared_to", "ALTER TABLE session ADD COLUMN cleared_to TEXT;"),
+            ("clear_state", "ALTER TABLE session ADD COLUMN clear_state TEXT;"),
+            ("purge_at", "ALTER TABLE session ADD COLUMN purge_at TEXT;"),
+            ("clear_asked", "ALTER TABLE session ADD COLUMN clear_asked INTEGER NOT NULL DEFAULT 0;"),
+            ("kept_at", "ALTER TABLE session ADD COLUMN kept_at TEXT;"),
+        ] {
+            let has: bool = conn
+                .query_row("SELECT COUNT(*) FROM pragma_table_info('session') WHERE name = ?1", [col], |r| r.get::<_, i64>(0))
+                .map(|n| n > 0)?;
+            if !has {
+                conn.execute_batch(ddl)?;
+            }
+        }
+        conn.execute_batch(
+            "UPDATE session SET cleared_at = ended_at, clear_state = 'ask', clear_asked = 1
+              WHERE end_reason = 'clear' AND cleared_at IS NULL AND ended_at IS NOT NULL;",
+        )?;
+    }
+    if current < 12 && had_turn {
+        // v11 → v12: 요청 태그 — 새 표만 추가한다(위 SCHEMA 가 이미 만들었다). 기존 데이터는 바꾸지 않으니 사본만 남긴다.
+        backup_before(conn, "v11");
+    }
+    if current < 13 && had_turn {
+        // v12 → v13: 태그를 요청 시점 훅이 정한다 — 0.9.0 이 뒤늦게 낱말·경로로 붙인 자동 표식(src 없는 auto)만 지운다.
+        // 사용자가 붙이고 뗀 것(manual · off)과 모델 제안(ai)은 손대지 않는다. 열이 없을 때(= 처음 이 단계를 밟을 때)만 지워 두 번 돌아도 안전하다.
+        // 지우기 전에 사본을 한 벌 남긴다(이미 있으면 그대로).
+        let has_src: bool = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('turn_tag') WHERE name = 'src'", [], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)?;
+        if !has_src {
+            backup_before(conn, "v12");
+            conn.execute_batch(
+                "ALTER TABLE turn_tag ADD COLUMN src TEXT;
+                 DELETE FROM turn_tag WHERE state = 'auto' AND src IS NULL;
+                 DELETE FROM turn_tagged WHERE ai_at IS NULL;",
+            )?;
+            let _ = conn.execute("DELETE FROM meta WHERE key = 'tags.rev'", []);
+        }
+    }
+    if current < 14 && had_turn {
+        // 폰 예약 허용(기기별, 기본 끔)
+        let has_dev: bool = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('relay_device') WHERE name = 'can_schedule'", [], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)?;
+        if !has_dev {
+            backup_before(conn, "v13");
+            conn.execute_batch("ALTER TABLE relay_device ADD COLUMN can_schedule INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        // v13 → v14: 예약 전송 — 새 표는 위 SCHEMA 가 만들었고, 대기열(conoti_reply)에 예약 표식 열 하나만 더한다. 기존 데이터는 바꾸지 않는다.
+        // (새 열의 인덱스는 SCHEMA 묶음에 넣지 않았다 — 옛 DB 에서 묶음이 먼저 돈다.) 바꾸기 전에 사본을 한 벌 남긴다(이미 있으면 그대로).
+        let has_col: bool = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('conoti_reply') WHERE name = 'sched'", [], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)?;
+        if !has_col {
+            backup_before(conn, "v13");
+            conn.execute_batch("ALTER TABLE conoti_reply ADD COLUMN sched TEXT;")?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS conoti_reply_sched ON conoti_reply (sched) WHERE sched IS NOT NULL;")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS schedule_due ON schedule (state, next_due_at);")?;
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS schedule_rid ON schedule (created_by, rid) WHERE rid IS NOT NULL;")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS schedule_session ON schedule (session_id, state);")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS schedule_run_open ON schedule_run (state);")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS session_clear_state ON session (clear_state) WHERE clear_state IS NOT NULL;")?;
+    if current < SCHEMA_VERSION || get_meta(conn, "schema_version").is_none() {
         set_meta(conn, "schema_version", &SCHEMA_VERSION.to_string())?;
     }
     // 오래된 훅 이벤트는 90일까지만
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     conn.execute("DELETE FROM hook_event WHERE at < ?1", params![cutoff])?;
+    crate::tags::seed_defaults(conn);
     if get_meta(conn, "installed_at").is_none() {
         set_meta(conn, "installed_at", &crate::time::now_iso())?;
     }
     Ok(())
+}
+
+/// 마이그레이션 전 DB 사본(`inbox.db.bak-<이름>`, 본인만 읽기). 파일 DB 일 때만, 이미 있으면 건드리지 않는다. 실패해도 마이그레이션은 계속한다.
+fn backup_before(conn: &Connection, tag: &str) {
+    let Some(path) = conn.path().map(std::path::PathBuf::from) else { return };
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let dst = std::path::PathBuf::from(format!("{}.bak-{tag}", path.display()));
+    if dst.exists() {
+        return;
+    }
+    if conn.execute("VACUUM INTO ?1", params![dst.to_string_lossy()]).is_ok() {
+        crate::paths::make_private_file(&dst);
+    }
 }
 
 pub fn get_meta(conn: &Connection, key: &str) -> Option<String> {
