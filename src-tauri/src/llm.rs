@@ -330,6 +330,8 @@ fn run_claude_in(dir: &Path, mut cmd: Command, model: &str, system: &str, prompt
         return Err("모델 이름 형식이 올바르지 않습니다".into());
     }
     cmd.args(claude_args(model, system, safe_mode)).current_dir(dir).env(INTERNAL_ENV, "1");
+    // 지침(--system-prompt)은 여러 줄이다
+    crate::deliver::multiline_ok(&cmd)?;
     let out = exec_cli(cmd, prompt.as_bytes(), timeout).map_err(exec_msg)?;
     finish(out, None)
 }

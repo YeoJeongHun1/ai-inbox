@@ -289,14 +289,25 @@ pub fn find_claude() -> Option<PathBuf> {
         PathBuf::from("/usr/local/bin/claude"),
     ];
     if cfg!(windows) {
-        cands = vec![
-            home.join(".local/bin/claude.exe"),
-            home.join("AppData/Roaming/npm/claude.cmd"),
-            home.join("AppData/Local/Programs/claude/claude.exe"),
-        ];
+        // 네이티브 exe 를 먼저 — npm 래퍼(.cmd)로는 여러 줄 인자를 넘길 수 없다(multiline_ok)
+        let npm = home.join("AppData/Roaming/npm");
+        cands = vec![home.join(".local/bin/claude.exe"), home.join("AppData/Local/Programs/claude/claude.exe")];
+        cands.extend(npm_claude_exe(&npm));
+        cands.push(npm.join("claude.cmd"));
     }
     if let Some(p) = cands.into_iter().find(|p| p.is_file()) {
         return Some(p);
+    }
+    // 흔한 위치에 없으면 PATH 에서 — exe 먼저, 래퍼(.cmd)를 찾으면 그 뒤의 exe
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        if let Some(p) = search_path(&path, &["claude.exe"]) {
+            return Some(p);
+        }
+        if let Some(w) = search_path(&path, &["claude.cmd", "claude.bat"]) {
+            return Some(w.parent().and_then(npm_claude_exe).unwrap_or(w));
+        }
     }
     #[cfg(unix)]
     {
@@ -308,6 +319,37 @@ pub fn find_claude() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// PATH 의 폴더를 차례로 보며 `names` 중 있는 파일(이름 순서가 우선 — 모든 폴더에서 앞 이름을 먼저 찾는다)
+#[cfg_attr(not(windows), allow(dead_code))]
+fn search_path(path: &std::ffi::OsStr, names: &[&str]) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).filter(|d| d.is_absolute()).collect();
+    names.iter().find_map(|n| dirs.iter().map(|d| d.join(n)).find(|p| p.is_file()))
+}
+
+/// npm 설치(`claude.cmd`) 뒤의 네이티브 claude.exe. 래퍼가 부르는 `bin/claude.exe` 는 설치 스크립트가 돌지 않았으면
+/// 몇백 바이트짜리 자리표시자라 크기로 거르고, 그때는 플랫폼 패키지(`claude-code-win32-*`)의 것을 쓴다
+fn npm_claude_exe(npm_dir: &Path) -> Option<PathBuf> {
+    let scope = npm_dir.join("node_modules/@anthropic-ai");
+    let main = scope.join("claude-code");
+    let mut cands = vec![main.join("bin/claude.exe")];
+    for arch in ["x64", "arm64"] {
+        let pkg = format!("claude-code-win32-{arch}");
+        cands.push(scope.join(&pkg).join("claude.exe"));
+        cands.push(main.join("node_modules/@anthropic-ai").join(&pkg).join("claude.exe"));
+    }
+    cands.into_iter().find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 1 << 20))
+}
+
+/// Windows 에서 npm 래퍼(.cmd/.bat)로는 줄바꿈이 든 인자를 넘길 수 없다(Rust 가 InvalidInput 으로 거절한다) — 부르기 전에 알아듣게 막는다
+pub(crate) fn multiline_ok(c: &Command) -> Result<(), String> {
+    let wrapper = Path::new(c.get_program()).extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    let multiline = c.get_args().any(|a| a.to_string_lossy().contains(['\n', '\r']));
+    if cfg!(windows) && wrapper && multiline {
+        return Err("Windows 에서는 npm 래퍼(claude.cmd)로 여러 줄 말을 넘길 수 없습니다 — claude.exe 가 있는 설치(네이티브 설치, 또는 설치 스크립트를 건너뛰지 않은 npm 설치)가 필요합니다".into());
+    }
+    Ok(())
 }
 
 /// Claude Code 안에서 띄운 앱이면 그 세션의 환경변수가 따라온다 — 새 세션이 자기를 자식으로 착각하지 않게 지운다.
@@ -416,11 +458,10 @@ fn resume_in_background(t: &conoti::Target, text: &str) -> Result<(), String> {
     let cwd = t.cwd.clone().filter(|d| Path::new(d).is_dir()).ok_or("세션 작업 폴더가 없음")?;
     // 셸을 거치지 않고 인자로 직접 넘긴다(본문이 셸에 해석되지 않는다).
     // 권한 모드는 지정하지 않는다 = 사용자의 기본 설정. 승인이 필요하면 세션이 멈추고 `claude attach` 로 연다.
-    let out = claude_cmd()?
-        .current_dir(cwd)
-        .args(["--bg", "--resume", &t.session_id, text])
-        .output()
-        .map_err(|e| format!("claude 실행 실패: {e}"))?;
+    let mut c = claude_cmd()?;
+    c.current_dir(cwd).args(["--bg", "--resume", &t.session_id, text]);
+    multiline_ok(&c)?;
+    let out = c.output().map_err(|e| format!("claude 실행 실패: {e}"))?;
     if !out.status.success() {
         return Err(launch_error(&out));
     }
@@ -451,11 +492,10 @@ pub fn start_session(cwd: &Path, name: &str, text: &str) -> Result<(String, Opti
     if !cwd.is_dir() {
         return Err("폴더가 없습니다".into());
     }
-    let out = claude_cmd()?
-        .current_dir(cwd)
-        .args(["--bg", &format!("--name={name}"), text])
-        .output()
-        .map_err(|e| format!("claude 실행 실패: {e}"))?;
+    let mut c = claude_cmd()?;
+    c.current_dir(cwd).args(["--bg", &format!("--name={name}"), text]);
+    multiline_ok(&c)?;
+    let out = c.output().map_err(|e| format!("claude 실행 실패: {e}"))?;
     if !out.status.success() {
         return Err(launch_error(&out));
     }
@@ -562,6 +602,48 @@ mod tests {
         f.arg("x");
         let o = crate::llm::exec_cli(f, b"x1\ny2\n", Duration::from_secs(10)).ok().expect("findstr");
         assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "x1");
+    }
+
+    #[test]
+    fn npm_install_resolves_to_the_native_exe_behind_the_wrapper() {
+        let npm = std::env::temp_dir().join(format!("aiinbox-npm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&npm);
+        let main_bin = npm.join("node_modules/@anthropic-ai/claude-code/bin");
+        let plat = npm.join("node_modules/@anthropic-ai/claude-code-win32-x64");
+        std::fs::create_dir_all(&main_bin).unwrap();
+        std::fs::create_dir_all(&plat).unwrap();
+        assert_eq!(npm_claude_exe(&npm), None, "exe 가 없으면 래퍼 그대로");
+        // 설치 스크립트가 돌지 않은 자리표시자(수백 바이트)는 건너뛰고 플랫폼 패키지의 것을
+        std::fs::write(main_bin.join("claude.exe"), vec![0u8; 500]).unwrap();
+        std::fs::write(plat.join("claude.exe"), vec![0u8; 2 << 20]).unwrap();
+        assert_eq!(npm_claude_exe(&npm), Some(plat.join("claude.exe")));
+        // 설치 스크립트가 덮어쓴 bin/claude.exe(래퍼가 부르는 것)가 먼저
+        std::fs::write(main_bin.join("claude.exe"), vec![0u8; 2 << 20]).unwrap();
+        assert_eq!(npm_claude_exe(&npm), Some(main_bin.join("claude.exe")));
+        // PATH 탐색: 앞 이름(exe)을 모든 폴더에서 먼저 찾는다. 상대 경로 폴더는 보지 않는다
+        let (a, b) = (npm.join("a"), npm.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("claude.cmd"), "").unwrap();
+        std::fs::write(b.join("claude.exe"), "").unwrap();
+        let path = std::env::join_paths([a.clone(), b.clone(), PathBuf::from("relative")]).unwrap();
+        assert_eq!(search_path(&path, &["claude.exe", "claude.cmd"]), Some(b.join("claude.exe")));
+        assert_eq!(search_path(&path, &["claude.cmd"]), Some(a.join("claude.cmd")));
+        assert_eq!(search_path(&path, &["nope.exe"]), None);
+        let _ = std::fs::remove_dir_all(&npm);
+    }
+
+    #[test]
+    fn multiline_args_are_refused_only_for_windows_wrappers() {
+        let mut w = Command::new(r"C:\npm\claude.cmd");
+        w.args(["--bg", "첫 줄\n둘째 줄"]);
+        assert_eq!(multiline_ok(&w).is_err(), cfg!(windows));
+        let mut one = Command::new(r"C:\npm\claude.cmd");
+        one.arg("--version");
+        assert!(multiline_ok(&one).is_ok(), "한 줄 인자는 래퍼로도 된다");
+        let mut exe = Command::new(r"C:\bin\claude.exe");
+        exe.args(["--bg", "첫 줄\n둘째 줄"]);
+        assert!(multiline_ok(&exe).is_ok());
     }
 
     #[test]
