@@ -478,6 +478,9 @@ pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captu
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }
+                // Windows 에는 프로세스 그룹 신호가 없다 — 자식이 띄운 하위 프로세스를 먼저 끝낸다(`kill` 은 직계 자식만 끝낸다)
+                #[cfg(windows)]
+                kill_descendants(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -494,9 +497,93 @@ pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captu
     }
 }
 
+/// (pid, 부모 pid) 목록에서 `root` 의 자손 — 가까운 것부터, `root` 는 빼고
+#[cfg_attr(not(windows), allow(dead_code))]
+fn descendants(root: u32, procs: &[(u32, u32)]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(p) = frontier.pop() {
+        for &(pid, ppid) in procs {
+            // pid 0(시스템 유휴)·자기 자신을 부모로 적은 항목·이미 넣은 것은 건너뛴다(순환 방지)
+            if ppid == p && pid != 0 && pid != root && pid != ppid && !out.contains(&pid) {
+                out.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    out
+}
+
+/// 시간 초과 때 `root` 가 띄운 하위 프로세스(손자·증손자)를 모두 끝낸다
+#[cfg(windows)]
+fn kill_descendants(root: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    let mut procs: Vec<(u32, u32)> = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut e) != 0 {
+            loop {
+                procs.push((e.th32ProcessID, e.th32ParentProcessID));
+                if Process32NextW(snap, &mut e) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+        for pid in descendants(root, &procs) {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descendants_walk_the_whole_tree_without_looping() {
+        // 1 → 2 → 3 → 4, 1 → 5, 다른 가지 9 → 10. 6 은 자기를 부모로 적었다(순환)
+        let procs = [(2, 1), (3, 2), (4, 3), (5, 1), (10, 9), (6, 6), (1, 4)];
+        let mut d = descendants(1, &procs);
+        d.sort();
+        assert_eq!(d, vec![2, 3, 4, 5]);
+        assert!(descendants(10, &procs).is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn timeout_ends_grandchildren_on_windows() {
+        // cmd(자식)가 띄운 ping(손자)이 출력 파일을 쥐고 있다 — 손자가 살아 있으면 그 파일을 지울 수 없다
+        let dir = std::env::temp_dir().join(format!("aiinbox-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("held.txt");
+        let mut c = Command::new("cmd");
+        // cmd 의 따옴표 규칙은 Rust 의 인자 이스케이프와 다르다 — 그대로 넘긴다
+        std::os::windows::process::CommandExt::raw_arg(&mut c, format!("/C ping -n 60 127.0.0.1 > \"{}\"", held.display()));
+        let t = Instant::now();
+        assert!(matches!(exec_cli(c, b"", Duration::from_secs(2)), Err(ExecErr::Timeout)));
+        assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
+        let until = Instant::now() + Duration::from_secs(5);
+        while std::fs::remove_file(&held).is_err() {
+            assert!(Instant::now() < until, "손자 프로세스(ping)가 아직 파일을 쥐고 있다");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn claude_auth_parsing_hides_identity() {
