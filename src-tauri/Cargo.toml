@@ -1,6 +1,6 @@
 [package]
 name = "ai-inbox"
-version = "0.10.0"
+version = "0.10.1"
 description = "AI Inbox — Claude Code·Codex 요청을 채팅처럼 모아 보는 데스크톱 앱"
 authors = ["YeoJeongHun"]
 license = "MIT"
