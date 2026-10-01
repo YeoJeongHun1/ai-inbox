@@ -45,7 +45,7 @@ export function ClearSection({ toast }: { toast: (m: string) => void }) {
           별표·고정한 요청이 있거나, 진행 중이거나, /clear 뒤 이어서 쓴 흔적이 있으면 지우지 않고 미룹니다. 지우기 전에는 건수만 기록합니다(내용 없음).
         </p>
       )}
-      <div className="set-row">
+      <div className="set-row" data-set-id="clear-tidy">
         <button className="btn" onClick={() => setDialog(true)}>
           끝난 대화 정리…
         </button>
@@ -122,6 +122,7 @@ export function HistorySection({ toast }: { toast: (m: string) => void }) {
         <strong> 질문 한 번마다 구독 사용량이 소모됩니다.</strong> 모델은 빈 임시 폴더에서 도구 없이 한 번만 돌며 파일·명령에 접근할 수 없고, 훅·MCP·개인 설정은 켜지 않습니다. 이 호출은 이 앱의 목록에 세션으로 나타나지 않습니다.
         비밀값은 저장할 때 이미 가려지지만 완전하지 않으니, 보내고 싶지 않으면 켜지 마세요. "모델 없이 찾기"는 켜지 않아도 되고 아무 데도 접속하지 않습니다.
       </p>
+      <div data-set-id="history-service">
       <div className="set-line">
         <span>감지된 서비스</span>
         <button className="btn" disabled={busy || detecting} onClick={detect}>
@@ -151,6 +152,8 @@ export function HistorySection({ toast }: { toast: (m: string) => void }) {
         </select>
         <span className="set-note small">{st.active ? `지금은 ${st.active === "claude" ? "Claude Code" : "Codex"} 를 씁니다` : "쓸 수 있는 서비스 없음"}</span>
       </div>
+      </div>
+      <div data-set-id="history-model">
       <div className="set-line">
         <span>Claude 모델</span>
         <input className="text-in" list="llm-claude-models" value={claudeModel} spellCheck={false} onChange={(e) => setClaudeModel(e.target.value)} />
@@ -175,6 +178,8 @@ export function HistorySection({ toast }: { toast: (m: string) => void }) {
           바꾸기
         </button>
       </div>
+      </div>
+      <div data-set-id="history-consent">
       <label className="check">
         <input
           type="checkbox"
@@ -196,6 +201,7 @@ export function HistorySection({ toast }: { toast: (m: string) => void }) {
       <p className="set-note small">
         하루 {st.daily_cap}회까지 · 오늘 {st.calls_today}회 사용(요청 태그 제안과 함께 셉니다). 답이 늦거나 실패하면 자동으로 "모델 없이 찾기"로 보여 줍니다.
       </p>
+      </div>
       {st.legacy_key && (
         <div className="set-line">
           <span className="set-note small">이전 버전이 저장한 API 키 파일이 남아 있습니다 — 더는 쓰지 않으니 지워도 됩니다.</span>
@@ -297,6 +303,7 @@ export function ScheduleSection({ toast }: { toast: (m: string) => void }) {
         우선순위: 예약을 만들 때 고른 것 → 세션 규칙 → 태그 규칙 → 방해금지 시간대 → 이 기본값. 세션 규칙은 아래에서, 예약마다 덮어쓰기는 예약 창에서 정합니다.
       </p>
 
+      <div data-set-id="sched-dnd">
       <h4>방해금지 시간 (시간대 규칙)</h4>
       <div className="set-line">
         <label className="check">
@@ -315,7 +322,9 @@ export function ScheduleSection({ toast }: { toast: (m: string) => void }) {
         ))}
       </div>
       <p className="set-note small">이 시간 안에 시각이 된 예약은 "방해금지 시간이 끝난 뒤"로 미룹니다(예약·세션·태그 규칙이 따로 있으면 그쪽이 먼저). 자정을 넘겨도 됩니다.</p>
+      </div>
 
+      <div data-set-id="sched-rules">
       {st.rules.length > 0 && (
         <>
           <h4>세션·태그 규칙</h4>
@@ -349,7 +358,9 @@ export function ScheduleSection({ toast }: { toast: (m: string) => void }) {
           </button>
         ))}
       </div>
+      </div>
 
+      <div data-set-id="sched-perm">
       <h4>예약 처리 정책 (권한)</h4>
       <p className="set-note small">
         예약된 말은 그 세션이 <strong>지금 쓰는 권한 설정 그대로</strong> 실행됩니다 — 이미 떠 있는 세션에는 도구 허용 목록 같은 제한을 새로 걸 수 없습니다(세션을 시작할 때만 정해집니다).
@@ -393,6 +404,7 @@ export function ScheduleSection({ toast }: { toast: (m: string) => void }) {
           </div>
         </>
       )}
+      </div>
     </section>
   );
 }
