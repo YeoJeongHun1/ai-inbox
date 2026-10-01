@@ -1530,6 +1530,64 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_phone_send_never_leaves_the_run_stuck_in_sending() {
+        // 폰 보내기의 트랜잭션이 실패해도(잠금 경합 등) 회차가 `sending` 에 갇히거나 트랜잭션이 열린 채 남지 않는다 — 경우마다 모아 한 번에 단언
+        let mut wrong: Vec<String> = Vec::new();
+        let fresh = || {
+            let c = mem();
+            add_dev(&c, "d1", 1, 1);
+            db::set_meta(&c, "conoti.bg_resume", "1").unwrap();
+            let id = held_pc_schedule(&c);
+            (c, id)
+        };
+        let send = |c: &Connection, id: &str| sched_act(c, &json!({"id": id, "op": "send"}), &dev("d1", true, false, true));
+        // 1) BEGIN IMMEDIATE 실패 — 이미 트랜잭션 안에서 부르면 BEGIN 이 거절된다(잠금을 못 얻을 때와 같은 갈래)
+        let (c, id) = fresh();
+        c.execute_batch("BEGIN").unwrap();
+        let r = send(&c, &id);
+        c.execute_batch("COMMIT").unwrap();
+        if r.is_ok() || run_of(&c, &id).0 != "held" {
+            wrong.push(format!("BEGIN 실패: 결과 {r:?} · 회차 {}", run_of(&c, &id).0));
+        }
+        // 2) COMMIT 실패 — 지연 외래 키 위반을 주입한다(실패한 COMMIT 은 트랜잭션을 연 채 둔다)
+        let (c, id) = fresh();
+        c.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TEMP TABLE fk_parent (id INTEGER PRIMARY KEY);
+             CREATE TEMP TABLE fk_child (pid INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TEMP TRIGGER fail_commit AFTER INSERT ON conoti_reply BEGIN INSERT INTO fk_child VALUES (42); END;",
+        )
+        .unwrap();
+        let r = send(&c, &id);
+        let open = !c.is_autocommit();
+        if open {
+            let _ = c.execute_batch("ROLLBACK");
+        }
+        let lines: i64 = c.query_row("SELECT COUNT(*) FROM conoti_reply WHERE device = 'd1'", [], |x| x.get(0)).unwrap();
+        if r.is_ok() || open || run_of(&c, &id).0 != "held" || lines != 0 {
+            wrong.push(format!("COMMIT 실패: 결과 {r:?} · 트랜잭션 열림 {open} · 회차 {} · 남은 줄 {lines}", run_of(&c, &id).0));
+        }
+        c.execute_batch("DROP TRIGGER fail_commit;").unwrap();
+        if send(&c, &id).is_err() || run_of(&c, &id).0 != "fired" {
+            wrong.push(format!("실패 뒤 다시 보내기: 회차 {}", run_of(&c, &id).0));
+        }
+        // 3) 되돌리기까지 실패했거나 앱이 그 사이 꺼져 `sending` 에 남은 회차는 틱이 2분 뒤 다시 대기로 — 진행 중(방금 누름)인 것은 두고
+        let (c, id) = fresh();
+        let now = chrono::Utc::now();
+        let ago = |s: i64| (now - chrono::Duration::seconds(s)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        c.execute("UPDATE schedule_run SET state = 'sending', fired_at = ?1", params![ago(10)]).unwrap();
+        crate::sched::tick(&c, now, &UpProbe);
+        let early = run_of(&c, &id).0;
+        c.execute("UPDATE schedule_run SET fired_at = ?1", params![ago(180)]).unwrap();
+        crate::sched::tick(&c, now, &UpProbe);
+        let late = run_of(&c, &id).0;
+        if (early.as_str(), late.as_str()) != ("sending", "held") {
+            wrong.push(format!("멈춘 sending 거두기: 10초 {early} · 3분 {late}"));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
     fn confirm_approved_more_than_ten_minutes_after_fire_is_delivered() {
         // 발사 → PC 확인 대기 → 11분 뒤 PC 가 "전달" — 정체 판정은 허용한 때부터 센다(발사 시각부터 세면 바로 held 로 튕긴다)
         let (c, id) = fired_phone_schedule(true);

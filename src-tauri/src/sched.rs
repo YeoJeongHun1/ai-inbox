@@ -36,6 +36,8 @@ pub const MAX_ACTIVE_PER_SESSION: i64 = 20;
 pub const MAX_ACTIVE_TOTAL: i64 = 200;
 /// 예약에서 온 줄이 PC 확인을 기다릴 수 있는 시간 — 파이프라인의 "받은 뒤 3시간" 상한과 같다(그 뒤엔 허용해도 넣지 않으므로 거둔다)
 pub const CONFIRM_LIMIT_SECS: i64 = 3 * 3600;
+/// "보내기"를 잡은(`sending`) 채 이만큼 지나면 끝내지 못한 것으로 보고 held 로 되돌린다(`recover_sending`)
+pub const SENDING_STALE_SECS: i64 = 120;
 const CONFIRM_EXPIRED_NOTE: &str = "PC 확인 없이 3시간이 지나 넣지 않음";
 /// 폰 한 대가 24시간 동안 만들 수 있는 예약 수(취소한 것도 센다) — 만들고 취소하기를 되풀이해 표가 끝없이 커지지 않게
 pub const MAX_DEVICE_ADDS_PER_DAY: i64 = 100;
@@ -787,9 +789,13 @@ pub fn act_by(conn: &Connection, now: DateTime<Utc>, id: &str, op: &str, phone: 
                     .into());
                 }
             }
-            // 두 번 눌러도 한 번만 — 먼저 잡은 쪽만 진행한다
+            // 두 번 눌러도 한 번만 — 먼저 잡은 쪽만 진행한다. 잡은 시각을 `fired_at` 에 남긴다(보내기 중 앱이 꺼지면 `recover_sending` 이 이 시각으로 거둔다 —
+            // 보내기가 끝나면 `mark` 가 발사 시각으로 덮는다)
             let n = conn
-                .execute("UPDATE schedule_run SET state = 'sending' WHERE schedule_id = ?1 AND occurrence_at = ?2 AND state = 'held'", params![id, occ])
+                .execute(
+                    "UPDATE schedule_run SET state = 'sending', fired_at = ?3 WHERE schedule_id = ?1 AND occurrence_at = ?2 AND state = 'held'",
+                    params![id, occ, iso(now)],
+                )
                 .map_err(|e| e.to_string())?;
             if n == 0 {
                 return Ok(());
@@ -808,21 +814,29 @@ pub fn act_by(conn: &Connection, now: DateTime<Utc>, id: &str, op: &str, phone: 
             };
             let sent: R<()> = match phone {
                 // 폰이 누른 보내기 = 그 기기의 폰 답 줄(확인 대기 여부까지 INSERT 한 번에) — 전달 직전 재검사·확인·해제 회수를 폰 답처럼 탄다.
-                // 줄과 회차 연결을 한 트랜잭션으로: 전달 스레드(다른 연결)가 "예약에서 온 줄"임을 모르는 채 집어 가지 않게
-                Some((pid, _)) => {
-                    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
-                    match conoti::accept_phone_send(conn, pid, &sid, &body, &atts_of(conn, id), q).and_then(|rid| mark(&rid)) {
-                        Ok(()) => {
-                            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-                            conoti::record_tag_hint(conn, &sid, &body);
-                            Ok(())
-                        }
-                        Err(e) => {
-                            let _ = conn.execute_batch("ROLLBACK");
-                            Err(e)
+                // 줄과 회차 연결을 한 트랜잭션으로: 전달 스레드(다른 연결)가 "예약에서 온 줄"임을 모르는 채 집어 가지 않게.
+                // BEGIN·COMMIT 실패(잠금 경합이 busy_timeout 을 넘김 등)도 `?` 로 빠져나가지 않는다 — 실패한 COMMIT 은 트랜잭션을 연 채 두므로
+                // ROLLBACK 으로 닫고, 아래에서 회차를 held 로 되돌린다(그러지 않으면 `sending` 에 갇힌다, 10-01 리뷰)
+                Some((pid, _)) => match conn.execute_batch("BEGIN IMMEDIATE") {
+                    Err(e) => Err(e.to_string()),
+                    Ok(()) => {
+                        let done = conoti::accept_phone_send(conn, pid, &sid, &body, &atts_of(conn, id), q)
+                            .and_then(|rid| mark(&rid))
+                            .and_then(|()| conn.execute_batch("COMMIT").map_err(|e| e.to_string()));
+                        match done {
+                            Ok(()) => {
+                                conoti::record_tag_hint(conn, &sid, &body);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                if !conn.is_autocommit() {
+                                    let _ = conn.execute_batch("ROLLBACK");
+                                }
+                                Err(e)
+                            }
                         }
                     }
-                }
+                },
                 // PC 앞의 사용자가 누른 보내기 — 입력창과 같은 데스크톱 경로
                 None => conoti::accept_desktop(conn, &sid, &body, &atts_of(conn, id), q).and_then(|v| mark(v["rid"].as_str().unwrap_or_default())),
             };
@@ -920,8 +934,24 @@ pub fn tick(conn: &Connection, now: DateTime<Utc>, probe: &dyn Probe) -> TickRep
     process_runs(conn, now, probe, &mut rep);
     sync_fired(conn, now, probe, &mut rep);
     renotify(conn, now, probe, &mut rep);
+    recover_sending(conn, now, &mut rep);
     expire_held(conn, now, &mut rep);
     rep
+}
+
+/// "보내기"를 잡은 뒤 끝내지 못한 회차(`sending`) — 보내기 도중 앱이 꺼졌거나, 실패 뒤 held 로 되돌리는 쓰기마저 잠금 경합으로 실패한 경우.
+/// 보내기 한 번은 잠금 대기(busy_timeout 8초)를 넣어도 몇 초면 끝나므로 2분 넘게 `sending` 이면 다시 대기(held)로 — 보내기·버리기·7일 만료가 다시 듣게
+fn recover_sending(conn: &Connection, now: DateTime<Utc>, rep: &mut TickReport) {
+    let cut = iso(now - Duration::seconds(SENDING_STALE_SECS));
+    let sids: Vec<String> = conn
+        .prepare("SELECT s.session_id FROM schedule_run r JOIN schedule s ON s.id = r.schedule_id WHERE r.state = 'sending' AND COALESCE(r.fired_at, r.created_at) < ?1")
+        .and_then(|mut st| st.query_map(params![cut], |r| r.get(0)).map(|r| r.flatten().collect()))
+        .unwrap_or_default();
+    if sids.is_empty() {
+        return;
+    }
+    let _ = conn.execute("UPDATE schedule_run SET state = 'held' WHERE state = 'sending' AND COALESCE(fired_at, created_at) < ?1", params![cut]);
+    rep.changed_sessions.extend(sids);
 }
 
 /// 시각이 된 예약 → 회차(pending) 또는 놓침(missed)

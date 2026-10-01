@@ -294,7 +294,7 @@ pub(crate) mod tests {
         assert!(Responder::new(&desk.private, &key(1), MODE_CONNECT, &pid).unwrap().respond(&m1).is_err());
     }
 
-    /// 폰 구현(Dart)이 대조할 기준값. `cargo test relay_vectors -- --ignored --nocapture`
+    /// 폰 구현이 대조할 기준값. `cargo test relay_vectors -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn relay_vectors() {

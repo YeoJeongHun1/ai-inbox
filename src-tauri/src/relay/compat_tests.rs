@@ -1,15 +1,15 @@
 //! 운영 코노티 호환 시험 — docs/COMPAT.md 의 근거.
 //!
-//! "구 폰" = 스토어에 배포된 코노티 앱(1.5.0 · 1.6.0)의 `ai_relay` 클라이언트. 그 앱은 심사를 거쳐야만 바뀌므로
+//! "구 폰" = 스토어에 배포된 코노티 앱(1.5.0 · 1.6.0)의 AI 작업 클라이언트. 그 앱은 심사를 거쳐야만 바뀌므로
 //! AI Inbox 가 그 앱을 계속 견뎌야 한다. 여기서 세 가지를 고정한다.
 //!
 //! 1. **기존 필드 불변**: 0.8.0 이 같은 입력에 낸 응답(`tests/fixtures/compat_080_snapshot.json`, 0.8.0 트리에서 만든 것)의
 //!    모든 필드가 0.10.0 에서 이름·값이 그대로다. 새로 생긴 필드는 아래 `ADDED` 목록에 있는 것뿐이다 —
 //!    목록에 없는 새 필드가 생기면 시험이 깨지므로 폰이 견디는지 사람이 한 번 본다.
-//! 2. **폰이 읽은 값이 같다**: 폰 Dart 모델(`relay_models.dart`)의 파싱 규칙을 그대로 옮긴 파서로 0.8.0 응답과 0.10.0 응답을
+//! 2. **폰이 읽은 값이 같다**: 폰이 응답을 읽는 규칙(docs/COMPAT.md §2-2)을 그대로 옮긴 파서로 0.8.0 응답과 0.10.0 응답을
 //!    읽으면 결과가 같다(모르는 필드는 폰이 버리므로, 폰 입장에서의 동등성).
-//! 3. **폰의 딱딱한 형변환이 안 터진다**: Dart 가 `as List?`·`as Map?`·`as String?` 로 강제하는 자리는 타입이 유지된다.
-//!    (폰 파서는 나머지를 전부 `_s`·`_i`·`_b` 로 관대하게 읽어 모르는 값·null 에서 예외가 나지 않는다 — 폰 소스로 확인.)
+//! 3. **형식이 고정된 자리가 안 깨진다**: 폰이 리스트·객체·문자열로만 받는 자리(COMPAT.md §2-2 표)는 타입이 유지된다.
+//!    (그 밖의 자리는 폰이 관대하게 — 타입이 다르면 기본값으로 — 읽어 모르는 값·null 에서 예외가 나지 않는다.)
 //!
 //! 이 시험의 입력(`compat_driver.rs`)은 0.8.0 트리에도 글자 그대로 들어가 기준선을 만든다.
 
@@ -130,21 +130,21 @@ fn old_phone_script_keeps_every_080_field() {
     assert_eq!(added, expected, "0.10.0 이 더한 필드 목록이 다르다 — 새 필드는 폰이 견디는지 확인하고 ADDED 와 docs/COMPAT.md 에 적는다");
 }
 
-// ── 2·3. 폰 Dart 모델과 같은 규칙으로 읽기 ────────────────────────────────────
+// ── 2·3. 폰과 같은 규칙으로 읽기 ──────────────────────────────────────────────
 
-/// `_s` — 문자열이 아니면 null
+/// 문자열 자리 — 문자열이 아니면 null
 fn s(v: &Value) -> Value {
     if v.is_string() { v.clone() } else { Value::Null }
 }
-/// `_i` — 정수·숫자면 정수, 아니면 0
+/// 정수 자리 — 정수·숫자면 정수, 아니면 0
 fn i(v: &Value) -> Value {
     json!(v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).unwrap_or(0))
 }
-/// `_in` — 숫자면 정수, 아니면 null
+/// 없을 수 있는 정수 자리 — 숫자면 정수, 아니면 null
 fn i_null(v: &Value) -> Value {
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).map_or(Value::Null, |n| json!(n))
 }
-/// `_b` — true 일 때만 true
+/// 불리언 자리 — true 일 때만 true
 fn b(v: &Value) -> Value {
     json!(v == &json!(true))
 }
@@ -348,7 +348,7 @@ fn old_phone_replies_and_permissions_behave_like_080() {
 
 // ── 0.10.0 에서 새로 생긴 상태가 옛 폰 화면에 미치는 영향 ─────────────────────
 
-/// 폰 화면의 `AiUserBubble` — `origin` 은 peer·channel 만 따로 쓰고 나머지(sched 포함)는 "나"
+/// 폰 화면의 내 말풍선 — `origin` 은 peer·channel 만 따로 쓰고 나머지(sched 포함)는 "나"
 fn phone_who(origin: Option<&str>) -> &'static str {
     match origin {
         Some("peer") => "peer",
