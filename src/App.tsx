@@ -7,6 +7,7 @@ import { Sidebar, type SessionAction } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { DocPanel } from "./components/DocPanel";
 import { Settings } from "./components/Settings";
+import type { SettingsCat } from "./settingsIndex";
 import { PairDialog } from "./components/PairDialog";
 import { PhoneDialog } from "./components/PhoneDialog";
 import { NewTaskDialog } from "./components/NewTaskDialog";
@@ -43,7 +44,8 @@ export default function App() {
   const [chatKey, setChatKey] = useState(0);
   const [docKey, setDocKey] = useState(0);
   const [working, setWorking] = useState(false);
-  const [settings, setSettings] = useState(false);
+  // 설정 창 — 범주를 정해 열면(이력 찾기의 설정 → 이력 검색) 그 범주로, true 면 마지막에 보던 범주로
+  const [settings, setSettings] = useState<boolean | SettingsCat>(false);
   const [pair, setPair] = useState<{ name: string; sas: string } | null>(null);
   const [phoneOpen, setPhoneOpen] = useState(false);
   const [newTask, setNewTask] = useState(false);
@@ -327,7 +329,7 @@ export default function App() {
 
       {historyChat ? (
         <HistoryChat
-          onSettings={() => setSettings(true)}
+          onSettings={() => setSettings("ai")}
           toast={toast}
           onOpenTurn={(sid, turnId) => {
             // 이력 보관 세션은 이력 탭에서만 보이므로 목록 필터를 맞춰 준다
@@ -369,6 +371,7 @@ export default function App() {
 
       {settings && (
         <Settings
+          initialCat={settings === true ? undefined : settings}
           onClose={() => {
             setSettings(false);
             loadUpdate();

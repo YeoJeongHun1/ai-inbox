@@ -22,7 +22,9 @@ import {
   Star,
   SquareTerminal,
   Tag as TagIcon,
+  X,
 } from "lucide-react";
+import { tryCopy } from "../clipboard";
 import {
   api,
   filterActive,
@@ -129,6 +131,32 @@ function ShellMenu({ x, y, items, onPick, onClose }: { x: number; y: number; ite
   );
 }
 
+/** 클립보드 복사가 실패했을 때(다른 프로그램이 클립보드를 잡고 있음 등) — 명령을 직접 선택해 복사하게 보여 준다 */
+function CopyFallback({ text, onClose }: { text: string; onClose: () => void }) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    ref.current?.focus();
+    ref.current?.select();
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", esc);
+    return () => window.removeEventListener("keydown", esc);
+  }, [onClose]);
+  return (
+    <div className="modal-back" role="dialog" aria-modal="true" onClick={onClose}>
+      <div className="modal copy-fallback" onClick={(e) => e.stopPropagation()}>
+        <header className="modal-head">
+          <h2>복사하지 못했습니다</h2>
+          <button className="icon-btn" onClick={onClose} title="닫기">
+            <X size={18} />
+          </button>
+        </header>
+        <p className="set-note">다른 프로그램이 클립보드를 쓰고 있어 복사하지 못했습니다. 아래 명령을 직접 복사해 붙여 넣으세요 — 전체가 선택돼 있습니다.</p>
+        <textarea ref={ref} className="copy-fallback-text" readOnly spellCheck={false} rows={3} value={text} onFocus={(e) => e.currentTarget.select()} />
+      </div>
+    </div>
+  );
+}
+
 /** 새로 받은 요청들 중 내용이 그대로인 것은 앞의 객체를 그대로 쓴다 — 말풍선(memo)이 바뀐 것만 다시 그리게.
  *  대화는 수집기가 알릴 때마다(작업 중이면 1.5초마다) 통째로 다시 받는다. */
 function keepSame(prev: Turn[], next: Turn[]): Turn[] {
@@ -202,6 +230,16 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
   const [tocOpen, setTocOpen] = useState(tocSaved);
   const [shellMenu, setShellMenu] = useState<{ x: number; y: number } | null>(null);
   const closeShellMenu = useCallback(() => setShellMenu(null), []);
+  // 이어가기 명령 복사가 실패하면 명령을 직접 보여 준다(조용히 실패하면 복사된 줄 알고 붙여 넣는다)
+  const [copyFail, setCopyFail] = useState<string | null>(null);
+  const closeCopyFail = useCallback(() => setCopyFail(null), []);
+  const copyCommand = useCallback(
+    async (command: string, done: string) => {
+      if (await tryCopy(command, writeText)) toast(done);
+      else setCopyFail(command);
+    },
+    [toast],
+  );
   const [outline, setOutline] = useState<OutlineRow[] | null>(null);
   /** 하나씩 보기: 이 요청의 대화만 그린다 */
   const [single, setSingle] = useState(false);
@@ -694,8 +732,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
                 setShellMenu({ x: r.left, y: r.bottom + 4 });
                 return;
               }
-              await writeText(s.attach_command ?? s.resume_command);
-              toast(s.attach_command ? "백그라운드 세션을 여는 명령을 복사했습니다" : "이어가기 명령을 복사했습니다");
+              await copyCommand(s.attach_command ?? s.resume_command, s.attach_command ? "백그라운드 세션을 여는 명령을 복사했습니다" : "이어가기 명령을 복사했습니다");
             }}
           >
             <SquareTerminal size={16} /> {s.attach_command ? "터미널에서 열기" : "이어가기"}
@@ -706,12 +743,10 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
               y={shellMenu.y}
               items={s.resume_shells}
               onClose={closeShellMenu}
-              onPick={async (command) => {
-                await writeText(command);
-                toast("이어가기 명령을 복사했습니다");
-              }}
+              onPick={(command) => copyCommand(command, "이어가기 명령을 복사했습니다")}
             />
           )}
+          {copyFail !== null && <CopyFallback text={copyFail} onClose={closeCopyFail} />}
           <button
             className={`toc-btn ${tocOpen ? "on" : ""}`}
             title={`이 세션의 요청 목록 — 골라서 그 자리로 가거나 하나만 보기 (${kbd("⌘⇧O")})`}

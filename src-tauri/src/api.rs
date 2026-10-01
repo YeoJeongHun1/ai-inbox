@@ -1226,7 +1226,7 @@ pub fn uninstall_hooks() -> R<install::HookStatus> {
 pub struct About {
     /// tauri.conf.json 의 version (Cargo.toml·package.json 과 같아야 한다 — `about_versions_agree` 시험)
     pub version: String,
-    /// 컴파일 시각 "YYYY-MM-DD HH:mm"(빌드한 PC 의 시각)
+    /// 컴파일 시각 "YYYY-MM-DD HH:mm" — UTC(`build.rs`). 화면은 사용자 시간대로 바꿔 보여 준다
     pub build_time: String,
     /// 열려 있는 DB 의 스키마 버전
     pub schema_version: i64,

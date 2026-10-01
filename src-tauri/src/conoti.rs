@@ -128,6 +128,11 @@ pub trait Deliver {
     fn deliver_opts(&self, target: &Target, reply_id: &str, text: &str, opts: Opts) -> Outcome {
         self.deliver(target, reply_id, text, opts.from_desktop && !opts.scheduled)
     }
+
+    /// 요청이 끝난 뒤 이어서 띄운 백그라운드 세션을 멈춘다(`claude stop <짧은 ID>`). 시험용 가짜는 부른 것만 기록한다
+    fn stop_background(&self, short: &str) {
+        crate::deliver::stop_background(short)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -517,6 +522,9 @@ pub fn cancel_desktop(conn: &Connection, rid: &str) -> Result<(), String> {
 
 // ── 전달 ─────────────────────────────────────────────────────────────────────
 
+/// 보낸 말의 요청이 답 없이(API 호출 0) "끝남"으로 보일 때 처리됨으로 넘기기 전에 기다리는 시간(`link_results`)
+const EMPTY_RESULT_GRACE_MS: i64 = 60_000;
+
 pub struct Pipeline {
     conn: Connection,
     /// 방금 claude 를 띄운 세션 — 등록부에 올라오기 전에 한 번 더 띄우지 않게
@@ -553,7 +561,7 @@ impl Pipeline {
             self.last_gc = Some(std::time::Instant::now());
         }
         self.deliver_ready(deliverer, &mut rep);
-        self.link_results(&mut rep);
+        self.link_results(deliverer, &mut rep);
         rep.needs_confirm = self
             .conn
             .query_row("SELECT COUNT(*) FROM conoti_reply WHERE state = 'confirm'", [], |r| r.get::<_, i64>(0))
@@ -751,7 +759,7 @@ impl Pipeline {
     }
 
     /// 전달한 답으로 시작된 요청을 대화 기록에서 찾고, 끝나면 handled 로 표시한다.
-    fn link_results(&mut self, rep: &mut PipelineReport) {
+    fn link_results(&mut self, deliverer: &dyn Deliver, rep: &mut PipelineReport) {
         let rows: Vec<(String, String, String, Option<i64>)> = {
             let Ok(mut st) = self.conn.prepare(
                 "SELECT reply_id, session_id, delivered_at, result_turn FROM conoti_reply
@@ -791,19 +799,28 @@ impl Pipeline {
                 }
             };
             let Some(t) = turn else { continue };
-            let done: Option<(String, String)> = self
+            let done: Option<(String, String, bool)> = self
                 .conn
-                .query_row("SELECT status, session_id FROM turn WHERE id = ?1", params![t], |x| Ok((x.get(0)?, x.get(1)?)))
+                .query_row(
+                    "SELECT status, session_id, api_calls = 0 AND TRIM(COALESCE(response_text, '')) = '' FROM turn WHERE id = ?1",
+                    params![t],
+                    |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)),
+                )
                 .optional()
                 .ok()
                 .flatten();
-            if let Some((status, tsid)) = done {
+            if let Some((status, tsid, empty)) = done {
+                // 모델이 한 마디도 안 한 채 "끝남" — 이어서 띄운 직후의 오판일 수 있다. 잠시는 처리됨으로 넘기지도, 세션을 멈추지도 않는다
+                // (멈추면 모델이 움직이기 전에 죽어 답이 끝내 오지 않는다 — 0.10.1 Windows 점검 문제 1). 답이 오면 그때, 끝내 없으면 이 시간 뒤에
+                if crate::doc::is_finished(&status) && empty && time::age_ms(&delivered_at).is_some_and(|a| a < EMPTY_RESULT_GRACE_MS) {
+                    continue;
+                }
                 if crate::doc::is_finished(&status) {
                     let _ = self.conn.execute("UPDATE conoti_reply SET state = 'handled' WHERE reply_id = ?1", params![reply_id]);
                     // 백그라운드로 이어서 띄운 세션이면 멈춘다(계속 살아 있으면 다음 답이 막힌다)
                     let bg_key = format!("conoti.bg.{tsid}");
                     if let Some(short) = db::get_meta(&self.conn, &bg_key) {
-                        crate::deliver::stop_background(&short);
+                        deliverer.stop_background(&short);
                         let _ = self.conn.execute("DELETE FROM meta WHERE key = ?1", params![bg_key]);
                     }
                     rep.changed_sessions.push(tsid);
@@ -1053,10 +1070,11 @@ mod tests {
         assert_eq!(st, "delivered");
         // 폰 화면의 "내 답" 목록에는 데스크톱에서 보낸 말이 섞이지 않는다
         assert!(replies_for(&p.conn, DESK_SID, 10).is_empty());
-        // 요청으로 잡히면(origin = inbox) 보낸 말 목록에서 빠진다
+        // 요청으로 잡히면(origin = inbox) 보낸 말 목록에서 빠진다 · 답이 와서 끝나면 처리됨
         p.conn
             .execute(
-                "INSERT INTO turn (session_id, prompt_uuid, seq, prompt_at, prompt_text, status, origin) VALUES (?2, 'u2', 2, ?1, '이어서 테스트도 돌려 줘', 'done', 'inbox')",
+                "INSERT INTO turn (session_id, prompt_uuid, seq, prompt_at, prompt_text, status, origin, response_text, api_calls)
+                 VALUES (?2, 'u2', 2, ?1, '이어서 테스트도 돌려 줘', 'done', 'inbox', '돌렸습니다', 1)",
                 params![time::now_iso(), DESK_SID],
             )
             .unwrap();
@@ -1064,6 +1082,67 @@ mod tests {
         assert!(outbox_for(&p.conn, DESK_SID).is_empty());
         let st: String = p.conn.query_row("SELECT state FROM conoti_reply WHERE reply_id = ?1", params![rid], |r| r.get(0)).unwrap();
         assert_eq!(st, "handled");
+    }
+
+    /// 꺼진 세션으로 보내 이어서 띄운 백그라운드 세션 — 멈춘 것만 기록한다
+    struct Resumed(std::sync::Mutex<Vec<String>>);
+    impl Deliver for Resumed {
+        fn deliver(&self, _t: &Target, _id: &str, _text: &str, _d: bool) -> Outcome {
+            Outcome::Done("꺼진 세션을 백그라운드로 이어서 실행".into())
+        }
+        fn stop_background(&self, short: &str) {
+            self.0.lock().unwrap().push(short.to_string());
+        }
+    }
+
+    /// 보내고 이어서 띄운 세션에 대해 "모델이 한 마디도 안 한 채 끝남"을 받으면(수집기 오판·띄우자마자 끝남) 바로 처리됨으로
+    /// 넘기고 그 세션을 멈추지 않는다 — 모델이 움직이기 전에 멈춰 답이 끝내 오지 않았다(0.10.1 Windows 점검 문제 1).
+    /// 답이 오면 그때 처리됨·멈춤, 1분이 지나도 답이 없으면 처리됨(요청은 "응답 없이 끝남"으로 화면에 남는다).
+    #[test]
+    fn empty_result_right_after_resume_does_not_stop_the_session() {
+        let c = mem_desk();
+        let rid = accept_desktop(&c, DESK_SID, "3+3 의 답을 숫자 하나로만", &[], None).unwrap()["rid"].as_str().unwrap().to_string();
+        let stops = Resumed(Default::default());
+        let mut p = Pipeline::new(c);
+        p.tick(&stops);
+        db::set_meta(&p.conn, &format!("conoti.bg.{DESK_SID}"), "0f0e0d0c").unwrap();
+        let state = |p: &Pipeline| -> String { p.conn.query_row("SELECT state FROM conoti_reply WHERE reply_id = ?1", params![rid], |r| r.get(0)).unwrap() };
+        assert_eq!(state(&p), "delivered");
+        // 수집기가 "보낸 순간 끝남 · API 호출 0 · 답 없음"으로 적은 요청
+        p.conn
+            .execute(
+                "INSERT INTO turn (session_id, prompt_uuid, seq, prompt_at, prompt_text, status, origin) VALUES (?2, 'u2', 2, ?1, '3+3 의 답을 숫자 하나로만', 'done', 'inbox')",
+                params![time::now_iso(), DESK_SID],
+            )
+            .unwrap();
+        p.tick(&stops);
+        assert_eq!(state(&p), "delivered", "답이 아직 없으면 처리됨으로 넘기지 않는다");
+        assert!(stops.0.lock().unwrap().is_empty(), "모델이 움직이기 전에 세션을 멈추지 않는다");
+        // 답이 오면 처리됨 + 백그라운드 세션 멈춤
+        p.conn.execute("UPDATE turn SET response_text = '6', api_calls = 1 WHERE prompt_uuid = 'u2'", []).unwrap();
+        p.tick(&stops);
+        assert_eq!(state(&p), "handled");
+        assert_eq!(*stops.0.lock().unwrap(), vec!["0f0e0d0c".to_string()]);
+
+        // 1분이 지나도 답이 없으면 처리됨(멈춤 포함) — 영영 "전달됨"에 머물지 않는다
+        let c = mem_desk();
+        let rid2 = accept_desktop(&c, DESK_SID, "하나 더", &[], None).unwrap()["rid"].as_str().unwrap().to_string();
+        let stops = Resumed(Default::default());
+        let mut p = Pipeline::new(c);
+        p.tick(&stops);
+        let long_ago = time::iso_from_ms(chrono::Utc::now().timestamp_millis() - 2 * 60_000);
+        p.conn.execute("UPDATE conoti_reply SET delivered_at = ?2 WHERE reply_id = ?1", params![rid2, long_ago]).unwrap();
+        db::set_meta(&p.conn, &format!("conoti.bg.{DESK_SID}"), "0f0e0d0c").unwrap();
+        p.conn
+            .execute(
+                "INSERT INTO turn (session_id, prompt_uuid, seq, prompt_at, prompt_text, status, origin) VALUES (?2, 'u3', 3, ?1, '하나 더', 'stopped', 'inbox')",
+                params![long_ago, DESK_SID],
+            )
+            .unwrap();
+        p.tick(&stops);
+        let st: String = p.conn.query_row("SELECT state FROM conoti_reply WHERE reply_id = ?1", params![rid2], |r| r.get(0)).unwrap();
+        assert_eq!(st, "handled");
+        assert_eq!(stops.0.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -3,14 +3,24 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Check, Copy } from "lucide-react";
 import { api, type About } from "../api";
 
-/** 문제 신고에 붙여 넣을 한 줄 — 버전·빌드 시각·스키마 버전만(경로·계정 등 개인 정보 없음) */
+/** 문제 신고에 붙여 넣을 한 줄 — 버전·빌드 시각(UTC 그대로)·스키마 버전만(경로·계정 등 개인 정보 없음) */
 export function aboutReport(a: About): string {
-  return `AI Inbox v${a.version} · 빌드 ${a.build_time} · DB 스키마 v${a.schema_version}`;
+  return `AI Inbox v${a.version} · 빌드 ${a.build_time} UTC · DB 스키마 v${a.schema_version}`;
 }
 
-/** "2026-09-30 14:05" → "09-30 14:05" */
+/** 빌드 시각은 UTC "YYYY-MM-DD HH:mm"(build.rs — CI 러너·빌드한 PC 의 시간대와 무관) → 이 PC 의 시간대로. 형식이 다르면 그대로 */
+export function localBuild(t: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(t);
+  if (!m) return t;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** "2026-09-30 14:05"(UTC) → 이 PC 시각의 "09-30 23:05" */
 function shortBuild(t: string): string {
-  return t.length >= 16 ? t.slice(5, 16) : t;
+  const l = localBuild(t);
+  return l.length >= 16 ? l.slice(5, 16) : l;
 }
 
 export function useAbout(): About | null {
@@ -88,7 +98,7 @@ export function AboutRows({ about }: { about: About }) {
       <dt>버전</dt>
       <dd>v{about.version}</dd>
       <dt>빌드 시각</dt>
-      <dd>{about.build_time}</dd>
+      <dd>{`${localBuild(about.build_time)} (UTC ${about.build_time})`}</dd>
       <dt>DB 스키마</dt>
       <dd>v{about.schema_version}</dd>
       <dt>데이터 폴더</dt>

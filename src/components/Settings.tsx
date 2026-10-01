@@ -3,11 +3,11 @@ import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Bell, Clock, Copy, Eraser, Info, MessageSquareText, Plug, Search, Smartphone, Tag, X, type LucideIcon } from "lucide-react";
 import { api, type AppInfo, type CodexStatus, type HookStatus, type RelayKey, type RelayOffer, type RelayStatus, type UpdateState } from "../api";
-import { fullTime } from "../format";
+import { fullTime, nativePath } from "../format";
 import { kbd } from "../keys";
 import { SETTINGS_BLOCKS, SETTINGS_CATS, SETTINGS_ENTRIES, type BlockId, type SettingsCat, type SettingsEntry } from "../settingsIndex";
 import { flatHits, searchSettings, type Segment } from "../settingsSearch";
-import { CopyReport, useAbout } from "./About";
+import { CopyReport, localBuild, useAbout } from "./About";
 import { ClearSection, HistorySection, ScheduleSection } from "./ClearSettings";
 
 interface Props {
@@ -16,6 +16,8 @@ interface Props {
   /** 요청 태그 관리 창을 연다 */
   onTags: () => void;
   toast: (msg: string) => void;
+  /** 이 범주로 연다(없으면 마지막에 보던 범주) — 이력 찾기의 설정 버튼은 "이력 검색(AI)" */
+  initialCat?: SettingsCat;
 }
 
 const NOTIFY_MIN = [0, 30, 60, 120, 300];
@@ -55,7 +57,7 @@ function Marked({ segs }: { segs: Segment[] }) {
   );
 }
 
-export function Settings({ onClose, onHooksChanged, onTags, toast }: Props) {
+export function Settings({ onClose, onHooksChanged, onTags, toast, initialCat }: Props) {
   const [hooks, setHooks] = useState<HookStatus | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const about = useAbout();
@@ -63,7 +65,7 @@ export function Settings({ onClose, onHooksChanged, onTags, toast }: Props) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const [cat, setCat] = useState<SettingsCat>(loadCat);
+  const [cat, setCat] = useState<SettingsCat>(() => initialCat ?? loadCat());
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const [jump, setJump] = useState<{ id: string; block: string; n: number } | null>(null);
@@ -364,7 +366,7 @@ export function Settings({ onClose, onHooksChanged, onTags, toast }: Props) {
             <dd>
               {about ? (
                 <>
-                  <span className="about-line">{`v${about.version} · 빌드 ${about.build_time} · DB 스키마 v${about.schema_version}`}</span>
+                  <span className="about-line">{`v${about.version} · 빌드 ${localBuild(about.build_time)} · DB 스키마 v${about.schema_version}`}</span>
                   <CopyReport about={about} toast={toast} />
                 </>
               ) : (
@@ -898,11 +900,11 @@ function CodexSection({ toast }: { toast: (m: string) => void }) {
       </label>
       {st && (
         <p className="set-note small">
-          {st.found ? `기록 폴더 ${st.sessions_dir} · 모은 세션 ${st.sessions}개` : `기록 폴더(${st.sessions_dir})가 아직 없습니다`}
+          {st.found ? `기록 폴더 ${nativePath(st.sessions_dir)} · 모은 세션 ${st.sessions}개` : `기록 폴더(${nativePath(st.sessions_dir)})가 아직 없습니다`}
           {st.live != null && st.live > 0 ? ` · 지금 열려 있는 세션 ${st.live}개` : ""}
           <br />
           {st.bin
-            ? `codex ${st.version ?? ""} — ${st.bin}`
+            ? `codex ${st.version ?? ""} — ${nativePath(st.bin)}`
             : "codex 실행 파일을 찾지 못했습니다 — 모아 보기는 되지만, 말 넣기·새 작업은 Codex CLI 가 있어야 합니다"}
         </p>
       )}

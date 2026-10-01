@@ -93,22 +93,39 @@ fn locate() -> Option<PathBuf> {
     None
 }
 
-/// npm 패키지 안의 네이티브 codex*.exe (깊이 6까지)
+/// npm 패키지 안의 네이티브 Codex 본체(깊이 6까지). 같은 폴더에 보조 실행 파일(`codex-code-mode-host.exe` 등)이 함께 있고
+/// 디렉터리 순서상 그쪽이 먼저 나온다(`-` < `.`) — 이름이 정확히 `codex.exe` 인 것을 먼저, 없을 때만 옛 패키지의 대상 이름 본체
+/// (`codex-x86_64-pc-windows-msvc.exe`)를 고른다. 보조 실행 파일은 고르지 않는다(0.10.1 Windows 점검 문제 2)
 fn find_exe_under(dir: &Path, depth: usize) -> Option<PathBuf> {
+    let mut found = Vec::new();
+    collect_codex_exes(dir, depth, &mut found);
+    found.into_iter().min_by_key(|(rank, p)| (*rank, p.clone())).map(|(_, p)| p)
+}
+
+fn collect_codex_exes(dir: &Path, depth: usize, out: &mut Vec<(u8, PathBuf)>) {
     if depth > 6 {
-        return None;
+        return;
     }
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            if let Some(x) = find_exe_under(&p, depth + 1) {
-                return Some(x);
-            }
-        } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("codex") && n.ends_with(".exe")) {
-            return Some(p);
+            collect_codex_exes(&p, depth + 1, out);
+        } else if let Some(rank) = codex_exe_rank(&p) {
+            out.push((rank, p));
         }
     }
-    None
+}
+
+/// 0 = `codex.exe` · 1 = `codex-<아키텍처>-….exe`(옛 npm 패키지의 본체) · None = 그 밖(보조 실행 파일 등)
+fn codex_exe_rank(p: &Path) -> Option<u8> {
+    let name = p.file_name()?.to_str()?.to_ascii_lowercase();
+    let stem = name.strip_suffix(".exe")?;
+    if stem == "codex" {
+        return Some(0);
+    }
+    let rest = stem.strip_prefix("codex-")?;
+    ["x86_64-", "aarch64-", "arm64-"].iter().any(|a| rest.starts_with(a)).then_some(1)
 }
 
 /// `codex --version` → "codex-cli 0.156.0" 의 버전 부분
@@ -576,6 +593,33 @@ mod tests {
         assert_eq!(resume_sandbox_cap(None), Some("workspace-write"));
         assert_eq!(resume_sandbox_cap(Some("workspace-write")), None, "쓰던 값을 승계");
         assert_eq!(resume_sandbox_cap(Some("read-only")), None, "좁은 값은 넓히지 않는다");
+    }
+
+    /// Windows npm 설치: 같은 폴더에 `codex.exe` 와 보조 실행 파일(`codex-code-mode-host.exe` 등)이 함께 있다.
+    /// 디렉터리 순서상 보조 쪽이 먼저 나와도(`-` 0x2D < `.` 0x2E) 정확히 `codex.exe` 를 고른다(0.10.1 Windows 점검 문제 2)
+    #[test]
+    fn npm_install_picks_codex_exe_not_a_helper() {
+        let root = std::env::temp_dir().join(format!("aiinbox-codex-npm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let touch = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+            p
+        };
+        let bin = "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin";
+        // 보조 실행 파일만 있으면 고르지 않는다
+        touch(&format!("{bin}/codex-code-mode-host.exe"));
+        touch(&format!("{bin}/codex-command-runner.exe"));
+        touch("a/codex-windows-sandbox-setup.exe");
+        assert_eq!(find_exe_under(&root, 0), None);
+        // 옛 패키지의 대상 이름 본체(`codex-<triple>.exe`)는 쓴다
+        let triple = touch("bin/codex-x86_64-pc-windows-msvc.exe");
+        assert_eq!(find_exe_under(&root, 0), Some(triple));
+        // 정확히 codex.exe 가 있으면 그것 — 앞 폴더(`a/`)·같은 폴더의 보조 파일보다 먼저
+        let exe = touch(&format!("{bin}/codex.exe"));
+        assert_eq!(find_exe_under(&root, 0), Some(exe));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

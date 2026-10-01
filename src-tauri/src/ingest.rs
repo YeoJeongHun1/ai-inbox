@@ -28,7 +28,8 @@ mod cx;
 /// 파서 규칙이 바뀌면 올린다 → 다음 실행 때 백필 기간 안의 파일을 처음부터 다시 읽는다
 /// (읽음·별표 같은 사용자 상태는 upsert 가 건드리지 않으므로 보존된다).
 /// 15: Windows 에서 도구 대상 경로(`turn_touch`)를 드라이브 문자째(`C:/…`) 모은다(`tags::collect_touched`)
-pub const PARSER_VERSION: &str = "15";
+/// 16: 앱에서 보낸 말(입력창·예약·폰 답)은 답 없이 끝나도 숨기지 않는다 — 그렇게 사라진 말을 다시 보이게
+pub const PARSER_VERSION: &str = "16";
 
 const FINISHED: &[&str] = &["done", "interrupted", "stopped"];
 /// 이보다 오래 조용하고 프로세스도 없으면 멈춘 것으로 본다.
@@ -1196,20 +1197,17 @@ impl Ingestor {
             status = if acc.pending_bg > 0 { "background" } else { "done" };
         } else {
             status = "running";
-            let after_activity = |t: &Option<String>| match (t, &acc.last_activity_at) {
-                (Some(t), Some(a)) => t.as_str() >= a.as_str(),
-                (Some(_), None) => true,
-                _ => false,
-            };
+            // 이 요청의 마지막 활동 — 모델이 아직 한 마디도 안 했으면 요청 시각. 그보다 앞선 신호는 앞 요청의 것이다:
+            // 세션을 끄기 전에 받은 Stop 훅 · 이어서 띄운 직후의 등록부 idle 을 "끝남"으로 읽으면 전달 스레드가 그 세션을
+            // 모델이 움직이기 전에 멈추고 답 없는 요청은 숨김이 됐다(0.10.1 Windows 점검 문제 1 — 0.6.0 부터 있던 결함)
+            let since = acc.last_activity_at.as_deref().unwrap_or(acc.prompt_at.as_str());
             // Stop 훅이 마지막 활동 뒤에 왔다 = 모델이 멈췄다
-            if after_activity(&live.stop_hook_at) {
+            if live.stop_hook_at.as_deref().is_some_and(|t| t >= since) {
                 status = "done";
             }
             // 등록부가 idle = 입력을 기다린다
-            if live.alive && live.status.as_deref() == Some("idle") {
-                if acc.last_activity_at.as_deref().and_then(time::age_ms).map(|a| a > 5_000).unwrap_or(true) {
-                    status = "done";
-                }
+            if live.alive && live.status.as_deref() == Some("idle") && time::age_ms(since).map(|a| a > 5_000).unwrap_or(true) {
+                status = "done";
             }
         }
         if !acc.closed && matches!(status, "running" | "background") {
@@ -1281,7 +1279,10 @@ impl Ingestor {
         let span_end = ended_at.clone().or_else(|| acc.last_activity_at.clone());
         let duration_ms = span_end.as_deref().and_then(|e| time::diff_ms(&acc.prompt_at, e));
         let ttfr = acc.first_reply_at.as_deref().and_then(|f| time::diff_ms(&acc.prompt_at, f));
+        // 앱(입력창·예약·폰 답)에서 보낸 말은 답 없이 끝나도 숨기지 않는다 — 숨기면 보낸 말이 화면에서 사라진다(사용자가 "응답 없이 끝남"을 봐야 한다)
+        let from_app = matches!(acc.origin.as_str(), "inbox" | "sched") || acc.prompt_text.starts_with(crate::conoti::REPLY_HEADER);
         let hidden = !acc.side
+            && !from_app
             && acc.api_calls() == 0
             && acc.response.is_none()
             && (finished || (acc.slash.is_some() && acc.prompt_text.is_empty()));
@@ -2835,6 +2836,151 @@ mod tests {
         let o = open.unwrap();
         assert!(!o.side);
         assert_eq!(o.prompt_text, "새 요청");
+    }
+
+    /// 꺼진 세션에 입력창으로 보낸 말(`claude --bg --resume`) — 모델이 아직 한 마디도 안 한 동안은 끝난 것이 아니다.
+    /// 세션을 끄기 전에 받은 Stop 훅·띄운 직후의 등록부 idle 을 "끝남"으로 읽으면 전달 스레드가 그 백그라운드 세션을
+    /// 모델이 움직이기 전에 멈추고(`conoti::link_results`), 답 없는 요청은 숨김이 되어 보낸 말이 화면에서 사라졌다(0.10.1 Windows 점검 문제 1).
+    #[test]
+    fn resumed_request_is_not_finished_by_an_earlier_stop_hook_or_a_fresh_idle_registry() {
+        let secs = |s: i64| (chrono::Utc::now() + chrono::Duration::seconds(s)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut ing = ingestor();
+        ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
+        let row = |ing: &Ingestor, uuid: &str| -> (String, i64, String) {
+            ing.conn
+                .query_row("SELECT status, hidden, origin FROM turn WHERE prompt_uuid = ?1", params![uuid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+        };
+        // 터미널에서 요청을 처리하고(그 끝의 Stop 훅을 앱이 받았다) /exit 로 끈 세션에, 1초 전 입력창으로 보낸 말
+        ing.live.insert("s".into(), Live { stop_hook_at: Some(secs(-60)), ..Default::default() });
+        let (_, open) = run(&[
+            human("u1", &secs(-120), "앞 요청"),
+            said(&secs(-118), "앞 답"),
+            json!({"type":"system","subtype":"turn_duration","timestamp":secs(-117),"durationMs":3000}),
+            human("u2", &secs(-1), &crate::conoti::wrap_desk("3+3 의 답을 숫자 하나로만")),
+        ]);
+        let mut sent = open.unwrap();
+        let mut rep = Report::default();
+        ing.flush_turn("s", &mut sent, &mut rep);
+        assert_eq!(row(&ing, "u2"), ("running".into(), 0, "inbox".into()), "그 말보다 앞선 Stop 훅은 이 요청의 끝이 아니다");
+        // 이어서 띄운 백그라운드 세션이 등록부에 잠깐 idle 로 올라와도 — 보낸 지 5초가 안 됐으면 아직 작업 중
+        let live = ing.live.get_mut("s").unwrap();
+        live.alive = true;
+        live.status = Some("idle".into());
+        ing.flush_turn("s", &mut sent, &mut rep);
+        assert_eq!(row(&ing, "u2").0, "running");
+        // 그 말 뒤의 Stop 훅은 끝 — 답 없이 끝나도 앱에서 보낸 말은 숨기지 않는다(사용자가 "답 없이 끝남"을 봐야 한다)
+        ing.live.get_mut("s").unwrap().stop_hook_at = Some(secs(0));
+        ing.flush_turn("s", &mut sent, &mut rep);
+        assert_eq!(row(&ing, "u2"), ("done".into(), 0, "inbox".into()));
+        // 터미널에서 친 말이 답 없이 끝난 것(로컬 명령 등)은 예전처럼 숨긴다
+        let (_, open) = run(&[human("u3", &secs(-30), "터미널에서 친 말")]);
+        let mut typed = open.unwrap();
+        ing.flush_turn("s", &mut typed, &mut rep);
+        assert_eq!(row(&ing, "u3").1, 1);
+        // 정말 쉬는 세션(보낸 지 5초 넘게 아무 활동 없음 + 등록부 idle)은 예전처럼 끝으로 본다
+        let (_, open) = run(&[human("u4", &secs(-10), &crate::conoti::wrap_desk("하나 더"))]);
+        let mut quiet = open.unwrap();
+        ing.live.get_mut("s").unwrap().stop_hook_at = Some(secs(-60));
+        ing.flush_turn("s", &mut quiet, &mut rep);
+        assert_eq!(row(&ing, "u4"), ("done".into(), 0, "inbox".into()));
+    }
+
+    /// 실제 claude 로 위 결함을 끝까지: 꺼진 세션(앱이 그 세션의 Stop 훅을 받아 둔 상태 — 터미널에서 요청을 처리하고 끈 세션과 같다)에
+    /// 입력창으로 보내 `--bg --resume` 으로 이어서 띄우고, 수집기(이 세션 기록 한 파일만 — 사용자의 다른 기록은 읽지 않는다)와
+    /// 전달 스레드를 앱과 같은 주기로 함께 돌린다. 답이 기록에 남고 · 그 요청이 숨김 없이 끝나고 · 보낸 말이 처리됨이 되는가.
+    /// 신뢰한 폴더가 필요하다(새 세션 1번 + 보내기 1번). `AI_INBOX_LIVE_SID=<앞서 만든 세션>` 이면 새 세션을 만들지 않는다.
+    /// `AI_INBOX_LIVE_DIR=<신뢰한 폴더> cargo test live_ended_session_send -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_ended_session_send() {
+        use crate::{conoti, deliver};
+        use std::time::{Duration, Instant};
+        let dir = PathBuf::from(std::env::var("AI_INBOX_LIVE_DIR").expect("AI_INBOX_LIVE_DIR"));
+        let data = std::env::temp_dir().join(format!("aiinbox-live-ended-{}", std::process::id()));
+        paths::set_data_dir_override(data.clone());
+        let conn = db::open(&paths::db_path()).unwrap();
+        db::migrate(&conn).unwrap();
+        let transcript = |sid: &str| -> Option<PathBuf> {
+            std::fs::read_dir(paths::projects_dir()).ok()?.flatten().map(|d| d.path().join(format!("{sid}.jsonl"))).find(|p| p.is_file())
+        };
+        let answered_after = |sid: &str, marker: &str| -> bool {
+            // 그 말이 처음 나온 줄 뒤의 어시스턴트 줄(파일 끝의 요약 줄에도 같은 글이 있다)
+            let body = transcript(sid).and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+            body.find(marker).is_some_and(|i| body[i..].lines().skip(1).any(|l| l.contains("\"type\":\"assistant\"")))
+        };
+        let wait = |what: &str, secs: u64, mut ok: Box<dyn FnMut() -> bool + '_>| {
+            let until = Instant::now() + Duration::from_secs(secs);
+            while !ok() {
+                assert!(Instant::now() < until, "시간 초과: {what}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        };
+        // 1. 세션 하나 — 백그라운드 새 작업으로 만들고 답을 받은 뒤 끈다
+        let sid = match std::env::var("AI_INBOX_LIVE_SID") {
+            Ok(s) => s,
+            Err(_) => {
+                let (_, sid) = deliver::start_session(&dir, "ok1", &conoti::wrap_desk("ok1 이라고만 답해")).expect("새 작업");
+                let sid = sid.expect("세션 ID");
+                wait("첫 답", 150, Box::new(|| answered_after(&sid, "ok1 이라고만 답해")));
+                wait("쉬는 상태", 60, Box::new(|| deliver::route(&sid) == deliver::Route::Idle));
+                sid
+            }
+        };
+        println!("session {sid}");
+        deliver::stop_session(&sid);
+        wait("세션 꺼짐", 30, Box::new(|| deliver::route(&sid) == deliver::Route::Ended));
+        conn.execute("INSERT OR IGNORE INTO session (id, project_dir) VALUES (?1, ?2)", params![sid, dir.to_string_lossy()]).unwrap();
+
+        // 2. 앱이 이 세션의 마지막 Stop 훅을 받아 둔 상태 — 수집기는 이 세션 기록만 읽는다
+        let path = transcript(&sid).expect("대화 기록");
+        let mut ing = ingestor();
+        ing.conn = db::open(&paths::db_path()).unwrap();
+        ing.files.insert(path.clone(), FileState::fresh(sid.clone(), 0, 0, false, false));
+        let mut rep = Report::default();
+        ing.apply_hook(&json!({"hook_event_name": "Stop", "session_id": sid, "received_at_ms": now_ms()}), &mut rep);
+        let step = |ing: &mut Ingestor| {
+            let mut rep = Report::default();
+            ing.drain_spool(&mut rep);
+            ing.refresh_registry(&mut rep);
+            let md = std::fs::metadata(&path).unwrap();
+            let mtime = md.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+            ing.process_file(&path, md.len(), mtime, &mut rep);
+            ing.recheck_open(&mut rep);
+        };
+        step(&mut ing);
+
+        // 3. 입력창으로 보낸다 — 전달 스레드(2초)·수집기(1.5초)를 번갈아
+        let text = format!("{} 더하기 {} 의 답을 숫자 하나로만", chrono::Utc::now().timestamp() % 89 + 10, 3);
+        let rid = conoti::accept_desktop(&conn, &sid, &text, &[], None).expect("받기")["rid"].as_str().unwrap().to_string();
+        let deliverer = deliver::LocalDeliver { bg_resume: false };
+        let mut pipe = conoti::Pipeline::new(db::open(&paths::db_path()).unwrap());
+        let until = Instant::now() + Duration::from_secs(150);
+        let (mut answered, mut handled) = (false, false);
+        while Instant::now() < until && !(answered && handled) {
+            pipe.tick(&deliverer);
+            step(&mut ing);
+            let (st, note): (String, Option<String>) =
+                conn.query_row("SELECT state, note FROM conoti_reply WHERE reply_id = ?1", params![rid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let turn: Option<(String, i64, i64)> = conn
+                .query_row(
+                    "SELECT status, hidden, api_calls FROM turn WHERE session_id = ?1 AND origin = 'inbox' AND prompt_text = ?2 ORDER BY seq DESC LIMIT 1",
+                    params![sid, text],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .unwrap();
+            let reg = deliver::live_entry(&sid).map(|l| l.status.unwrap_or_default());
+            answered = answered_after(&sid, &text);
+            handled = st == "handled";
+            println!("  reply={st} {note:?} · turn={turn:?} · registry={reg:?} · answered={answered}");
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+        deliver::stop_session(&sid);
+        let _ = std::fs::remove_dir_all(&data);
+        assert!(answered, "꺼진 세션에 보낸 말의 답이 기록되지 않음");
+        assert!(handled, "답이 왔는데 처리됨이 되지 않음");
+        println!("ok — {}", path.display());
     }
 
     #[test]

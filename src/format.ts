@@ -143,6 +143,11 @@ export function toolName(n: string | null | undefined): string {
   return m ? `${m[1]}:${m[2]}` : n;
 }
 
+/** 표시용 경로 구분자 맞추기 — Windows 경로(`\` 가 든 것)에 섞인 `/` 를 `\` 로(`C:\Users\a\AppData/Roaming/npm/…`). 그 밖은 그대로 */
+export function nativePath(p: string): string {
+  return p.includes("\\") ? p.replace(/\//g, "\\") : p;
+}
+
 /** 홈 폴더를 ~ 로 */
 export function tildePath(p: string): string {
   return p.replace(/^\/Users\/[^/]+/, "~").replace(/^[A-Za-z]:\\Users\\[^\\]+/, "~");

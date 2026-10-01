@@ -2582,6 +2582,25 @@ pre {
   border-top: 1px solid var(--line);
 }
 
+/* 이어가기 명령 복사가 실패했을 때 직접 복사하게 보여 주는 칸 */
+.copy-fallback {
+  width: min(560px, calc(100vw - 48px));
+}
+.copy-fallback-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--code-bg);
+  color: var(--ink);
+  font: 12px/1.5 var(--mono);
+  word-break: break-all;
+  resize: vertical;
+  user-select: text;
+}
+
 /* 보관한 세션을 열었을 때 */
 .archived-bar {
   display: flex;
@@ -3043,6 +3062,48 @@ pre {
 }
 .tabs {
   gap: 13px;
+}
+
+/* 좁을 때 한글이 한 글자씩 꺾이지 않게(0.10.1 Windows 점검 — 사이드바가 300px 이 되면 탭 여유가 몇 px 뿐이라 글꼴이 넓은 Windows 에서
+   "전 / 체"·"정하 / 기"로 꺾였다). 탭은 줄바꿈 없이, 사이드바가 좁으면 간격을 줄이고, 그래도 넘치면 가로로 넘겨 본다 —
+   넘침을 허용하면 탭 밑줄의 -1px 겹침이 잘리므로 아랫선은 안쪽 그림자로 그린다(기록 창 탭은 그대로) */
+.tabs {
+  border-bottom: 0;
+  box-shadow: inset 0 -1px 0 var(--line);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+.tabs .tab {
+  flex: none;
+  white-space: nowrap;
+  margin-bottom: 0;
+}
+.app.with-doc .tabs {
+  gap: 10px;
+  padding: 0 14px;
+}
+@media (max-width: 1180px) {
+  .tabs {
+    gap: 10px;
+    padding: 0 14px;
+  }
+}
+.list-bar > span {
+  min-width: 0;
+  word-break: keep-all;
+}
+.list-bar-btn {
+  flex: none;
+  white-space: nowrap;
+}
+/* 이력 찾기 입력창: 안내문이 넘치면 두 줄로 꺾여 스크롤 화살표가 생겼다 — 한 줄로, 넘치면 … */
+.history-chat .composer textarea:placeholder-shown {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .chat.ended .chat-inner {
