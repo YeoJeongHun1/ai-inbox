@@ -23,21 +23,56 @@ pub fn first_line(s: &str) -> &str {
     s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
 }
 
-/// CLI(claude·codex)가 낸 오류 글. UTF-8 이 아니면 Windows 에서는 로캘 코드 페이지(OEM → ANSI — 한국어 Windows 는 CP949)로
-/// 풀어 본다. 그래도 안 되면 깨진 바이트만 대체 문자로
+/// CLI(claude·codex)가 낸 오류 글. 1) 온전한 UTF-8 이면 그대로 2) 조금 깨진 UTF-8(출력 상한에서 잘린 반쪽 글자·드문 깨진 바이트)이면
+/// UTF-8 로 — 깨진 바이트만 대체 문자 3) UTF-8 로 볼 수 없을 때만 Windows 에서 로캘 코드 페이지(OEM → ANSI — 한국어 Windows 는 CP949)로
+/// 풀어 본다. CP437 같은 OEM 코드 페이지는 어떤 바이트든 받아 버려서, 3) 을 먼저 하면 조금 깨진 UTF-8 이 통째로 엉뚱한 글자가 된다
 pub fn cli_text(bytes: &[u8]) -> String {
+    decode_cli(bytes, legacy_text)
+}
+
+/// `cli_text` 의 순서·조건 — `legacy` 는 로캘 코드 페이지 풀기(시험에서 바꿔 끼운다)
+fn decode_cli(bytes: &[u8], legacy: impl Fn(&[u8]) -> Option<String>) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
     }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Globalization::{GetACP, GetOEMCP};
-        let pages = unsafe { [GetOEMCP(), GetACP()] };
-        if let Some(s) = pages.iter().find_map(|&cp| decode_codepage(cp, bytes)) {
+    if !mostly_utf8(bytes) {
+        if let Some(s) = legacy(bytes) {
             return s;
         }
     }
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// 깨졌어도 UTF-8 로 볼 글인가: 맨 끝의 잘린 반쪽 글자는 깨진 것으로 치지 않고, 올바른 UTF-8 멀티바이트 글자의 바이트가
+/// 깨진 바이트의 3배 이상이면 UTF-8. CP949·CP932·CP936 글은 우연히 UTF-8 로 맞는 조합(대개 2바이트)보다 깨진 바이트가 많고
+/// (Windows 오류 문구 실측: 최대 2배 — "err 한글"), 단일 바이트 코드 페이지(CP1252·CP850) 글은 맞는 조합이 거의 없다
+fn mostly_utf8(bytes: &[u8]) -> bool {
+    let (mut good, mut bad) = (0usize, 0usize);
+    let mut chunks = bytes.utf8_chunks().peekable();
+    while let Some(c) = chunks.next() {
+        good += c.valid().chars().filter(|ch| !ch.is_ascii()).map(char::len_utf8).sum::<usize>();
+        let inv = c.invalid();
+        // 마지막 조각의 깨진 바이트가 "글자가 끝나기 전에 끝남"이면 상한에서 잘린 것
+        let cut_tail = chunks.peek().is_none() && std::str::from_utf8(inv).err().is_some_and(|e| e.error_len().is_none());
+        if !cut_tail {
+            bad += inv.len();
+        }
+    }
+    bad == 0 || good >= 3 * bad
+}
+
+/// 로캘 코드 페이지로 풀기 — Windows 에서만(OEM 먼저: 콘솔 프로그램은 OEM 으로 쓴다)
+#[cfg(windows)]
+fn legacy_text(bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::{GetACP, GetOEMCP};
+    // SAFETY: 인자 없는 조회
+    let pages = unsafe { [GetOEMCP(), GetACP()] };
+    pages.iter().find_map(|&cp| decode_codepage(cp, bytes))
+}
+
+#[cfg(not(windows))]
+fn legacy_text(_: &[u8]) -> Option<String> {
+    None
 }
 
 /// 코드 페이지 `cp` 로 풀기 — 그 코드 페이지에 맞지 않는 바이트가 있으면 None
@@ -343,14 +378,42 @@ mod tests {
         assert!(cli_text(&[b'e', b'r', b'r', 0xC7, 0xD1]).starts_with("err"));
     }
 
+    /// "한글 오류" 를 CP949 로
+    const CP949_HANGUL_ERROR: [u8; 9] = [0xC7, 0xD1, 0xB1, 0xDB, b' ', 0xBF, 0xC0, 0xB7, 0xF9];
+
+    #[test]
+    fn slightly_broken_utf8_is_not_handed_to_the_code_page() {
+        // CP437 처럼 어떤 바이트든 받아 버리는 코드 페이지 흉내 — 이걸로 풀리면 글 전체가 엉뚱해진다
+        let anything = |b: &[u8]| Some(format!("<코드페이지 {}바이트>", b.len()));
+        // 출력 상한에서 잘린 반쪽 글자
+        let full = "로그인이 필요합니다 — not logged in 다".as_bytes();
+        let cut = &full[..full.len() - 1];
+        assert_eq!(decode_cli(cut, anything), "로그인이 필요합니다 — not logged in \u{FFFD}");
+        // 가운데 깨진 바이트 하나
+        let mut stray = "인증 실패: ".as_bytes().to_vec();
+        stray.push(0xFF);
+        stray.extend_from_slice("다시 로그인하세요".as_bytes());
+        assert_eq!(decode_cli(&stray, anything), "인증 실패: \u{FFFD}다시 로그인하세요");
+        // 온전한 UTF-8·ASCII 는 그대로
+        assert_eq!(decode_cli("오류 error".as_bytes(), anything), "오류 error");
+        // UTF-8 로 볼 수 없는 글(CP949)만 코드 페이지로
+        assert_eq!(decode_cli(&CP949_HANGUL_ERROR, anything), "<코드페이지 9바이트>");
+        assert_eq!(decode_cli(&[b'e', b'r', b'r', b' ', 0xC7, 0xD1, 0xB1, 0xDB], anything), "<코드페이지 8바이트>");
+        // 코드 페이지로도 안 풀리면 대체 문자
+        assert!(decode_cli(&CP949_HANGUL_ERROR, |_| None).contains('\u{FFFD}'));
+        assert!(mostly_utf8(cut) && mostly_utf8(&stray) && !mostly_utf8(&CP949_HANGUL_ERROR));
+    }
+
     #[test]
     #[cfg(windows)]
     fn cp949_error_text_is_decoded_on_windows() {
-        // "한글 오류" 를 CP949 로
-        let bytes = [0xC7, 0xD1, 0xB1, 0xDB, b' ', 0xBF, 0xC0, 0xB7, 0xF9];
-        assert_eq!(decode_codepage(949, &bytes).as_deref(), Some("한글 오류"));
+        assert_eq!(decode_codepage(949, &CP949_HANGUL_ERROR).as_deref(), Some("한글 오류"));
         assert_eq!(decode_codepage(949, &[0xC7]), None, "잘린 두 바이트 글자는 맞지 않는다");
         assert_eq!(decode_codepage(949, &[]), None);
+        // 실제 코드 페이지로: CP949 글은 CP949 로, 잘린 UTF-8 은 CP437(모든 바이트를 받는다)에 넘기지 않는다
+        assert_eq!(decode_cli(&CP949_HANGUL_ERROR, |b| decode_codepage(949, b)), "한글 오류");
+        let full = "로그인이 필요합니다".as_bytes();
+        assert_eq!(decode_cli(&full[..full.len() - 1], |b| decode_codepage(437, b)), "로그인이 필요합니\u{FFFD}");
     }
 
     #[test]

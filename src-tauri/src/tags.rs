@@ -131,8 +131,27 @@ pub fn norm(s: &str) -> String {
     nfc_hangul(s).to_lowercase()
 }
 
-/// 경로 표기를 하나로: Windows 경로(`c:\a\b`)는 `C:/a/b` 로 — 역슬래시는 `/`, 드라이브 문자는 대문자. 유닉스 경로는 그대로
+#[cfg(test)]
+thread_local! {
+    /// 시험 전용: 이 스레드에서 Windows 경로 규칙을 켜고 끈다(None = 이 OS 대로) — 두 OS 의 결과를 한 기계에서 본다
+    static WIN_PATHS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Windows 경로 규칙(드라이브 문자·역슬래시 구분자)을 쓰는가 — Windows 에서만. macOS·Linux 에서는 `h:/srv/…`·`s:/a:…` 가
+/// 드라이브가 아니라 원격 호스트(`scp`)·구분자(`sed`)이고 역슬래시는 파일 이름의 한 글자라, 거기서는 예전(유닉스) 규칙 그대로다
+fn win_paths() -> bool {
+    #[cfg(test)]
+    if let Some(v) = WIN_PATHS.with(|c| c.get()) {
+        return v;
+    }
+    cfg!(windows)
+}
+
+/// 경로 표기를 하나로(Windows 에서만): `c:\a\b` 는 `C:/a/b` 로 — 역슬래시는 `/`, 드라이브 문자는 대문자. 그 밖의 OS 에서는 그대로
 pub fn slash_path(p: &str) -> String {
+    if !win_paths() {
+        return p.to_string();
+    }
     let mut s = p.trim().replace('\\', "/");
     if has_drive(&s) {
         s[..1].make_ascii_uppercase();
@@ -140,13 +159,13 @@ pub fn slash_path(p: &str) -> String {
     s
 }
 
-/// `C:/…` 처럼 드라이브 문자로 시작하는가(역슬래시는 먼저 `slash_path` 로 바꾼다)
+/// `C:/…` 처럼 드라이브 문자로 시작하는가(Windows 에서만 · 역슬래시는 먼저 `slash_path` 로 바꾼다)
 fn has_drive(p: &str) -> bool {
     let b = p.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
+    win_paths() && b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
 }
 
-/// 절대경로(`/…` · `C:/…`)
+/// 절대경로(`/…` · Windows 에서는 `C:/…` 도)
 fn is_abs(p: &str) -> bool {
     p.starts_with('/') || has_drive(p)
 }
@@ -178,7 +197,7 @@ pub fn collect_touched(set: &mut BTreeSet<String>, tool: &str, input: &Value) {
         return;
     }
     let mut add = |p: &str| {
-        let p = slash_path(p);
+        let p = slash_path(p.trim());
         if p.len() >= 3 && p.len() <= 300 && (is_abs(&p) || p.starts_with("~/")) && set.len() < MAX_TOUCHED {
             set.insert(p);
         }
@@ -213,12 +232,17 @@ pub fn collect_touched(set: &mut BTreeSet<String>, tool: &str, input: &Value) {
     }
 }
 
-/// 셸 명령 속 절대경로(시스템 경로는 제외, 최대 6개). Windows 경로(`C:\a\b` · `C:/a/b`)는 드라이브 문자째 `C:/a/b` 로
+/// 셸 명령 속 절대경로(시스템 경로는 제외, 최대 6개). Windows 에서는 Windows 경로(`C:\a\b` · `C:/a/b`)도 드라이브 문자째 `C:/a/b` 로
 fn abs_paths_in(cmd: &str) -> Vec<String> {
     use std::sync::OnceLock;
     static RE: OnceLock<Regex> = OnceLock::new();
-    // 드라이브 갈래가 앞에서 먼저 맞으므로 `C:/a` 가 `:` 뒤의 `/a` 로 잘리지 않는다. 유닉스 갈래는 그대로(역슬래시에서 끊는다)
-    let re = RE.get_or_init(|| Regex::new(r#"(?:^|[\s"'=(:])((?:/|~/)[^\s"'`$;|&<>()*?\\]{2,}|[A-Za-z]:[\\/][^\s"'`$;|&<>()*?]{2,})"#).unwrap());
+    static RE_WIN: OnceLock<Regex> = OnceLock::new();
+    let re = if win_paths() {
+        // 드라이브 갈래가 앞에서 먼저 맞으므로 `C:/a` 가 `:` 뒤의 `/a` 로 잘리지 않는다. 유닉스 갈래는 그대로(역슬래시에서 끊는다)
+        RE_WIN.get_or_init(|| Regex::new(r#"(?:^|[\s"'=(:])((?:/|~/)[^\s"'`$;|&<>()*?\\]{2,}|[A-Za-z]:[\\/][^\s"'`$;|&<>()*?]{2,})"#).unwrap())
+    } else {
+        RE.get_or_init(|| Regex::new(r#"(?:^|[\s"'=(:])((?:/|~/)[^\s"'`$;|&<>()*?\\]{2,})"#).unwrap())
+    };
     const SYSTEM: &[&str] = &["/dev/", "/tmp", "/usr/", "/bin/", "/sbin/", "/etc/", "/private/", "/opt/", "/var/", "/System/", "/Library/", "/Applications/", "/proc/", "/sys/", "/lib/"];
     // Windows 시스템 폴더(드라이브 뒤, 소문자로 비교)
     const WIN_SYSTEM: &[&str] = &["windows/", "program files", "programdata/"];
@@ -1154,10 +1178,10 @@ fn dir_of(p: &str) -> Option<String> {
     Some(p[..i].to_string())
 }
 
-/// 폴더 집계 키(`/C:/a` — 드라이브도 한 마디로 센다) → 실제 경로(`C:/a`). 유닉스 경로는 그대로
+/// 폴더 집계 키(`/C:/a` — 드라이브도 한 마디로 센다) → 실제 경로(`C:/a`, Windows 에서만). 유닉스 경로는 그대로
 fn real_path(key: &str) -> String {
     let b = key.as_bytes();
-    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' && (b.len() == 3 || b[3] == b'/') {
+    if win_paths() && b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' && (b.len() == 3 || b[3] == b'/') {
         return if b.len() == 3 { format!("{}/", &key[1..]) } else { key[1..].to_string() };
     }
     key.to_string()
@@ -1260,8 +1284,9 @@ fn suggest_from(per_turn: &HashMap<i64, HashSet<String>>, existing: &HashSet<Str
         }
     }
     let name_of = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-    // 드라이브(`C:`)는 폴더 이름이 아니다
-    let usable = |name: &str| !SKIP_DIRS.contains(&name.to_lowercase().as_str()) && name.chars().count() >= 2 && !name.starts_with('.') && !name.ends_with(':');
+    // Windows 의 드라이브(`C:`)는 폴더 이름이 아니다
+    let win = win_paths();
+    let usable = |name: &str| !SKIP_DIRS.contains(&name.to_lowercase().as_str()) && name.chars().count() >= 2 && !name.starts_with('.') && !(win && name.ends_with(':'));
     let covered = |name: &str| {
         let pat = norm(&format!("/{name}/"));
         existing.contains(&pat)
@@ -1302,8 +1327,8 @@ pub struct RuleCandidate {
 }
 
 fn as_dir(p: &str) -> String {
-    // Windows 경로(C:\a\b)도 같은 규칙 문구(/a/b/)로 맞춘다
-    let mut n = norm(&slash_path(p));
+    // Windows 경로(C:\a\b)도 같은 규칙 문구(/a/b/)로 맞춘다(역슬래시 바꾸기는 예전부터 모든 OS 에서 — 그대로 둔다)
+    let mut n = norm(&slash_path(p)).replace('\\', "/");
     if !n.ends_with('/') {
         n.push('/');
     }
@@ -1359,7 +1384,7 @@ pub fn suggest_for_turn(conn: &Connection, turn_id: i64, tag_id: i64) -> Vec<Rul
         let base = chosen.unwrap_or_else(|| dir.to_string());
         // 흔한 하위 폴더 이름(lib·src…)은 건너뛰고 그 위의 첫 의미 있는 폴더 이름을 쓴다
         let segs: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
-        let Some(last) = segs.iter().rev().find(|s| !SKIP_DIRS.contains(&s.to_lowercase().as_str()) && s.chars().count() >= 2 && !s.starts_with('.') && !s.starts_with('~') && !s.ends_with(':')) else { return };
+        let Some(last) = segs.iter().rev().find(|s| !SKIP_DIRS.contains(&s.to_lowercase().as_str()) && s.chars().count() >= 2 && !s.starts_with('.') && !s.starts_with('~') && !(win_paths() && s.ends_with(':'))) else { return };
         let pat = norm(&format!("/{last}/"));
         if have.contains(&pat) {
             return;
@@ -2321,8 +2346,48 @@ mod tests {
         assert!(!suggest_for_turn(&c, t, a).iter().any(|r| r.pattern == "/gamma/"), "이미 있는 규칙은 다시 제안하지 않는다");
     }
 
+    /// 이 시험 스레드에서만 Windows 경로 규칙을 켜거나 끈다 — 끝나면(실패해도) 되돌린다
+    struct PathRules;
+
+    fn path_rules(win: bool) -> PathRules {
+        WIN_PATHS.with(|c| c.set(Some(win)));
+        PathRules
+    }
+
+    impl Drop for PathRules {
+        fn drop(&mut self) {
+            WIN_PATHS.with(|c| c.set(None));
+        }
+    }
+
+    #[test]
+    fn unix_rules_keep_colons_and_backslashes_as_they_were() {
+        // macOS·Linux: `h:/…`(scp 원격 호스트)·`s:/…`(sed 구분자)는 드라이브가 아니고, 역슬래시는 파일 이름의 글자다 — 0.10.0 과 같은 결과
+        let _rules = path_rules(false);
+        let mut set = BTreeSet::new();
+        collect_touched(&mut set, "Bash", &json!({ "command": "scp h:/srv/app/log.txt backup:/x/y/z" }));
+        collect_touched(&mut set, "Bash", &json!({ "command": "sed 's:/old/path:/new/path:g' f.txt" }));
+        collect_touched(&mut set, "Read", &json!({ "file_path": r"/Users/me/p/we\ ird.txt" }));
+        collect_touched(&mut set, "Read", &json!({ "file_path": r"C:\w\alpha\a.rs" }));
+        collect_touched(&mut set, "Glob", &json!({ "pattern": r"C:\w\delta\**\*.rs" }));
+        let want: BTreeSet<String> = ["/srv/app/log.txt", "/x/y/z", "/old/path:/new/path:g", r"/Users/me/p/we\ ird.txt"].map(String::from).into();
+        assert_eq!(set, want);
+        assert_eq!(slash_path(r" c:\a\b "), r" c:\a\b ", "그 밖의 OS 에서는 손대지 않는다");
+        assert_eq!(dir_of(r"/Users/me/p/we\ ird.txt").as_deref(), Some("/Users/me/p"));
+        assert_eq!(dir_of("C:/a"), Some("C:".into()), "드라이브로 보지 않는다");
+        assert_eq!(real_path("/C:/w"), "/C:/w");
+        assert_eq!(as_dir(r"/U/Me\x"), "/u/me/x/", "규칙 문구의 역슬래시 바꾸기는 예전 그대로");
+
+        // 같은 입력을 Windows 규칙으로: 드라이브 문자로 읽는다
+        let _rules = path_rules(true);
+        let mut set = BTreeSet::new();
+        collect_touched(&mut set, "Bash", &json!({ "command": "scp h:/srv/app/log.txt backup:/x/y/z" }));
+        assert!(set.contains("H:/srv/app/log.txt"), "{set:?}");
+    }
+
     #[test]
     fn windows_paths_keep_the_drive_and_use_forward_slashes() {
+        let _rules = path_rules(true);
         assert_eq!(slash_path(r"c:\w\alpha\a.rs"), "C:/w/alpha/a.rs");
         assert_eq!(slash_path("D:/w/beta"), "D:/w/beta");
         assert_eq!(slash_path("/Users/x/a b"), "/Users/x/a b", "유닉스 경로는 그대로");
@@ -2348,6 +2413,7 @@ mod tests {
 
     #[test]
     fn windows_paths_feed_folder_suggestions_and_rule_candidates() {
+        let _rules = path_rules(true);
         let c = clean();
         session(&c, "s1", r"C:\u\me\work");
         let mut seq = 0;

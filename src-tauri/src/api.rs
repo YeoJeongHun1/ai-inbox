@@ -477,9 +477,21 @@ fn usable_dir(dir: Option<&str>) -> Option<&str> {
     dir.filter(|d| !d.is_empty() && !d.chars().any(char::is_control))
 }
 
-/// PowerShell: 작은따옴표 안에서는 '' 만 특별하다
+/// PowerShell 이 작은따옴표로 치는 글자 — ASCII `'` 말고도 ‘ ’ ‚ ‛(U+2018~201B). 어느 것이든 작은따옴표 문자열을 닫는다
+fn ps_single_quote(c: char) -> bool {
+    matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
+}
+
+/// PowerShell: 작은따옴표 안에서는 작은따옴표(위 다섯 글자)만 특별하다 — 두 번 쓰면 그 글자 하나가 된다
 fn in_powershell(d: &str, resume: &str) -> String {
-    format!("Set-Location -LiteralPath '{}'; {resume}", d.replace('\'', "''"))
+    let mut q = String::with_capacity(d.len() + 8);
+    for c in d.chars() {
+        if ps_single_quote(c) {
+            q.push(c);
+        }
+        q.push(c);
+    }
+    format!("Set-Location -LiteralPath '{q}'; {resume}")
 }
 
 /// sh/bash/zsh: 작은따옴표 안에서는 아무것도 해석되지 않는다. ' 는 '\'' 로 끊어 넣는다
@@ -759,6 +771,64 @@ mod tests {
         // 폴더를 모르면 이어가기 명령만
         let v = resume_commands_windows(None, id, "codex resume");
         assert!(v.iter().all(|c| c.command == format!("codex resume {id}")));
+    }
+
+    /// PowerShell 토크나이저의 작은따옴표 문자열 읽기(ScanStringLiteral)를 흉내 낸다 — 여는 따옴표부터 읽어 (문자열 값, 닫는 따옴표 뒤)
+    fn ps_literal(s: &str) -> Option<(String, &str)> {
+        use super::ps_single_quote;
+        let mut it = s.char_indices().peekable();
+        if !ps_single_quote(it.next()?.1) {
+            return None;
+        }
+        let mut out = String::new();
+        while let Some((i, c)) = it.next() {
+            if ps_single_quote(c) {
+                match it.peek() {
+                    // 따옴표 둘 = 뒤의 글자 하나
+                    Some(&(_, n)) if ps_single_quote(n) => {
+                        it.next();
+                        out.push(n);
+                        continue;
+                    }
+                    _ => return Some((out, &s[i + c.len_utf8()..])),
+                }
+            }
+            out.push(c);
+        }
+        None // 닫히지 않았다
+    }
+
+    #[test]
+    fn powershell_path_cannot_escape_with_curly_single_quotes() {
+        use super::resume_commands_windows;
+        let id = "00000000-1111-4222-8333-444455556666";
+        // PowerShell 은 ‘ ’ ‚ ‛ 도 작은따옴표로 친다 — ASCII ' 만 겹쳐 쓰면 `’; calc; ’` 가 명령으로 샌다
+        for d in [r"C:\w\x’; calc; ’", r"C:\w\x‘; calc; ‘", r"C:\w\‚a‛'b’’c", r"C:\it's", r"C:\plain"] {
+            let v = resume_commands_windows(Some(d), id, "claude --resume");
+            let ps = v.iter().find(|c| c.shell == "powershell").unwrap().command.clone();
+            let rest = ps.strip_prefix("Set-Location -LiteralPath ").unwrap_or_else(|| panic!("{ps}"));
+            let (lit, after) = ps_literal(rest).unwrap_or_else(|| panic!("닫히지 않은 문자열: {ps}"));
+            assert_eq!(lit, d, "{ps}");
+            assert_eq!(after, format!("; claude --resume {id}"), "경로가 명령으로 새지 않는다: {ps}");
+        }
+        assert_eq!(super::in_powershell("C:\\w\\x’; calc; ’", "claude"), "Set-Location -LiteralPath 'C:\\w\\x’’; calc; ’’'; claude");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn powershell_curly_quote_folder_is_a_literal_on_windows() {
+        use super::resume_commands_windows;
+        let dir = std::env::temp_dir().join(format!("aiinbox-ps ’; Write-Output PWNED; ’ {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("here.txt"), "").unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let v = resume_commands_windows(Some(&d), "x", "Test-Path here.txt");
+        let ps = v.iter().find(|c| c.shell == "powershell").unwrap();
+        let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &ps.command]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout.trim(), "True", "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!stdout.contains("PWNED"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -58,9 +58,24 @@ pub fn eligible(env_entry: Option<&str>, kind: &str, entry: &str) -> bool {
     !env_entry.is_some_and(sdk) && !sdk(entry) && matches!(kind, "interactive" | "bg" | "background")
 }
 
+/// 표식을 바꾸는 쪽(대기자의 쓰기·지우기, 앱의 정리)이 함께 잡는 잠금 `waiters/.lock` — "읽고 판단한 뒤 지우는" 사이에
+/// 다른 쪽이 같은 이름의 표식을 써 넣지 못하게 한다(정리가 새 대기자의 표식을, 옛 대기자가 이어받은 대기자의 표식을 지우던 틈).
+/// 잠금은 파일을 닫을 때(돌려준 File 을 버릴 때, 프로세스가 죽어도) 풀린다. 열거나 잡지 못하면 None
+fn lock_markers(dir: &Path) -> Option<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let f = o.open(dir.join(".lock")).ok()?;
+    f.lock().ok()?;
+    Some(f)
+}
+
 fn write_marker(file: &Path, me: u32, claude_pid: i64) {
     let tmp = file.with_extension(format!("{me}.tmp"));
     let body = json!({"pid": me, "claude_pid": claude_pid, "at_ms": now_ms()});
+    // 잠금을 못 잡아도 쓴다(전달이 멈추는 것보다 낫다)
+    let _lock = file.parent().and_then(lock_markers);
     if std::fs::write(&tmp, body.to_string()).is_ok() {
         paths::make_private_file(&tmp);
         let _ = std::fs::rename(&tmp, file);
@@ -73,6 +88,7 @@ fn marker_pid(file: &Path) -> Option<u32> {
 }
 
 fn remove_if_mine(file: &Path, me: u32) {
+    let _lock = file.parent().and_then(lock_markers);
     if marker_pid(file) == Some(me) {
         let _ = std::fs::remove_file(file);
     }
@@ -139,32 +155,41 @@ pub fn sweep_dead() -> usize {
 
 fn sweep_in(dir: &Path, alive: &dyn Fn(i64) -> bool) -> usize {
     let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
-    let now = now_ms();
     let mut removed = 0;
     for e in rd.flatten() {
         let p = e.path();
-        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > LEFTOVER);
-        let name = e.file_name().to_string_lossy().into_owned();
-        let dead = if name.ends_with(".tmp") {
-            old
-        } else if name.ends_with(".json") {
-            match std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
-                // waiter_alive 와 같은 기준: 프로세스가 없거나 박동이 멈췄다
-                Some(v) => {
-                    let pid_ok = v.get("pid").and_then(Value::as_i64).is_some_and(alive);
-                    let beat = v.get("at_ms").and_then(Value::as_u64).unwrap_or(0);
-                    !pid_ok || now.saturating_sub(beat) > STALE_MS
-                }
-                None => old,
-            }
-        } else {
-            false
-        };
-        if dead && std::fs::remove_file(&p).is_ok() {
+        if !is_dead_marker(&p, alive) {
+            continue;
+        }
+        // 지우기 직전, 잠금 안에서 다시 판정한다 — 처음 읽은 뒤 새 대기자가 같은 이름으로 표식을 써 넣었으면(대기자는 잠금 안에서 쓴다)
+        // 그 표식은 살아 있으므로 남는다. 잠금을 못 잡으면 지우지 않는다
+        let Some(_lock) = lock_markers(dir) else { continue };
+        if is_dead_marker(&p, alive) && std::fs::remove_file(&p).is_ok() {
             removed += 1;
         }
     }
     removed
+}
+
+/// 지워도 되는 표식인가 — 쓰다 만 임시 파일·읽을 수 없는 표식은 오래됐을 때, 표식은 waiter_alive 와 같은 기준(프로세스가 없거나 박동이 멈췄다)
+fn is_dead_marker(p: &Path, alive: &dyn Fn(i64) -> bool) -> bool {
+    let old = || std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > LEFTOVER);
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if name.ends_with(".tmp") {
+        old()
+    } else if name.ends_with(".json") {
+        match std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+            Some(v) => {
+                let pid_ok = v.get("pid").and_then(Value::as_i64).is_some_and(alive);
+                let beat = v.get("at_ms").and_then(Value::as_u64).unwrap_or(0);
+                !pid_ok || now_ms().saturating_sub(beat) > STALE_MS
+            }
+            // 사라졌으면(이미 지워짐) 지울 것도 없다
+            None => p.exists() && old(),
+        }
+    } else {
+        false
+    }
 }
 
 /// 앱 쪽: 이 세션에 대기자가 살아 있나(심장 박동 10초 안 + 프로세스 생존)
@@ -322,8 +347,63 @@ mod tests {
         assert_eq!(sweep_in(&d, &|p| p == 111), 4);
         let mut left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        assert_eq!(left, vec!["live.json", "note.txt", "y.444.tmp"]);
+        assert_eq!(left, vec![".lock", "live.json", "note.txt", "y.444.tmp"], "잠금 파일은 정리 대상이 아니다");
+        assert_eq!(sweep_in(&d, &|p| p == 111), 0, "두 번째 정리는 잠금 파일을 건드리지 않는다");
         assert_eq!(sweep_in(&d.join("none"), &|_| true), 0, "폴더가 없으면 아무것도 안 한다");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sweep_keeps_a_marker_rewritten_after_it_was_read() {
+        // 정리가 죽은 대기자(222)의 표식을 읽은 직후 새 대기자(111)가 같은 이름으로 표식을 써 넣는다 — 새 표식은 남아야 한다
+        let d = tmp_dir("sweep-race");
+        marker(&d, "s1", 222, now_ms());
+        let rewrote = std::cell::Cell::new(false);
+        let alive = |p: i64| {
+            if p == 222 && !rewrote.replace(true) {
+                write_marker(&d.join("s1.json"), 111, 1);
+            }
+            p == 111
+        };
+        assert_eq!(sweep_in(&d, &alive), 0);
+        assert!(rewrote.get());
+        assert_eq!(marker_pid(&d.join("s1.json")), Some(111), "새 대기자의 표식을 지우지 않는다");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sweep_waits_for_a_waiter_writing_under_the_lock() {
+        // 대기자가 잠금을 쥐고 표식을 쓰는 중이면, 정리는 기다렸다가 다 쓴 표식으로 다시 판정한다
+        let d = tmp_dir("sweep-lock");
+        marker(&d, "s1", 222, now_ms());
+        let held = lock_markers(&d).expect("잠금");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let d2 = d.clone();
+        let sweeper = std::thread::spawn(move || {
+            sweep_in(&d2, &|p| {
+                let _ = tx.send(());
+                p == 111
+            })
+        });
+        rx.recv().unwrap(); // 정리가 옛 표식(222)을 죽은 것으로 읽었다
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!sweeper.is_finished(), "잠금을 쥔 동안은 지우지 않고 기다린다");
+        marker(&d, "s1", 111, now_ms());
+        drop(held);
+        assert_eq!(sweeper.join().unwrap(), 0);
+        assert_eq!(marker_pid(&d.join("s1.json")), Some(111));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_waiter_removes_only_its_own_marker() {
+        let d = tmp_dir("mine");
+        let f = d.join("s1.json");
+        write_marker(&f, 111, 1);
+        remove_if_mine(&f, 222);
+        assert_eq!(marker_pid(&f), Some(111), "이어받은 대기자의 표식은 남긴다");
+        remove_if_mine(&f, 111);
+        assert!(!f.exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

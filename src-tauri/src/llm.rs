@@ -458,7 +458,19 @@ pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captu
     // 자기 프로세스 그룹에서 돌려, 시간 초과 때 CLI 가 띄운 하위 프로세스까지 함께 끝낸다
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    // Windows: 멈춘 채 만들어(창 없이는 그대로) 작업 개체에 넣은 뒤에 푼다 — `win_job` 참고
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, win_job::CREATE_NO_WINDOW | win_job::CREATE_SUSPENDED);
     let mut child = cmd.spawn().map_err(|_| ExecErr::Spawn)?;
+    #[cfg(windows)]
+    let job = win_job::Job::adopt(&child);
+    #[cfg(windows)]
+    if !win_job::resume(child.id()) {
+        // 풀지 못한 자식은 영영 멈춰 있다 — 끝내고 실행 실패로
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ExecErr::Spawn);
+    }
     let stdin = child.stdin.take();
     let data = input.to_vec();
     let writer = std::thread::spawn(move || {
@@ -478,9 +490,11 @@ pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captu
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }
-                // Windows 에는 프로세스 그룹 신호가 없다 — 자식이 띄운 하위 프로세스를 먼저 끝낸다(`kill` 은 직계 자식만 끝낸다)
+                // Windows 에는 프로세스 그룹 신호가 없다 — 작업 개체째 끝낸다(`kill` 은 직계 자식만 끝낸다)
                 #[cfg(windows)]
-                kill_descendants(child.id());
+                if let Some(j) = &job {
+                    j.terminate();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -497,71 +511,89 @@ pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captu
     }
 }
 
-/// (pid, 부모 pid) 목록에서 `root` 의 자손 — 가까운 것부터, `root` 는 빼고
-#[cfg_attr(not(windows), allow(dead_code))]
-fn descendants(root: u32, procs: &[(u32, u32)]) -> Vec<u32> {
-    let mut out: Vec<u32> = Vec::new();
-    let mut frontier = vec![root];
-    while let Some(p) = frontier.pop() {
-        for &(pid, ppid) in procs {
-            // pid 0(시스템 유휴)·자기 자신을 부모로 적은 항목·이미 넣은 것은 건너뛴다(순환 방지)
-            if ppid == p && pid != 0 && pid != root && pid != ppid && !out.contains(&pid) {
-                out.push(pid);
-                frontier.push(pid);
+/// Windows: 시간 초과 때 CLI 가 띄운 하위 프로세스(손자·증손자)까지 끝내는 작업 개체(Job Object).
+///
+/// 프로세스 목록의 부모 pid 로 나무를 더듬으면, 끝난 부모의 pid 가 재사용됐을 때 무관한 프로세스를 끝낼 수 있고 목록을 뜬 뒤에 뜬 손자·
+/// 중간 부모가 먼저 끝난 손자는 놓친다. 작업 소속은 커널이 새 프로세스에 물려주므로 둘 다 없다(pid 로 고르지 않는다).
+/// 자식은 멈춘 채(`CREATE_SUSPENDED`) 만들어 작업에 넣은 뒤에 풀어, 넣기 전에 손자를 띄울 틈도 없다.
+/// 제한(`KILL_ON_JOB_CLOSE`)은 걸지 않는다 — 정상으로 끝난 뒤 작업을 닫아도 남은 프로세스는 두고(유닉스의 프로세스 그룹처럼 시간 초과 때만
+/// 끝낸다, CLI 가 따로 띄운 업데이트 같은 것을 끊지 않게)
+#[cfg(windows)]
+mod win_job {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject};
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    pub use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+
+    pub struct Job(HANDLE);
+
+    impl Job {
+        /// 새 작업을 만들어 (아직 멈춰 있는) 자식을 넣는다. 못 넣으면 None — 그때는 시간 초과 때 직계 자식만 끝난다
+        pub fn adopt(child: &std::process::Child) -> Option<Job> {
+            // SAFETY: 이름·보안 속성 없는 새 작업. 핸들은 Job 이 닫는다. 자식 핸들은 child 가 살아 있는 동안 유효하다
+            unsafe {
+                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if h.is_null() {
+                    return None;
+                }
+                let job = Job(h);
+                (AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) != 0).then_some(job)
+            }
+        }
+
+        /// 작업 안의 프로세스를 모두 끝낸다
+        pub fn terminate(&self) {
+            // SAFETY: 이 Job 이 연 핸들
+            unsafe {
+                TerminateJobObject(self.0, 1);
             }
         }
     }
-    out
-}
 
-/// 시간 초과 때 `root` 가 띄운 하위 프로세스(손자·증손자)를 모두 끝낸다
-#[cfg(windows)]
-fn kill_descendants(root: u32) {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    let mut procs: Vec<(u32, u32)> = Vec::new();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return;
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: 이 Job 이 연 핸들을 한 번만 닫는다
+            unsafe {
+                CloseHandle(self.0);
+            }
         }
-        let mut e: PROCESSENTRY32W = std::mem::zeroed();
-        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        if Process32FirstW(snap, &mut e) != 0 {
-            loop {
-                procs.push((e.th32ProcessID, e.th32ParentProcessID));
-                if Process32NextW(snap, &mut e) == 0 {
-                    break;
+    }
+
+    /// 멈춘 채 만든 프로세스 `pid` 의 스레드를 푼다(std 는 주 스레드 핸들을 안정 API 로 내주지 않는다). 하나도 못 풀면 false.
+    /// 호출하는 쪽이 그 프로세스 핸들(`Child`)을 쥐고 있어 pid 가 재사용될 수 없다
+    pub fn resume(pid: u32) -> bool {
+        let mut resumed = false;
+        // SAFETY: 스냅샷·스레드 핸들은 여기서 열고 닫는다. THREADENTRY32 는 dwSize 를 채워 넘긴다
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            let mut e: THREADENTRY32 = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut ok = Thread32First(snap, &mut e) != 0;
+            while ok {
+                if e.th32OwnerProcessID == pid {
+                    let h = OpenThread(THREAD_SUSPEND_RESUME, 0, e.th32ThreadID);
+                    if !h.is_null() {
+                        resumed |= ResumeThread(h) != u32::MAX;
+                        CloseHandle(h);
+                    }
                 }
+                ok = Thread32Next(snap, &mut e) != 0;
             }
+            CloseHandle(snap);
         }
-        CloseHandle(snap);
-        for pid in descendants(root, &procs) {
-            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if !h.is_null() {
-                TerminateProcess(h, 1);
-                CloseHandle(h);
-            }
-        }
+        resumed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn descendants_walk_the_whole_tree_without_looping() {
-        // 1 → 2 → 3 → 4, 1 → 5, 다른 가지 9 → 10. 6 은 자기를 부모로 적었다(순환)
-        let procs = [(2, 1), (3, 2), (4, 3), (5, 1), (10, 9), (6, 6), (1, 4)];
-        let mut d = descendants(1, &procs);
-        d.sort();
-        assert_eq!(d, vec![2, 3, 4, 5]);
-        assert!(descendants(10, &procs).is_empty());
-    }
 
     #[test]
     #[cfg(windows)]
@@ -580,6 +612,29 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(5);
         while std::fs::remove_file(&held).is_err() {
             assert!(Instant::now() < until, "손자 프로세스(ping)가 아직 파일을 쥐고 있다");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn timeout_ends_orphaned_grandchildren_on_windows() {
+        // 가운데 cmd 가 `start /b` 로 ping 을 띄우고 먼저 끝난다 — ping 의 부모 pid 는 이미 없는 프로세스라 부모 pid 로 나무를 더듬으면 놓친다.
+        // 바깥 cmd 는 두 번째 ping 으로 버틴다(시간 초과가 나게)
+        let dir = std::env::temp_dir().join(format!("aiinbox-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("held.txt");
+        let mut c = Command::new("cmd");
+        std::os::windows::process::CommandExt::raw_arg(
+            &mut c,
+            format!("/C cmd /C start /b ping -n 60 127.0.0.1 > \"{}\" & ping -n 60 127.0.0.1 > nul", held.display()),
+        );
+        assert!(matches!(exec_cli(c, b"", Duration::from_secs(3)), Err(ExecErr::Timeout)));
+        let until = Instant::now() + Duration::from_secs(5);
+        while std::fs::remove_file(&held).is_err() {
+            assert!(Instant::now() < until, "부모를 잃은 손자 프로세스(ping)가 아직 파일을 쥐고 있다");
             std::thread::sleep(Duration::from_millis(100));
         }
         let _ = std::fs::remove_dir_all(&dir);
