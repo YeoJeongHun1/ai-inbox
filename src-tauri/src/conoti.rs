@@ -522,8 +522,16 @@ pub fn cancel_desktop(conn: &Connection, rid: &str) -> Result<(), String> {
 
 // ── 전달 ─────────────────────────────────────────────────────────────────────
 
-/// 보낸 말의 요청이 답 없이(API 호출 0) "끝남"으로 보일 때 처리됨으로 넘기기 전에 기다리는 시간(`link_results`)
+/// 보낸 말의 요청이 답 없이(API 호출 0) "끝남"으로 보일 때 처리됨으로 넘기기 전에 기다리는 시간(`link_results`) · 그 끝남 알림을
+/// 미루는 시간(`ingest`). 기본 60초 — 첫 답이 늦게 오는 환경(Windows 기동·긴 생각)을 실측해 맞출 수 있게 숨은 설정값
+/// `setting.empty_result_grace_ms`(10초~10분)로 둔다
 const EMPTY_RESULT_GRACE_MS: i64 = 60_000;
+
+pub fn empty_grace_ms(conn: &Connection) -> i64 {
+    db::setting_i64(conn, "empty_result_grace_ms", EMPTY_RESULT_GRACE_MS).clamp(10_000, 600_000)
+}
+/// 유예가 끝나도 답이 없어 처리됨으로 넘긴 말의 `conoti_reply.note` — 폰의 "내 답"·PC 전달 기록에 그대로 보인다(필드는 그대로, 값만)
+pub const NO_ANSWER_NOTE: &str = "답을 받지 못했습니다 — 세션이 응답 없이 끝났습니다. 다시 보내 보세요";
 
 pub struct Pipeline {
     conn: Connection,
@@ -771,6 +779,7 @@ impl Pipeline {
             let Ok(rows) = st.query_map(params![since], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?))) else { return };
             rows.flatten().collect()
         };
+        let grace = empty_grace_ms(&self.conn);
         for (reply_id, sid, delivered_at, result_turn) in rows {
             let turn = match result_turn {
                 Some(t) => Some(t),
@@ -812,16 +821,35 @@ impl Pipeline {
             if let Some((status, tsid, empty)) = done {
                 // 모델이 한 마디도 안 한 채 "끝남" — 이어서 띄운 직후의 오판일 수 있다. 잠시는 처리됨으로 넘기지도, 세션을 멈추지도 않는다
                 // (멈추면 모델이 움직이기 전에 죽어 답이 끝내 오지 않는다 — 0.10.1 Windows 점검 문제 1). 답이 오면 그때, 끝내 없으면 이 시간 뒤에
-                if crate::doc::is_finished(&status) && empty && time::age_ms(&delivered_at).is_some_and(|a| a < EMPTY_RESULT_GRACE_MS) {
+                if crate::doc::is_finished(&status) && empty && time::age_ms(&delivered_at).is_some_and(|a| a < grace) {
                     continue;
                 }
                 if crate::doc::is_finished(&status) {
-                    let _ = self.conn.execute("UPDATE conoti_reply SET state = 'handled' WHERE reply_id = ?1", params![reply_id]);
-                    // 백그라운드로 이어서 띄운 세션이면 멈춘다(계속 살아 있으면 다음 답이 막힌다)
+                    // 유예가 지나도 답이 없으면 처리됨 + 답을 받지 못했다는 안내(폰 "내 답"·PC 전달 기록에 보인다 — note 값만, 필드는 그대로)
+                    let _ = if empty && status != "interrupted" {
+                        self.conn.execute("UPDATE conoti_reply SET state = 'handled', note = ?2 WHERE reply_id = ?1", params![reply_id, NO_ANSWER_NOTE])
+                    } else {
+                        self.conn.execute("UPDATE conoti_reply SET state = 'handled' WHERE reply_id = ?1", params![reply_id])
+                    };
+                    // 백그라운드로 이어서 띄운 세션이면 멈춘다(계속 살아 있으면 다음 답이 막힌다). 단 그 세션에 이 요청보다 뒤의 요청이나
+                    // 뒤에 전달된 말이 있으면 그 말이 일하는 중일 수 있다 — 멈추지 않고 표식을 남겨 그 말이 끝날 때 멈춘다(리뷰 필수 1:
+                    // 답 없는 말의 유예가 끝나는 틱에 그 사이 같은 세션으로 들어간 다음 말이 끊겼다)
+                    let later: bool = self
+                        .conn
+                        .query_row(
+                            "SELECT EXISTS (SELECT 1 FROM turn WHERE session_id = ?1 AND seq > (SELECT seq FROM turn WHERE id = ?2))
+                                 OR EXISTS (SELECT 1 FROM conoti_reply WHERE session_id = ?3 AND reply_id <> ?4
+                                              AND state = 'delivered' AND delivered_at > ?5)",
+                            params![tsid, t, sid, reply_id, delivered_at],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(true);
                     let bg_key = format!("conoti.bg.{tsid}");
-                    if let Some(short) = db::get_meta(&self.conn, &bg_key) {
-                        deliverer.stop_background(&short);
-                        let _ = self.conn.execute("DELETE FROM meta WHERE key = ?1", params![bg_key]);
+                    if !later {
+                        if let Some(short) = db::get_meta(&self.conn, &bg_key) {
+                            deliverer.stop_background(&short);
+                            let _ = self.conn.execute("DELETE FROM meta WHERE key = ?1", params![bg_key]);
+                        }
                     }
                     rep.changed_sessions.push(tsid);
                 }
@@ -1143,6 +1171,53 @@ mod tests {
         let st: String = p.conn.query_row("SELECT state FROM conoti_reply WHERE reply_id = ?1", params![rid2], |r| r.get(0)).unwrap();
         assert_eq!(st, "handled");
         assert_eq!(stops.0.lock().unwrap().len(), 1);
+    }
+
+    /// 답 없이 끝난 말 A 의 유예가 끝나는 틱에, 그 사이 같은 백그라운드 세션으로 들어가 일하는 말 B 를 멈추지 않는다(리뷰 필수 1).
+    /// A 는 처리됨(답을 받지 못했다는 안내와 함께)으로 넘기되 세션 멈춤은 B 가 끝날 때로 미룬다
+    #[test]
+    fn grace_end_of_an_empty_message_does_not_stop_a_later_one() {
+        let c = mem_desk();
+        let rid1 = accept_desktop(&c, DESK_SID, "첫 말", &[], None).unwrap()["rid"].as_str().unwrap().to_string();
+        let stops = Resumed(Default::default());
+        let mut p = Pipeline::new(c);
+        p.tick(&stops);
+        db::set_meta(&p.conn, &format!("conoti.bg.{DESK_SID}"), "0f0e0d0c").unwrap();
+        // A: API 오류로 답 없이 끝남(호출 0·답 없음)
+        p.conn
+            .execute(
+                "INSERT INTO turn (session_id, prompt_uuid, seq, prompt_at, prompt_text, status, origin) VALUES (?2, 'u1', 2, ?1, '첫 말', 'done', 'inbox')",
+                params![time::now_iso(), DESK_SID],
+            )
+            .unwrap();
+        p.tick(&stops);
+        // 유예 안에 B 를 보냄 → 같은 백그라운드 세션에서 일하는 중
+        let rid2 = accept_desktop(&p.conn, DESK_SID, "둘째 말", &[], None).unwrap()["rid"].as_str().unwrap().to_string();
+        p.conn
+            .execute("UPDATE conoti_reply SET state = 'delivered', delivered_at = ?2 WHERE reply_id = ?1", params![rid2, time::now_iso()])
+            .unwrap();
+        p.conn
+            .execute(
+                "INSERT INTO turn (session_id, prompt_uuid, seq, prompt_at, prompt_text, status, origin) VALUES (?2, 'u2', 3, ?1, '둘째 말', 'running', 'inbox')",
+                params![time::now_iso(), DESK_SID],
+            )
+            .unwrap();
+        // A 의 유예가 끝남
+        let long_ago = time::iso_from_ms(chrono::Utc::now().timestamp_millis() - 2 * 60_000);
+        p.conn.execute("UPDATE conoti_reply SET delivered_at = ?2 WHERE reply_id = ?1", params![rid1, long_ago]).unwrap();
+        p.tick(&stops);
+        let st = |p: &Pipeline, rid: &str| -> (String, Option<String>) {
+            p.conn.query_row("SELECT state, note FROM conoti_reply WHERE reply_id = ?1", params![rid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        };
+        assert_eq!(st(&p, &rid1).0, "handled");
+        assert!(stops.0.lock().unwrap().is_empty(), "B 가 일하는 중에 세션을 멈추지 않는다");
+        assert_eq!(st(&p, &rid1).1.as_deref(), Some(NO_ANSWER_NOTE), "답을 받지 못했다는 안내(폰·PC 기록에 보인다)");
+        // B 가 답을 받고 끝나면 그때 멈춘다
+        p.conn.execute("UPDATE turn SET status = 'done', response_text = '네', api_calls = 1 WHERE prompt_uuid = 'u2'", []).unwrap();
+        p.tick(&stops);
+        assert_eq!(st(&p, &rid2).0, "handled");
+        assert_ne!(st(&p, &rid2).1.as_deref(), Some(NO_ANSWER_NOTE));
+        assert_eq!(*stops.0.lock().unwrap(), vec!["0f0e0d0c".to_string()]);
     }
 
     #[test]

@@ -296,6 +296,16 @@ impl TurnAcc {
         self.calls.len() as i64
     }
 
+    /// 앱(입력창·예약·폰 답)에서 보낸 말
+    fn from_app(&self) -> bool {
+        matches!(self.origin.as_str(), "inbox" | "sched") || self.prompt_text.starts_with(crate::conoti::REPLY_HEADER)
+    }
+
+    /// 모델이 아무것도 내놓지 못한 요청(호출 0·답 없음)
+    fn no_answer(&self) -> bool {
+        self.api_calls() == 0 && self.response.is_none()
+    }
+
     fn totals(&self) -> Usage {
         let mut t = Usage::default();
         for u in self.calls.values() {
@@ -459,6 +469,8 @@ pub struct Ingestor {
     codex_written: HashMap<String, Option<String>>,
     /// 방금 SessionEnd(reason=clear) 를 받은 세션과 그 시각(ms) — 뒤따르는 SessionStart(source=clear) 를 잇는다
     last_clear: Option<(String, i64)>,
+    /// 앱에서 보낸 말의 첫 답 전 유예(`conoti::empty_grace_ms`) — 그동안은 등록부 idle 을 끝남으로 보지 않고, 답 없는 끝남은 알리지 않는다
+    empty_grace_ms: i64,
 }
 
 impl Ingestor {
@@ -512,6 +524,7 @@ impl Ingestor {
         }
         // 앞 실행이 남긴 Codex 세션의 "실행 중" 표시는 지운다 — 이번 실행이 잠금 파일로 다시 정한다
         let _ = conn.execute("UPDATE session SET live_status = NULL WHERE agent = 'codex' AND live_status IS NOT NULL", []);
+        let empty_grace_ms = crate::conoti::empty_grace_ms(&conn);
         Ingestor {
             conn,
             installed_at,
@@ -526,6 +539,7 @@ impl Ingestor {
             codex_live: None,
             codex_written: HashMap::new(),
             last_clear: None,
+            empty_grace_ms,
         }
     }
 
@@ -539,6 +553,7 @@ impl Ingestor {
         self.scan_codex(&mut rep);
         self.refresh_codex(&mut rep);
         self.recheck_open(&mut rep);
+        self.notify_deferred(&mut rep);
         // 만료·되살림 검사 — 1분에 한 번(첫 틱 포함)
         if self.tick_no % 40 == 1 {
             crate::tags::sweep_hints(&self.conn, chrono::Utc::now().timestamp_millis());
@@ -550,6 +565,37 @@ impl Ingestor {
             }
         }
         rep
+    }
+
+    /// 미뤄 둔 "답 없는 끝남" 알림(`flush_turn` 의 `defer`) — 앱에서 보낸 말이 첫 답 전 유예가 지나도 답 없이 끝나 있으면 한 번 알린다.
+    /// 그사이 답이 붙었거나(정상 알림이 나간다) 사용자가 읽었으면 알리지 않는다
+    fn notify_deferred(&mut self, rep: &mut Report) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let due = time::iso_from_ms(now - self.empty_grace_ms);
+        let recent = time::iso_from_ms(now - NOTIFY_WINDOW_MS - self.empty_grace_ms);
+        let rows: Vec<(i64, String, String, String)> = {
+            let Ok(mut st) = self.conn.prepare(
+                "SELECT id, session_id, status, COALESCE(prompt_text, '') FROM turn
+                  WHERE notified = 0 AND hidden = 0 AND read_at IS NULL AND status IN ('done', 'stopped')
+                    AND api_calls = 0 AND TRIM(COALESCE(response_text, '')) = ''
+                    AND (origin IN ('inbox', 'sched') OR prompt_text LIKE ?3)
+                    AND prompt_at <= ?1 AND prompt_at >= ?2
+                  LIMIT 20",
+            ) else {
+                return;
+            };
+            let Ok(rows) = st.query_map(params![due, recent, format!("{}%", crate::conoti::REPLY_HEADER)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            }) else {
+                return;
+            };
+            rows.flatten().collect()
+        };
+        for (turn_id, sid, status, prompt) in rows {
+            let _ = self.conn.execute("UPDATE turn SET notified = 1 WHERE id = ?1", params![turn_id]);
+            rep.finished.push(Finished { turn_id, session_id: sid.clone(), status, needs_input: false, text: no_answer_text(&prompt) });
+            rep.changed.insert(sid);
+        }
     }
 
     // ── 훅 스풀 ──────────────────────────────────────────────────────────
@@ -1205,8 +1251,10 @@ impl Ingestor {
             if live.stop_hook_at.as_deref().is_some_and(|t| t >= since) {
                 status = "done";
             }
-            // 등록부가 idle = 입력을 기다린다
-            if live.alive && live.status.as_deref() == Some("idle") && time::age_ms(since).map(|a| a > 5_000).unwrap_or(true) {
+            // 등록부가 idle = 입력을 기다린다. 앱에서 보낸 말이 아직 아무 활동도 없으면 첫 답 전 유예만큼 기다린다 — 이어서 띄운 세션이
+            // 기동하는 동안 등록부가 idle 로 보이면(Windows 의 느린 기동) 5초 만에 끝남·가짜 알림이 됐다(리뷰 필수 2)
+            let idle_wait = if acc.from_app() && acc.last_activity_at.is_none() { self.empty_grace_ms } else { 5_000 };
+            if live.alive && live.status.as_deref() == Some("idle") && time::age_ms(since).map(|a| a > idle_wait).unwrap_or(true) {
                 status = "done";
             }
         }
@@ -1280,7 +1328,7 @@ impl Ingestor {
         let duration_ms = span_end.as_deref().and_then(|e| time::diff_ms(&acc.prompt_at, e));
         let ttfr = acc.first_reply_at.as_deref().and_then(|f| time::diff_ms(&acc.prompt_at, f));
         // 앱(입력창·예약·폰 답)에서 보낸 말은 답 없이 끝나도 숨기지 않는다 — 숨기면 보낸 말이 화면에서 사라진다(사용자가 "응답 없이 끝남"을 봐야 한다)
-        let from_app = matches!(acc.origin.as_str(), "inbox" | "sched") || acc.prompt_text.starts_with(crate::conoti::REPLY_HEADER);
+        let from_app = acc.from_app();
         let hidden = !acc.side
             && !from_app
             && acc.api_calls() == 0
@@ -1295,12 +1343,13 @@ impl Ingestor {
             )
         };
 
-        let old: Option<(i64, String, i64)> = self
+        // (id, 상태, 알렸나, 답이 없었나)
+        let old: Option<(i64, String, i64, bool)> = self
             .conn
             .query_row(
-                "SELECT id, status, notified FROM turn WHERE session_id = ?1 AND prompt_uuid = ?2",
+                "SELECT id, status, notified, api_calls = 0 AND TRIM(COALESCE(response_text, '')) = '' FROM turn WHERE session_id = ?1 AND prompt_uuid = ?2",
                 params![sid, acc.uuid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .ok()
@@ -1470,10 +1519,17 @@ impl Ingestor {
         }
 
         // 알림 후보: 방금 끝났거나(✅) 사용자를 기다리게 됐다(❓·권한)
-        let was = old.as_ref().map(|(_, s, _)| s.as_str()).unwrap_or("");
-        let already = old.as_ref().map(|(_, _, n)| *n != 0).unwrap_or(false) || backfilled;
+        let was = old.as_ref().map(|(_, s, _, _)| s.as_str()).unwrap_or("");
+        let already = old.as_ref().map(|(_, _, n, _)| *n != 0).unwrap_or(false) || backfilled;
         let attention = finished || status == "waiting";
-        let was_attention = FINISHED.contains(&was) || was == "waiting";
+        // 알리지 않고 둔 "답 없는 끝남"에 이제 답이 붙었으면 새 끝남이다(그 답으로 알린다)
+        let answered_now = old.as_ref().is_some_and(|(_, _, n, empty)| *n == 0 && *empty) && !acc.no_answer();
+        let was_attention = (FINISHED.contains(&was) || was == "waiting") && !answered_now;
+        // 앱에서 보낸 말이 답 없이 끝남 — 이어서 띄운 직후의 오판일 수 있어 알림은 첫 답 전 유예 뒤로(`notify_deferred`).
+        // 숨기지는 않는다(리뷰 필수 2: 느린 기동에서 보낸 말 본문이 "끝남" 알림으로 뜨고 답이 오면 또 왔다)
+        let defer = from_app && acc.no_answer() && time::age_ms(&acc.prompt_at).is_some_and(|a| a < self.empty_grace_ms);
+        // 사용자가 직접 중단한 앱 발송 말(답 없음)은 알릴 결과가 없다 — 터미널에서 친 말이 답 없이 중단되면 숨겨져 알리지 않는 것과 같게
+        let stopped_by_user = from_app && acc.no_answer() && status == "interrupted";
         let recent = ended_at
             .as_deref()
             .or(acc.last_activity_at.as_deref())
@@ -1488,19 +1544,14 @@ impl Ingestor {
                 params![turn_id],
             );
         }
-        if attention && !was_attention && !already && !hidden && recent && !no_result_side {
+        if attention && !was_attention && !already && !hidden && recent && !no_result_side && !defer && !stopped_by_user {
             let body = acc
                 .summary
                 .clone()
                 .or_else(|| acc.response.clone())
                 .unwrap_or_else(|| acc.prompt_text.clone());
-            rep.finished.push(Finished {
-                turn_id,
-                session_id: sid.to_string(),
-                status: status.clone(),
-                needs_input,
-                text: text::clip(text::first_line(&body), 140),
-            });
+            let text = if from_app && finished && acc.no_answer() { no_answer_text(&body) } else { text::clip(text::first_line(&body), 140) };
+            rep.finished.push(Finished { turn_id, session_id: sid.to_string(), status: status.clone(), needs_input, text });
             let _ = self.conn.execute("UPDATE turn SET notified = 1 WHERE id = ?1", params![turn_id]);
         }
         if status == "waiting" || !finished {
@@ -2095,6 +2146,14 @@ fn on_system(acc: &mut TurnAcc, line: &Line, at: Option<String>) {
 
 // ── 잡동사니 ─────────────────────────────────────────────────────────────────
 
+/// 앱에서 보낸 말이 답 없이 끝났을 때의 알림 글 — "답을 받지 못했습니다 — <보낸 말 첫 줄>"(폰 답 머리말·첨부 목록·답장 줄은 뗀다)
+fn no_answer_text(prompt: &str) -> String {
+    let p = crate::attach::split_block(prompt).0;
+    let p = crate::doc::phone_reply(Some(&p)).map(|x| x.1).unwrap_or(p);
+    let line = text::first_line(text::split_quote(&p).1.trim()).to_string();
+    text::clip(&format!("답을 받지 못했습니다 — {line}"), 140)
+}
+
 /// 훅이 쓰다 만 임시 파일(.tmp)이 한 시간 넘게, 앱이 안 읽어 간 훅 파일(.json — 요청 글 앞부분이 들어 있다)이 2주 넘게 남아 있으면 지운다.
 fn clean_stale_spool() {
     let Ok(rd) = std::fs::read_dir(paths::spool_dir()) else { return };
@@ -2250,6 +2309,7 @@ mod tests {
             codex_live: Some(HashSet::new()),
             codex_written: HashMap::new(),
             last_clear: None,
+            empty_grace_ms: 60_000,
         }
     }
 
@@ -2878,12 +2938,86 @@ mod tests {
         let mut typed = open.unwrap();
         ing.flush_turn("s", &mut typed, &mut rep);
         assert_eq!(row(&ing, "u3").1, 1);
-        // 정말 쉬는 세션(보낸 지 5초 넘게 아무 활동 없음 + 등록부 idle)은 예전처럼 끝으로 본다
+        // 정말 쉬는 세션(아무 활동 없음 + 등록부 idle)은 끝으로 본다 — 앱에서 보낸 말은 첫 답 전 유예(60초)가 지난 뒤에
+        ing.live.get_mut("s").unwrap().stop_hook_at = Some(secs(-600));
         let (_, open) = run(&[human("u4", &secs(-10), &crate::conoti::wrap_desk("하나 더"))]);
-        let mut quiet = open.unwrap();
-        ing.live.get_mut("s").unwrap().stop_hook_at = Some(secs(-60));
-        ing.flush_turn("s", &mut quiet, &mut rep);
-        assert_eq!(row(&ing, "u4"), ("done".into(), 0, "inbox".into()));
+        ing.flush_turn("s", &mut open.unwrap(), &mut rep);
+        assert_eq!(row(&ing, "u4").0, "running");
+        let (_, open) = run(&[human("u5", &secs(-70), &crate::conoti::wrap_desk("또 하나"))]);
+        ing.flush_turn("s", &mut open.unwrap(), &mut rep);
+        assert_eq!(row(&ing, "u5"), ("done".into(), 0, "inbox".into()));
+        // 터미널에서 친 말은 예전처럼 5초
+        let (_, open) = run(&[human("u6", &secs(-10), "터미널 말")]);
+        ing.flush_turn("s", &mut open.unwrap(), &mut rep);
+        assert_eq!(row(&ing, "u6").0, "done");
+        // 경계: Stop 훅이 마지막 활동과 같은 밀리초면 끝(그 활동 뒤의 멈춤)
+        ing.live.get_mut("s").unwrap().alive = false;
+        let t = secs(-3);
+        ing.live.get_mut("s").unwrap().stop_hook_at = Some(t.clone());
+        let (_, open) = run(&[human("u7", &secs(-8), "경계"), said(&t, "끝")]);
+        ing.flush_turn("s", &mut open.unwrap(), &mut rep);
+        assert_eq!(row(&ing, "u7").0, "done", "같은 밀리초의 Stop 훅");
+    }
+
+    /// 답 없는 앱 발송 말에 가짜 "끝남" 알림을 내지 않는다(리뷰 필수 2) — 이어서 띄운 세션이 등록부에 idle 로 보여도(Windows 의 느린 기동)
+    /// 첫 답 전 유예 안에는 끝남이 아니고, 답 없이 끝났어도 알림은 유예가 지난 뒤 한 번만("답을 받지 못했습니다 — …").
+    /// 유예 안에 진짜 답이 오면 그 답으로 한 번만 알린다.
+    #[test]
+    fn app_message_without_an_answer_is_not_announced_before_the_grace() {
+        let secs = |s: i64| (chrono::Utc::now() + chrono::Duration::seconds(s)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut ing = ingestor();
+        ing.conn.execute("INSERT INTO session (id) VALUES ('s')", []).unwrap();
+        let status = |ing: &Ingestor, uuid: &str| -> String {
+            ing.conn.query_row("SELECT status FROM turn WHERE prompt_uuid = ?1", params![uuid], |r| r.get(0)).unwrap()
+        };
+        // 느린 기동: 등록부 idle, 보낸 지 6초, 아직 답 없음 → 작업 중(끝남도 알림도 없음)
+        ing.live.insert("s".into(), Live { alive: true, status: Some("idle".into()), ..Default::default() });
+        let (_, open) = run(&[human("u1", &secs(-6), &crate::conoti::wrap_desk("느린 기동"))]);
+        let mut a = open.unwrap();
+        let mut rep = Report::default();
+        ing.flush_turn("s", &mut a, &mut rep);
+        assert_eq!(status(&ing, "u1"), "running", "보낸 지 몇 초 안 된 앱 발송 말은 등록부가 idle 이어도 작업 중");
+        assert!(rep.finished.is_empty());
+        // 그 말 뒤의 Stop 훅 — 답 없이 끝남(API 오류 등). 숨기지 않지만 알림은 유예 뒤로
+        ing.live.get_mut("s").unwrap().stop_hook_at = Some(secs(0));
+        ing.flush_turn("s", &mut a, &mut rep);
+        assert_eq!(status(&ing, "u1"), "done");
+        assert!(rep.finished.is_empty(), "답 없는 끝남은 바로 알리지 않는다");
+        ing.notify_deferred(&mut rep);
+        assert!(rep.finished.is_empty(), "유예 안에는 미룬다");
+        // 유예가 지나도 답이 없으면 한 번 알린다
+        ing.conn.execute("UPDATE turn SET prompt_at = ?1 WHERE prompt_uuid = 'u1'", [secs(-120)]).unwrap();
+        ing.notify_deferred(&mut rep);
+        assert_eq!(rep.finished.len(), 1);
+        assert!(rep.finished[0].text.starts_with("답을 받지 못했습니다"), "{}", rep.finished[0].text);
+        ing.notify_deferred(&mut rep);
+        assert_eq!(rep.finished.len(), 1, "한 번만");
+        // 사용자가 직접 중단한 앱 발송 말은 유예가 지나도 알리지 않는다
+        let (_, open) = run(&[
+            human("u9", &secs(-120), &crate::conoti::wrap_desk("멈출 말")),
+            json!({"type":"user","timestamp":secs(-119),"message":{"role":"user","content":"[Request interrupted by user]"}}),
+        ]);
+        ing.flush_turn("s", &mut open.unwrap(), &mut rep);
+        assert_eq!(status(&ing, "u9"), "interrupted");
+        ing.notify_deferred(&mut rep);
+        assert_eq!(rep.finished.len(), 1, "중단은 알림 없음");
+        // 유예 안에 진짜 답이 오면(가짜 끝남 → 답 붙은 끝남) 그 답으로 한 번만
+        let mut rep = Report::default();
+        ing.live.get_mut("s").unwrap().stop_hook_at = Some(secs(-4));
+        let (_, open) = run(&[human("u2", &secs(-5), &crate::conoti::wrap_desk("둘째"))]);
+        ing.flush_turn("s", &mut open.unwrap(), &mut rep);
+        assert_eq!(status(&ing, "u2"), "done");
+        assert!(rep.finished.is_empty());
+        let (_, open) = run(&[
+            human("u2", &secs(-5), &crate::conoti::wrap_desk("둘째")),
+            said(&secs(-2), "6"),
+            json!({"type":"system","subtype":"turn_duration","timestamp":secs(-1),"durationMs":3000}),
+        ]);
+        ing.flush_turn("s", &mut open.unwrap(), &mut rep);
+        assert_eq!(rep.finished.len(), 1, "답이 붙어 끝나면 알린다");
+        assert_eq!(rep.finished[0].text, "6");
+        ing.notify_deferred(&mut rep);
+        assert_eq!(rep.finished.len(), 1);
     }
 
     /// 실제 claude 로 위 결함을 끝까지: 꺼진 세션(앱이 그 세션의 Stop 훅을 받아 둔 상태 — 터미널에서 요청을 처리하고 끈 세션과 같다)에

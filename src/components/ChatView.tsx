@@ -1263,7 +1263,11 @@ const AiBubble = memo(function AiBubble({
       ) : (
         !live && (
           <div className="ai-empty">
-            {t.prompt_source === "mid-turn" ? "따로 답한 글 없이 앞 요청 안에서 이어졌습니다." : "응답 텍스트 없이 끝났습니다."}
+            {t.prompt_source === "mid-turn"
+              ? "따로 답한 글 없이 앞 요청 안에서 이어졌습니다."
+              : t.api_calls === 0 && t.status !== "interrupted" && (t.origin === "inbox" || t.origin === "sched" || phoneReply(t.prompt_text) !== null)
+                ? "답을 받지 못했습니다 — 세션이 응답 없이 끝났습니다. 다시 보내 보세요."
+                : "응답 텍스트 없이 끝났습니다."}
           </div>
         )
       )}

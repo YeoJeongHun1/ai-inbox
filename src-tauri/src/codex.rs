@@ -97,9 +97,29 @@ fn locate() -> Option<PathBuf> {
 /// 디렉터리 순서상 그쪽이 먼저 나온다(`-` < `.`) — 이름이 정확히 `codex.exe` 인 것을 먼저, 없을 때만 옛 패키지의 대상 이름 본체
 /// (`codex-x86_64-pc-windows-msvc.exe`)를 고른다. 보조 실행 파일은 고르지 않는다(0.10.1 Windows 점검 문제 2)
 fn find_exe_under(dir: &Path, depth: usize) -> Option<PathBuf> {
+    find_exe_for(dir, depth, std::env::consts::ARCH)
+}
+
+/// 경로에 이 PC 의 아키텍처가 들어간 것을 먼저 — 옛 통합 패키지는 한 폴더에 `codex-aarch64-….exe`·`codex-x86_64-….exe` 가 함께 있어
+/// 이름 순서로는 aarch64 를 골랐다(x64 PC 에서 실행 불가). 그다음 `codex.exe` > 대상 이름 본체, 끝으로 경로 순서(디렉터리 순서와 무관)
+fn find_exe_for(dir: &Path, depth: usize, arch: &str) -> Option<PathBuf> {
     let mut found = Vec::new();
     collect_codex_exes(dir, depth, &mut found);
-    found.into_iter().min_by_key(|(rank, p)| (*rank, p.clone())).map(|(_, p)| p)
+    // 아키텍처는 패키지 안 경로에서만 본다(사용자 이름 같은 위쪽 경로에 "x64" 가 들어 있어도 흔들리지 않게)
+    found.into_iter().min_by_key(|(rank, p)| (arch_penalty(p.strip_prefix(dir).unwrap_or(p), arch), *rank, p.clone())).map(|(_, p)| p)
+}
+
+/// 0 = 경로에 이 아키텍처가 있음 · 1 = 아키텍처 표시 없음 · 2 = 다른 아키텍처만
+fn arch_penalty(p: &Path, arch: &str) -> u8 {
+    let s = p.to_string_lossy().to_ascii_lowercase();
+    let x64 = s.contains("x86_64") || s.contains("x64");
+    let arm = s.contains("aarch64") || s.contains("arm64");
+    let here = if arch == "aarch64" { arm } else { x64 };
+    match (here, x64 || arm) {
+        (true, _) => 0,
+        (false, false) => 1,
+        (false, true) => 2,
+    }
 }
 
 fn collect_codex_exes(dir: &Path, depth: usize, out: &mut Vec<(u8, PathBuf)>) {
@@ -619,6 +639,29 @@ mod tests {
         // 정확히 codex.exe 가 있으면 그것 — 앞 폴더(`a/`)·같은 폴더의 보조 파일보다 먼저
         let exe = touch(&format!("{bin}/codex.exe"));
         assert_eq!(find_exe_under(&root, 0), Some(exe));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 옛 통합 패키지: 한 폴더에 두 아키텍처의 본체가 함께 있다 — 이 PC 의 아키텍처 것을 고른다(이름 순서로는 aarch64 가 먼저였다)
+    #[test]
+    fn npm_install_picks_the_exe_for_this_cpu() {
+        let root = std::env::temp_dir().join(format!("aiinbox-codex-arch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let touch = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+            p
+        };
+        let arm = touch("bin/codex-aarch64-pc-windows-msvc.exe");
+        let x64 = touch("bin/codex-x86_64-pc-windows-msvc.exe");
+        assert_eq!(find_exe_for(&root, 0, "x86_64"), Some(x64.clone()));
+        assert_eq!(find_exe_for(&root, 0, "aarch64"), Some(arm.clone()));
+        // 아키텍처별 vendor 폴더에 codex.exe 가 둘이면 그 아키텍처 것
+        let arm_exe = touch("vendor/aarch64-pc-windows-msvc/codex/codex.exe");
+        let x64_exe = touch("vendor/x86_64-pc-windows-msvc/codex/codex.exe");
+        assert_eq!(find_exe_for(&root, 0, "x86_64"), Some(x64_exe));
+        assert_eq!(find_exe_for(&root, 0, "aarch64"), Some(arm_exe));
         let _ = std::fs::remove_dir_all(&root);
     }
 
