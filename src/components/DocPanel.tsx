@@ -4,7 +4,8 @@ import { ChevronDown, ChevronUp, Code2, Copy, Download, Eye, MailOpen, Star, X }
 import { api, isFinished, type TurnDetail } from "../api";
 import { kbd } from "../keys";
 import { buildTurnMarkdown, suggestedFileName } from "../markdown";
-import { Markdown } from "./Markdown";
+import { Lightbox } from "./Attachments";
+import { TurnCard } from "./TurnCard";
 
 interface Props {
   turnId: number;
@@ -18,6 +19,7 @@ interface Props {
 export function DocPanel({ turnId, refreshKey, onClose, onNavigate, onChanged, toast }: Props) {
   const [detail, setDetail] = useState<TurnDetail | null>(null);
   const [raw, setRaw] = useState(false);
+  const [viewer, setViewer] = useState<{ ids: string[]; index: number } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -39,6 +41,7 @@ export function DocPanel({ turnId, refreshKey, onClose, onNavigate, onChanged, t
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.tagName === "INPUT") return;
+      if (viewer) return; // 이미지 보기가 먼저 Esc 를 받는다
       if (e.key === "Escape") onClose();
       if (!detail) return;
       if ((e.key === "k" || e.key === "ArrowUp") && e.altKey && detail.prev_id) onNavigate(detail.prev_id);
@@ -46,7 +49,7 @@ export function DocPanel({ turnId, refreshKey, onClose, onNavigate, onChanged, t
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [detail, onClose, onNavigate]);
+  }, [detail, viewer, onClose, onNavigate]);
 
   if (!detail) return <aside className="doc loading" />;
   const t = detail.turn;
@@ -119,8 +122,10 @@ export function DocPanel({ turnId, refreshKey, onClose, onNavigate, onChanged, t
         </div>
       </header>
       <div className="doc-scroll">
-        {raw ? <pre className="doc-raw">{md}</pre> : <Markdown className="doc-md">{md}</Markdown>}
+        {/* 화면은 턴 카드(접기·펼치기), 원문·복사·저장·폰은 같은 순서의 마크다운 */}
+        {raw ? <pre className="doc-raw">{md}</pre> : <TurnCard detail={detail} onOpenImages={(ids, index) => setViewer({ ids, index })} />}
       </div>
+      {viewer && <Lightbox ids={viewer.ids} index={viewer.index} onClose={() => setViewer(null)} toast={toast} />}
     </aside>
   );
 }

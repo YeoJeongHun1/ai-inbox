@@ -850,12 +850,248 @@ pre {
   font-size: 12px;
   color: var(--ink-3);
 }
-.facts {
+/* ── 턴 카드(질문 · 이해 · 결과 · 응답 필요 · 과정 · 비용) ─────────── */
+
+.tc-label {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink-3);
+}
+.tc-dim {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+/* 응답 필요 — 확정은 흑백 반전, 추정은 점선·흐리게(파란색은 "안 본 결과" 전용이라 안 쓴다) */
+.tc-attn {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.tc-attn.sure {
+  background: var(--sel-bg);
+  color: var(--sel-ink);
+}
+.tc-attn.guess {
+  border: 1px dashed var(--line-strong);
+  color: var(--ink-2);
+}
+.tc-attn svg {
+  flex: none;
+  margin-top: 2px;
+}
+.tc-attn-main {
+  min-width: 0;
+}
+.tc-attn-label {
+  font-weight: 700;
+}
+.tc-guess {
+  margin-left: 6px;
+  font-weight: 400;
+  font-size: 11px;
+  opacity: 0.8;
+}
+.tc-attn-items {
+  margin: 2px 0 0;
+  padding-left: 16px;
+}
+
+/* 이해 — 한 줄 */
+.tc-under {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  min-width: 0;
+}
+.tc-under-text {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: text;
+}
+
+.ai-body.full {
+  max-height: none;
+}
+
+/* 과정 — 접힘 한 줄 */
+.tc-proc {
+  margin-top: 8px;
+}
+.tc-proc-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.tc-proc-head:hover {
+  color: var(--ink);
+}
+.tc-proc-sum {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tc-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 5px;
+  border: 1px solid var(--ink-2);
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink);
+}
+.tc-proc-body {
+  margin: 6px 0 0 19px;
+  font-size: 12px;
+  color: var(--ink-2);
+  user-select: text;
+  cursor: auto;
+}
+.tc-sub + .tc-sub {
+  margin-top: 8px;
+}
+.tc-sub-h {
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 2px;
+}
+.tc-list,
+.tc-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.tc-list li {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  overflow-wrap: anywhere;
+}
+.tc-list.mono,
+.tc-steps code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.tc-done {
+  color: var(--ink-3);
+}
+.tc-steps li {
+  display: flex;
+  gap: 8px;
+  padding: 1px 0;
+}
+.tc-steps time {
+  flex: none;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.tc-step-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.tc-step-sub {
+  display: block;
+  color: var(--ink-3);
+}
+.tc-steps .tc-warn {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+/* 비용 — 푸터 한 줄 */
+.tc-cost {
   flex: 1;
   display: flex;
   flex-wrap: wrap;
   gap: 2px 12px;
   min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 문서 패널의 카드 */
+.tc-doc-head {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--ink);
+}
+.tc-doc-where {
+  font-size: 15px;
+  font-weight: 700;
+}
+.tc-doc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.tc-sec {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+.tc-sec > .tc-label {
+  display: block;
+  margin-bottom: 6px;
+}
+.tc-sec-line {
+  padding: 10px 0;
+}
+.tc-sec-line .tc-under,
+.tc-sec-line .tc-proc {
+  margin-top: 0;
+}
+.tc-origin {
+  margin-bottom: 4px;
+}
+.tc-prompt {
+  font-size: 14px;
+  line-height: 1.6;
+}
+.tc-foot {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+  border-bottom: 0;
+  padding-bottom: 4px;
+}
+.tc-where {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.tc-next-text {
+  margin-top: 4px;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.tc-next-text.clamp {
+  -webkit-line-clamp: 4;
 }
 .open-doc {
   display: inline-flex;

@@ -1,7 +1,8 @@
 // 요청 하나를 읽기 좋은 마크다운 문서로. 앱 안에서 보는 것과 .md 로 저장하는 것이 같은 문서다.
 
-import { isFinished, phoneReply, splitQuote, type Step, type TurnDetail } from "./api";
-import { clock, duration, fullTime, modelName, num, statusView, tildePath, tokens, toolName, usd } from "./format";
+import { isFinished, phoneReply, splitQuote, type TurnDetail } from "./api";
+import { clock, duration, fullTime, modelName, statusView, tildePath, tokens, toolName } from "./format";
+import { attentionOf, costParts, processItems, processSummary, SECTION, subagentLine, understandingOf, type ProcessItem } from "./turncard";
 
 const esc = (s: string) => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
 
@@ -10,69 +11,59 @@ function firstLine(s: string | null | undefined, max = 60): string {
   return line.length > max ? line.slice(0, max) + "…" : line;
 }
 
-/** 답이 필요한 물음: 응답 끝에서 물음표로 끝나는 줄들 */
-export function questionsOf(response: string | null | undefined): string[] {
-  if (!response) return [];
-  const lines = response.split("\n").map((l) => l.trim()).filter(Boolean);
-  const tail = lines.slice(-8);
-  return tail.filter((l) => /[?？]\s*\**$/.test(l) || /(주세요|알려 주세요|말씀해 주세요)\.?$/.test(l));
-}
-
-/** 연속된 도구 호출을 한 줄로 묶는다 */
-function renderSteps(steps: Step[]): string[] {
+/** 과정 칸의 시간순 목록 — 같은 도구가 이어지면 한 줄로 묶는다 */
+function renderProcess(items: ProcessItem[]): string[] {
   const out: string[] = [];
-  let tools: Step[] = [];
-  const flush = () => {
-    if (!tools.length) return;
-    const counts = new Map<string, number>();
-    tools.forEach((t) => counts.set(toolName(t.name), (counts.get(toolName(t.name)) ?? 0) + 1));
-    const head = [...counts.entries()].map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(" · ");
-    const shown = tools.slice(0, 6).map((t) => `\`${toolName(t.name)}\` ${t.text ?? ""}`.trim());
-    out.push(`- ${clock(tools[0].at)} **도구 ${tools.length}회** — ${head}`);
-    shown.forEach((s) => out.push(`  - ${s}`));
-    if (tools.length > 6) out.push(`  - … 외 ${tools.length - 6}개`);
-    tools = [];
-  };
-  for (const s of steps) {
-    if (s.kind === "tool") {
-      tools.push(s);
+  for (const it of items) {
+    const at = clock(it.at);
+    if (it.kind === "tools") {
+      const name = toolName(it.name);
+      if (it.count === 1) {
+        out.push(`- ${at} \`${name}\` ${(it.texts[0] ?? "").replace(/\n+/g, " ")}`.trimEnd());
+        continue;
+      }
+      out.push(`- ${at} \`${name}\` ×${it.count}`);
+      it.texts.slice(0, 6).forEach((x) => out.push(`  - ${x.replace(/\n+/g, " ")}`));
+      if (it.texts.length > 6) out.push(`  - … 외 ${it.texts.length - 6}개`);
       continue;
     }
-    flush();
-    const t = (s.text ?? "").trim();
-    switch (s.kind) {
+    const t = it.text;
+    switch (it.kind) {
       case "text": {
         const body = t.length > 600 ? t.slice(0, 600) + "…" : t;
-        out.push(`- ${clock(s.at)} ${body.replace(/\n+/g, " ")}`);
+        out.push(`- ${at} ${body.replace(/\n+/g, " ")}`);
         break;
       }
       case "task":
-        out.push(`- ${clock(s.at)} 백그라운드 알림 — ${t}`);
+        out.push(`- ${at} 백그라운드 알림 — ${t}`);
         break;
       case "ask":
-        out.push(`- ${clock(s.at)} **${s.name ? `${s.name} 이 보냄` : "작업 중에 받은 말"}** — ${t.replace(/\n+/g, " ")}`);
+        out.push(`- ${at} **${it.name ? `${it.name} 이 보냄` : "작업 중에 받은 말"}** — ${t.replace(/\n+/g, " ")}`);
         break;
       case "summary":
-        out.push(`- ${clock(s.at)} 요약 — ${t}`);
+        out.push(`- ${at} 요약 — ${t}`);
         break;
       case "error":
-        out.push(`- ${clock(s.at)} 오류 — ${t}`);
+        out.push(`- ${at} **오류** — ${t}`);
         break;
       case "interrupt":
-        out.push(`- ${clock(s.at)} 사용자가 중단함`);
+        out.push(`- ${at} **사용자가 중단함**`);
         break;
       case "compact":
-        out.push(`- ${clock(s.at)} 대화 압축`);
+        out.push(`- ${at} 대화 압축`);
         break;
       case "continue":
-        out.push(`- ${clock(s.at)} ${t}`);
+        out.push(`- ${at} ${t}`);
         break;
     }
   }
-  flush();
   return out;
 }
 
+/**
+ * 턴 카드 문서 — 질문 · 이해 · 결과 · 응답 필요 · 과정 · 비용 순서(src/turncard.ts).
+ * 🚨 src-tauri/src/doc.rs(폰 문서)가 같은 구성이다 — 바꾸면 둘을 같이.
+ */
 export function buildTurnMarkdown(d: TurnDetail): string {
   const t = d.turn;
   const s = d.session;
@@ -88,7 +79,8 @@ export function buildTurnMarkdown(d: TurnDetail): string {
   L.push(`> ${fullTime(t.prompt_at)} · **${st.label}** · ${duration(t.duration_ms)}`);
   L.push("");
 
-  L.push("## 요청");
+  // 1. 질문
+  L.push(`## ${SECTION.prompt}`);
   L.push("");
   if (t.origin === "peer") L.push(`*다른 세션 \`${t.peer_name ?? "?"}\` 이 보낸 요청*\n`);
   if (t.origin === "inbox") L.push("*AI Inbox 앱에서 보낸 말*\n");
@@ -105,71 +97,22 @@ export function buildTurnMarkdown(d: TurnDetail): string {
   L.push("");
   if (atts) L.push(`*첨부 이미지 ${atts}장*\n`);
 
-  if (t.needs_input) {
-    const qs = questionsOf(t.response_text);
-    if (qs.length) {
-      L.push("## 답이 필요한 질문");
-      L.push("");
-      qs.forEach((q) => L.push(`- ${q.replace(/^[-*]\s+/, "")}`));
-      L.push("");
-    }
+  // 2. 이해 — 착수 멘트·응답 되풀이는 뺀다
+  const understanding = understandingOf(t.understanding, t.response_text);
+  if (understanding) {
+    L.push(`## ${SECTION.understanding}`);
+    L.push("");
+    L.push(understanding);
+    L.push("");
   }
 
-  L.push("## 작업 요약");
+  // 3. 결과
+  L.push(`## ${SECTION.result}`);
   L.push("");
   if (t.summary) {
-    L.push(t.summary);
+    L.push(`**${t.summary.trim()}**`);
     L.push("");
   }
-  const facts: string[] = [];
-  if (d.tools.length) facts.push(`도구 ${num(t.tool_calls)}회 — ${d.tools.map(([n, c]) => `${toolName(n)} ${c}`).join(" · ")}`);
-  if (d.files.length) facts.push(`바뀐 파일 ${d.files.length}개`);
-  if (d.subagents.length) facts.push(`서브에이전트 ${d.subagents.length}개`);
-  if (t.task_notifications) facts.push(`백그라운드 완료 알림 ${t.task_notifications}번`);
-  if (t.error_count) facts.push(`오류 ${t.error_count}번`);
-  if (!facts.length) facts.push("도구 호출 없이 답함");
-  facts.forEach((f) => L.push(`- ${f}`));
-  L.push("");
-
-  if (t.understanding && t.understanding !== t.response_text) {
-    L.push("### 처음 이해한 내용");
-    L.push("");
-    L.push(t.understanding.trim());
-    L.push("");
-  }
-
-  const plan = parsePlan(t.plan_json);
-  if (plan.length) {
-    L.push("### 계획");
-    L.push("");
-    plan.forEach((p) => L.push(`- [${p.status === "completed" ? "x" : " "}] ${p.text}`));
-    L.push("");
-  }
-
-  if (d.files.length) {
-    L.push("### 바뀐 파일");
-    L.push("");
-    d.files.forEach(([p, n]) => L.push(`- \`${shortPath(p, t.cwd)}\`${n > 1 ? ` (${n}번 수정)` : ""}`));
-    L.push("");
-  }
-
-  if (d.subagents.length) {
-    L.push("### 서브에이전트");
-    L.push("");
-    L.push("| 종류 | 할 일 | 방식 | 걸린 시간 |");
-    L.push("|---|---|---|---|");
-    d.subagents.forEach((a) =>
-      L.push(
-        `| ${esc(a.agent_type ?? "-")} | ${esc(a.description ?? "")} | ${a.background ? "백그라운드" : "대기"} | ${
-          a.duration_ms != null ? duration(a.duration_ms) : a.ended_at ? "—" : "진행 중"
-        } |`,
-      ),
-    );
-    L.push("");
-  }
-
-  L.push("## 응답");
-  L.push("");
   L.push(
     t.response_text?.trim() ||
       (t.status === "running"
@@ -178,6 +121,69 @@ export function buildTurnMarkdown(d: TurnDetail): string {
           ? "_(따로 답한 글이 없습니다 — 앞 요청의 작업 과정·응답에 이어집니다)_"
           : "_(응답 없음)_"),
   );
+  L.push("");
+
+  // 4. 응답 필요 — 있을 때만. 확정(질문 도구·권한 승인)과 추정(글 끝 물음)을 가른다
+  const att = attentionOf(t, d.steps);
+  if (att) {
+    L.push(`## ${SECTION.attention}`);
+    L.push("");
+    L.push(att.sure ? `**${att.label}**` : `**${att.label}** _(추정 — 응답 끝의 물음으로 짐작)_`);
+    L.push("");
+    att.items.forEach((q) => L.push(`- ${q.replace(/\n+/g, " ")}`));
+    if (att.items.length) L.push("");
+  }
+
+  // 5. 과정
+  L.push(`## ${SECTION.process}`);
+  L.push("");
+  L.push(
+    processSummary(
+      { toolCalls: t.tool_calls, tools: d.tools, files: d.files.length, subagents: d.subagents.length, errors: t.error_count },
+      toolName,
+    ) + (t.status === "interrupted" ? " · 중단됨" : ""),
+  );
+  L.push("");
+  const plan = parsePlan(t.plan_json);
+  if (plan.length) {
+    L.push("### 계획");
+    L.push("");
+    plan.forEach((p) => L.push(`- [${p.status === "completed" ? "x" : " "}] ${p.text}`));
+    L.push("");
+  }
+  if (d.files.length) {
+    L.push("### 바뀐 파일");
+    L.push("");
+    d.files.forEach(([p, n]) => L.push(`- \`${shortPath(p, t.cwd)}\`${n > 1 ? ` (${n}번 수정)` : ""}`));
+    L.push("");
+  }
+  if (d.subagents.length) {
+    L.push("### 서브에이전트");
+    L.push("");
+    d.subagents.forEach((a) => L.push(`- ${subagentLine(a, duration)}`));
+    L.push("");
+  }
+  const items = renderProcess(processItems(d.steps, t.response_text, understanding));
+  if (items.length) {
+    L.push("### 시간순");
+    L.push("");
+    L.push(...items);
+    L.push("");
+  }
+
+  // 6. 비용 — 달러는 넣지 않는다
+  L.push(`## ${SECTION.cost}`);
+  L.push("");
+  const cost = costParts(t, { model: modelName, tokens, duration });
+  L.push(cost.length ? cost.join(" · ") : "—");
+  L.push("");
+  L.push("| 항목 | 값 |");
+  L.push("|---|---|");
+  const row = (k: string, v: string) => L.push(`| ${k} | ${esc(v)} |`);
+  row("끝난 시각", fullTime(t.ended_at));
+  row("작업 폴더", t.cwd ? tildePath(t.cwd) : "—");
+  if (t.git_branch && t.git_branch !== "HEAD") row("브랜치", t.git_branch);
+  row("세션", `${s.name} (${s.id})`);
   L.push("");
 
   L.push("## 이어진 요청");
@@ -194,48 +200,6 @@ export function buildTurnMarkdown(d: TurnDetail): string {
     L.push(isFinished(t.status) ? "_아직 이어진 요청이 없습니다._" : "_작업이 끝나면 다음 요청이 여기에 이어집니다._");
   }
   L.push("");
-
-  const steps = renderSteps(d.steps.filter((x) => !(x.kind === "text" && x.text?.trim() === t.response_text?.trim())));
-  if (steps.length) {
-    L.push("## 작업 과정");
-    L.push("");
-    L.push(...steps);
-    L.push("");
-  }
-
-  L.push("## 정보");
-  L.push("");
-  L.push("| 항목 | 값 |");
-  L.push("|---|---|");
-  const row = (k: string, v: string) => L.push(`| ${k} | ${esc(v)} |`);
-  row("상태", st.label);
-  row("요청 시각", fullTime(t.prompt_at));
-  row("끝난 시각", fullTime(t.ended_at));
-  row("걸린 시간", `${duration(t.duration_ms)} (모델 작업 ${duration(t.active_ms)})`);
-  row("첫 반응까지", duration(t.ttfr_ms));
-  row("모델", `${modelName(t.model)}${t.effort ? ` · effort ${t.effort}` : ""}`);
-  row("API 호출", `${num(t.api_calls)}회`);
-  row("토큰 — 입력", num(t.input_tokens));
-  row("토큰 — 캐시 쓰기 (5분 / 1시간)", `${num(t.cache_create_5m)} / ${num(t.cache_create_1h)}`);
-  row("토큰 — 캐시 읽기", num(t.cache_read));
-  row("토큰 — 출력 (생각 포함)", `${num(t.output_tokens)}${t.thinking_tokens ? ` (생각 ${num(t.thinking_tokens)})` : ""}`);
-  row("끝났을 때 문맥 크기", `${tokens(t.context_tokens)} 토큰`);
-  if (t.web_search || t.web_fetch) row("웹 검색 / 가져오기", `${t.web_search} / ${t.web_fetch}`);
-  row("작업 폴더", t.cwd ? tildePath(t.cwd) : "—");
-  if (t.git_branch && t.git_branch !== "HEAD") row("브랜치", t.git_branch);
-  row("세션", `${s.name} (${s.id})`);
-  if (s.cost_usd != null) row("세션 누적 비용 (API 환산)", usd(s.cost_usd));
-  L.push("");
-
-  if (d.hooks.length) {
-    L.push("### 훅 이벤트");
-    L.push("");
-    d.hooks.forEach((h) => {
-      const msg = (h.detail?.message as string) || (h.detail?.source as string) || (h.detail?.reason as string) || "";
-      L.push(`- ${clock(h.at)} \`${h.event}\`${msg ? ` — ${msg}` : ""}`);
-    });
-    L.push("");
-  }
 
   return L.join("\n");
 }
