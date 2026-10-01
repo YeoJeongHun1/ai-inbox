@@ -16,7 +16,7 @@
 |---|---|---|
 | 표 | `db.rs` v14 | `schedule`(예약) · `schedule_run`(회차) · `schedule_att`(이미지) · `quiet_window`(방해금지 창) · `busy_rule`(세션·태그 규칙) · `sched_allow`(허용 세션) + `conoti_reply.sched`(예약에서 온 줄의 회차 키) + `relay_device.can_schedule` |
 | 발사기 | `sched.rs` `tick(conn, now, probe)` | 전달 스레드(`spawn_phone`, 2초)가 파이프라인 틱 앞에서 부른다. `now` 는 인자(시험이 가짜 시계를 넣는다), 세션 상태는 `Probe`(시험이 가짜) |
-| 대기열 | `conoti.rs` `Pipeline` | 시각이 되면 **그때** `conoti_reply` 에 한 줄(`received_at` = 발사 시각 → 받은 뒤 3시간 상한이 발사 기준, `device='desktop'` + `sched` 표식). 파이프라인은 `wrap_sched` 머리말로 감싸고 `Opts{scheduled:true}` 로 넘긴다 |
+| 대기열 | `conoti.rs` `Pipeline` | 시각이 되면 **그때** `conoti_reply` 에 한 줄(`received_at` = 발사 시각 → 받은 뒤 3시간 상한이 발사 기준, `sched` 표식). PC 가 만든 예약은 `device='desktop'`, **폰이 만든 예약은 그 기기 pid** — 폰 답과 같은 겹(데스크톱 확인 · 전달 직전 세션 차단·전체 멈춤·기기 허용(답·예약)·해제)을 탄다(폰 말 10분 규칙만 빼고 예약 쪽 정체 규칙). 파이프라인은 `wrap_sched` 머리말로 감싸고 `Opts{scheduled:true}` 로 넘긴다 |
 | 머리말 | `conoti::SCHED_HEADER` | "AI Inbox 예약 메시지 (사용자가 미리 예약해 둔 시각에 자동으로 전달됨)" — 수집 때 떼고 요청 출처를 `sched` 로 남긴다(화면 "나 · AI Inbox 예약", 문서·`markdown.ts` 도 같은 구성) |
 | 화면 | `ScheduleDialog.tsx`(만들기·고치기) · `ScheduleList.tsx`(목록·취소·보내기/버리기) · 설정 "예약 전송" · 입력창 시계 버튼·"예약 N" 칩 · 사이드바 시계(배지) | |
 | 폰 | `relay/rpc.rs` `sched_*` · `tag_*` | 규격 `docs/RELAY.md` §4-3·§4-4 |
@@ -33,7 +33,7 @@ active(next_due_at) ──시각이 됨(늦음 ≤ 2분)──▶ pending ──
      └ 취소(발사 전) → cancelled · 발사 뒤라도 미룬 것·대기·대기열에서 전달 전인 것은 거둔다
 ```
 
-- **중복 방지**: 발사는 조건부 UPDATE(`WHERE next_due_at = ? AND state='active'`) + `schedule_run` PK + `conoti_reply` 회차 키 `INSERT OR IGNORE`. 발사 직후·대기열 삽입 직전에 앱이 죽어도 다시 켜면 한 줄만 들어간다(시험).
+- **중복 방지**: 발사는 조건부 UPDATE(`WHERE next_due_at = ? AND state='active'`) + `schedule_run` PK + `conoti_reply` 회차 키 `INSERT OR IGNORE`. 발사 직후·대기열 삽입 직전에 앱이 죽어도 다시 켜면 한 줄만 들어간다(시험). 회차 키는 목록으로 알 수 있으므로, 같은 키의 줄이 이미 있는데 그 회차가 넣은 줄(`sched` 표식)이 아니면(폰이 그 키를 답 번호로 먼저 쓴 경우) 묶지 않고 held 로 둔다.
 - **놓친 회차**: 예약당 하나로 접는다(1회성이라 폭주 없음). 놓친 사유는 살아 있음 표식(`meta sched.alive_at`)으로 "앱이 꺼져 있었거나 PC 가 절전" 대 "처리가 밀림"을 가른다.
 - **대기열에서 못 받는 경우**: 세션이 일하는 중이면 기다리고(3시간 상한은 파이프라인), 일하지도 않는데 10분 넘게 못 받으면 줄을 되돌려(`rejected`) held 로 알린다. 파이프라인이 거절한 줄(세션이 그사이 꺼짐 등)도 held 로.
 - **재알림**: 사유가 세션 상태인 것(`ended`·`terminal`·`perm`)만 다시 받을 수 있게 됐을 때 1회. 하루 한도·정책·미룸 한도 같은 사유는 재알림하지 않는다.
@@ -83,6 +83,7 @@ active(next_due_at) ──시각이 됨(늦음 ≤ 2분)──▶ pending ──
 ## 6. 폰(코노티) 연계
 
 규격은 `docs/RELAY.md` §4-3(예약)·§4-4(태그). 요약: `sched_add/list/edit/cancel/act`, 기기별 "예약 허용"(`can_schedule`, 기본 끔), 발사 순간 재검사, 이미지는 예약에 묶여 1시간 만료에서 보호, 푸시는 내용 없이 종류 `k`(`sched_held`·`sched_ready`·`sched_missed`)만. 폰 앱 화면·서버 푸시 문구는 코노티 쪽 작업.
+폰이 만든 예약은 폰 답과 같은 통제를 받는다(데스크톱 확인에서 PC 가 거절하면 회차는 `cancelled`). 폰은 **자기가 만든 예약만** 고치고 취소한다 — PC·다른 기기가 만든 예약은 `rejected`(발사 재검사·해제 회수가 만든 쪽 기준이라). 받지 못한 예약의 보내기·버리기(`sched_act`)는 누가 만든 것이든 된다.
 
 ## 7. 앱이 켜져 있어야 한다 — 자동 시작
 
@@ -93,7 +94,7 @@ active(next_due_at) ──시각이 됨(늦음 ≤ 2분)──▶ pending ──
 
 ## 8. 한도
 
-세션당 걸려 있는 예약 20개 · 전체 200개 · 하루 발사 100건 · 미래 366일 · "N분 뒤" 30일 · 미룸 3시간 · 승인 대기 10분 · 대기열 정체 10분 · held 7일. 비밀값은 저장 전에 가린다(입력창과 같다).
+세션당 걸려 있는 예약 20개 · 전체 200개 · 하루 발사 100건 · 폰 한 대 24시간 생성 100개(취소한 것 포함) · 미래 366일 · "N분 뒤" 30일 · 미룸 3시간 · 승인 대기 10분 · 대기열 정체 10분 · held 7일. 비밀값은 저장 전에 가린다(입력창과 같다).
 
 ## 9. 2단계(미구현)
 

@@ -20,6 +20,8 @@ pub const SCHED_HEADER: &str = "AI Inbox 예약 메시지 (사용자가 미리 �
 pub const MAX_REPLY_CHARS: usize = 4000;
 /// 데스크톱 입력창에서 보낸 말의 `conoti_reply.device`
 pub const DESKTOP: &str = "desktop";
+/// 데스크톱 확인 모드에서 PC 가 폰 말(폰이 건 예약 포함)을 거절했을 때의 `conoti_reply.note`
+pub const DENIED_NOTE: &str = "데스크톱에서 거절";
 
 pub fn flag(conn: &Connection, key: &str) -> bool {
     db::get_meta(conn, key).as_deref() == Some("1")
@@ -176,6 +178,9 @@ pub fn reply_block(conn: &Connection, device_can_reply: bool, sid: &str) -> &'st
     }
 }
 
+/// 폰이 건 예약이 발사된 뒤, 전달 전에 그 기기의 예약 허용이 꺼졌을 때
+const SCHED_OFF_TEXT: &str = "PC 에서 이 기기의 예약 허용을 꺼 둠";
+
 fn block_text(code: &str) -> &'static str {
     match code {
         "device_off" => "PC 에서 이 기기의 답 보내기를 꺼 둠",
@@ -226,9 +231,10 @@ fn reply_out(conn: &Connection, rid: &str) -> Option<Value> {
 
 /// 세션의 최근 폰 답(폰 화면의 상태 표시용). 요청으로 잡힌 답은 빠진다 — 그때부터는 대화의 요청 카드가 그 말이고,
 /// 작업 중이면 "작업 중", 답이 오면 그 카드가 채워진다(보낸 말풍선과 카드가 겹쳐 보이지 않게, 09-28).
+/// 예약이 넣은 줄은 폰이 건 것(`device`=그 기기)이어도 싣지 않는다 — 예약은 `sched_list` 로 보고, 폰 화면은 예전과 같다.
 pub fn replies_for(conn: &Connection, sid: &str, limit: i64) -> Vec<Value> {
     let Ok(mut st) = conn.prepare(
-        "SELECT reply_id FROM conoti_reply WHERE session_id = ?1 AND device IS NOT NULL AND device <> 'desktop'
+        "SELECT reply_id FROM conoti_reply WHERE session_id = ?1 AND device IS NOT NULL AND device <> 'desktop' AND sched IS NULL
             AND (result_turn IS NULL OR state = 'rejected') ORDER BY received_at DESC LIMIT ?2",
     ) else {
         return vec![];
@@ -437,17 +443,18 @@ pub fn outbox_for(conn: &Connection, sid: &str) -> Vec<Value> {
     .unwrap_or_default()
 }
 
-/// 보낸 말 지우기(대기·거절된 것만) — 사용자가 마음을 바꿨을 때
+/// 보낸 말 지우기(대기·거절된 것만) — 사용자가 마음을 바꿨을 때. 예약이 넣은 줄은 폰이 건 것도 PC 에서 거둘 수 있다
+/// (폰 예약이 그 기기의 줄로 들어가게 된 뒤에도 PC 화면의 "취소"가 예전처럼 듣게)
 pub fn cancel_desktop(conn: &Connection, rid: &str) -> Result<(), String> {
     let n = conn
         .execute(
-            "UPDATE conoti_reply SET state = 'rejected', note = '보내기 취소' WHERE reply_id = ?1 AND device = ?2 AND state = 'delivering'",
+            "UPDATE conoti_reply SET state = 'rejected', note = '보내기 취소' WHERE reply_id = ?1 AND (device = ?2 OR sched IS NOT NULL) AND state = 'delivering'",
             params![rid, DESKTOP],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {
         let gone = conn
-            .execute("DELETE FROM conoti_reply WHERE reply_id = ?1 AND device = ?2 AND state = 'rejected'", params![rid, DESKTOP])
+            .execute("DELETE FROM conoti_reply WHERE reply_id = ?1 AND (device = ?2 OR sched IS NOT NULL) AND state = 'rejected'", params![rid, DESKTOP])
             .map_err(|e| e.to_string())?;
         // 이미지 연결만 푼다 — 파일은 "다시 쓰기"로 다시 붙일 수 있게 두고, 7일 안에 안 쓰면 정리된다(attach::gc)
         if gone > 0 {
@@ -509,10 +516,12 @@ impl Pipeline {
         // 폰 · 데스크톱 모두 앞 작업이 끝나길 기다리는 대기열이라 받은 뒤 3시간까지는 기다린다.
         // 폰 말은 여기에 더해, 세션이 받을 수 있는데도 못 넣은 시간이 10분을 넘으면 넣지 않는다 —
         // 세션이 일하는 동안(Outcome::Busy)은 wait_from 이 밀려 이 시계가 멈춘다(09-25 실사고: 18분짜리 작업 뒤에 줄 선 폰 말이 버려졌다)
+        // 예약 줄(`sched`)은 폰이 건 것이어도 10분 규칙 대신 예약 쪽 정체 규칙(sched::sync_fired — 10분 못 받으면 held)을 따른다
         let now_ms = chrono::Utc::now().timestamp_millis();
         let stale_phone = time::iso_from_ms(now_ms - 10 * 60_000);
         let stale_all = time::iso_from_ms(now_ms - 3 * 3_600_000);
-        const STALE: &str = "state = 'delivering' AND (received_at < ?2 OR (COALESCE(device, '') <> 'desktop' AND COALESCE(wait_from, received_at) < ?1))";
+        const STALE: &str =
+            "state = 'delivering' AND (received_at < ?2 OR (COALESCE(device, '') <> 'desktop' AND sched IS NULL AND COALESCE(wait_from, received_at) < ?1))";
         let stale_sids: Vec<String> = self
             .conn
             .prepare(&format!("SELECT DISTINCT session_id FROM conoti_reply WHERE {STALE}"))
@@ -570,24 +579,26 @@ impl Pipeline {
                     rep.changed_sessions.push(sid);
                     continue;
                 }
-                // 전달 직전에 한 번 더: 기기 허용·세션 차단·전체 멈춤·전달 경로
-                let can_reply: bool = device
+                // 전달 직전에 한 번 더: 기기 허용·세션 차단·전체 멈춤·전달 경로 (폰이 건 예약이면 그 기기의 예약 허용까지)
+                let (can_reply, can_schedule): (bool, bool) = device
                     .as_deref()
                     .and_then(|d| {
                         self.conn
-                            .query_row("SELECT can_reply FROM relay_device WHERE pid = ?1", params![d], |r| r.get::<_, i64>(0))
+                            .query_row("SELECT can_reply, can_schedule FROM relay_device WHERE pid = ?1", params![d], |r| {
+                                Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0))
+                            })
                             .optional()
                             .ok()
                             .flatten()
                     })
-                    .map(|v| v != 0)
-                    .unwrap_or(false);
-                let block = reply_block(&self.conn, can_reply, &sid);
-                if !block.is_empty() {
-                    let _ = self.conn.execute(
-                        "UPDATE conoti_reply SET state = 'rejected', note = ?2 WHERE reply_id = ?1",
-                        params![reply_id, block_text(block)],
-                    );
+                    .unwrap_or((false, false));
+                let note = match reply_block(&self.conn, can_reply, &sid) {
+                    "" if sched.is_some() && !can_schedule => Some(SCHED_OFF_TEXT),
+                    "" => None,
+                    block => Some(block_text(block)),
+                };
+                if let Some(note) = note {
+                    let _ = self.conn.execute("UPDATE conoti_reply SET state = 'rejected', note = ?2 WHERE reply_id = ?1", params![reply_id, note]);
                     rep.changed_sessions.push(sid);
                     continue;
                 }

@@ -1020,7 +1020,13 @@ function OutboxBubble({
     <div className="user-row">
       <div className={`user pending s-${o.state}`}>
         <div className="who">
-          {o.from_phone ? <span className="via-phone">나 · 폰에서</span> : o.sched ? "나 · AI Inbox 예약" : "나 · AI Inbox"}
+          {o.from_phone ? (
+            <span className="via-phone">{o.sched ? "나 · 폰에서 예약" : "나 · 폰에서"}</span>
+          ) : o.sched ? (
+            "나 · AI Inbox 예약"
+          ) : (
+            "나 · AI Inbox"
+          )}
           <time>{clock(o.at)}</time>
         </div>
         {o.quote && (
@@ -1033,12 +1039,13 @@ function OutboxBubble({
         <div className="send-state">
           {(o.state === "delivering" || o.state === "delivered") && <Loader2 size={12} className="spin" />}
           <span>{state}</span>
-          {!o.from_phone && o.state === "delivering" && (
+          {/* 예약이 넣은 줄은 폰이 건 것이어도 PC 에서 거둘 수 있다(conoti::cancel_desktop) */}
+          {(!o.from_phone || o.sched) && o.state === "delivering" && (
             <button className="more" onClick={onCancel}>
               취소
             </button>
           )}
-          {!o.from_phone && o.state === "rejected" && (
+          {(!o.from_phone || o.sched) && o.state === "rejected" && (
             <>
               <button className="more" onClick={onRewrite}>
                 다시 쓰기

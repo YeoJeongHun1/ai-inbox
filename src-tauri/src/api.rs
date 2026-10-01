@@ -1716,7 +1716,8 @@ pub fn conoti_set_session_mode(state: State<AppState>, shared: Relay, session_id
 #[tauri::command]
 pub fn conoti_decide(state: State<AppState>, shared: Relay, reply_id: String, approve: bool) -> R<()> {
     let conn = state.conn.lock().map_err(e)?;
-    let (next, note) = if approve { ("delivering", None) } else { ("rejected", Some("데스크톱에서 거절")) };
+    // 거절 문구는 상수 — 폰이 건 예약의 회차는 이 문구를 보고 끝낸다(sched::sync_fired)
+    let (next, note) = if approve { ("delivering", None) } else { ("rejected", Some(crate::conoti::DENIED_NOTE)) };
     // acked = 'approved' — 전달 직전에 "확인 모드인데 확인을 거쳤나"를 다시 본다
     let n = conn
         .execute(

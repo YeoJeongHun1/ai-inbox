@@ -34,6 +34,8 @@ pub const STUCK_SECS: i64 = 600;
 pub const HELD_EXPIRE_DAYS: i64 = 7;
 pub const MAX_ACTIVE_PER_SESSION: i64 = 20;
 pub const MAX_ACTIVE_TOTAL: i64 = 200;
+/// 폰 한 대가 24시간 동안 만들 수 있는 예약 수(취소한 것도 센다) — 만들고 취소하기를 되풀이해 표가 끝없이 커지지 않게
+pub const MAX_DEVICE_ADDS_PER_DAY: i64 = 100;
 /// 하루 발사 상한 — 폭주·실수로 무인 실행이 쌓이지 않게
 pub const DAILY_FIRE_CAP: i64 = 100;
 pub const MAX_AFTER_MIN: i64 = 60 * 24 * 30;
@@ -516,6 +518,19 @@ pub fn add(conn: &Connection, now: DateTime<Utc>, created_by: &str, n: &NewSched
             }).ok_or_else(|| "기록을 읽지 못함".into());
         }
     }
+    // 폰 한 대가 만드는 속도 상한(취소한 것도 센다) — 걸려 있는 수 상한만으로는 만들고 취소하기를 되풀이하면 표가 끝없이 커진다
+    if created_by != conoti::DESKTOP {
+        let made: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schedule WHERE created_by = ?1 AND created_at >= ?2",
+                params![created_by, iso(now - Duration::days(1))],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if made >= MAX_DEVICE_ADDS_PER_DAY {
+            return Err(format!("이 기기에서 만든 예약이 너무 많습니다(24시간에 {MAX_DEVICE_ADDS_PER_DAY}개까지) — 나중에 다시 시도하세요"));
+        }
+    }
     conoti::check_body(&n.text, !n.atts.is_empty())?;
     if n.quote_part.as_deref().is_some_and(|q| !conoti::valid_quote(q)) || (n.quote_part.is_some() && n.quote_turn.is_none()) {
         return Err("답장 대상 형식 오류".into());
@@ -677,10 +692,10 @@ pub fn cancel(conn: &Connection, now: DateTime<Utc>, id: &str) -> R<()> {
         .map_err(|e| e.to_string())?;
     let Some((occ, state, reply)) = run else { return Err("이미 전달됐거나 취소된 예약입니다".into()) };
     if state == "fired" {
-        // 대기열에서 전달 전인 줄만 거둔다(이미 세션에 들어갔으면 못 거둔다)
+        // 대기열에서 전달 전인 줄만 거둔다(이미 세션에 들어갔으면 못 거둔다) — 폰 예약의 확인 대기 줄도(기기 해제 때 남지 않게)
         let took = conn
             .execute(
-                "UPDATE conoti_reply SET state = 'rejected', note = '예약 취소' WHERE reply_id = ?1 AND state = 'delivering'",
+                "UPDATE conoti_reply SET state = 'rejected', note = '예약 취소' WHERE reply_id = ?1 AND state IN ('delivering', 'confirm')",
                 params![reply],
             )
             .map_err(|e| e.to_string())?;
@@ -1087,10 +1102,17 @@ fn hold_or_fail(conn: &Connection, id: &str, occ: &str, state: &str, reason: &st
 }
 
 /// 회차를 대기열(`conoti_reply`)에 넣는다 — `received_at` = 지금(발사 시각), `sched` = 회차 키. 같은 회차는 두 번 들어가지 않는다.
+/// PC 가 만든 예약은 데스크톱 줄(`device='desktop'`), **폰이 만든 예약은 그 기기의 줄**(`device=pid`)로 넣는다 — 폰 답과 같은 겹
+/// (데스크톱 확인 · 전달 직전의 세션 차단·전체 멈춤·기기 허용·해제 재검사)을 파이프라인이 그대로 태운다(10-01 보안 점검).
 fn fire_run(conn: &Connection, now: DateTime<Utc>, id: &str, occ: &str) -> R<()> {
-    let (sid, body, quote, turn): (String, String, Option<String>, Option<i64>) = conn
-        .query_row("SELECT session_id, text, quote, turn_id FROM schedule WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+    let (sid, body, quote, turn, by): (String, String, Option<String>, Option<i64>, String) = conn
+        .query_row("SELECT session_id, text, quote, turn_id, created_by FROM schedule WHERE id = ?1", params![id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
         .map_err(|e| e.to_string())?;
+    let phone = by != conoti::DESKTOP;
+    // 확인 모드면 폰 답처럼 처음부터 확인 대기(파이프라인도 전달 직전에 한 번 더 본다)
+    let state = if phone && conoti::flag(conn, "conoti.confirm") { "confirm" } else { "delivering" };
     let ms = time::ms_of_iso(occ).unwrap_or(0);
     let key = format!("{id}-{ms}");
     let turn = match turn {
@@ -1106,12 +1128,19 @@ fn fire_run(conn: &Connection, now: DateTime<Utc>, id: &str, occ: &str) -> R<()>
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO conoti_reply (reply_id, turn_id, session_id, kind, text, created_at, received_at, state, device, quote, sched)
-                 VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?5, 'delivering', ?6, ?7, ?1)",
-                params![key, turn, sid, body, at, conoti::DESKTOP, quote],
+                 VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?5, ?8, ?6, ?7, ?1)",
+                params![key, turn, sid, body, at, by, quote, state],
             )
             .map_err(|e| e.to_string())?;
         if n == 1 {
             attach::link(conn, &key, &atts_of(conn, id))?;
+        } else {
+            // 같은 번호의 줄이 이미 있다 — 이 회차가 넣은 줄(앱이 죽었다 다시 켜진 재시도)이어야 한다. 번호는 목록으로 알 수 있으니
+            // 폰이 그 번호를 답 번호(rid)로 먼저 써 두었다면 예약을 그 답에 묶지 않는다(held — 사용자가 보내기/버리기)
+            let ours: bool = conn.query_row("SELECT sched IS ?1 FROM conoti_reply WHERE reply_id = ?1", params![key], |r| r.get(0)).map_err(|e| e.to_string())?;
+            if !ours {
+                return Err("대기열 번호가 다른 말과 겹쳐 넣지 못했습니다".into());
+            }
         }
         conn.execute(
             "UPDATE schedule_run SET state = 'fired', fired_at = ?3, reply_id = ?4, note = NULL WHERE schedule_id = ?1 AND occurrence_at = ?2 AND state IN ('pending','deferred')",
@@ -1164,6 +1193,13 @@ fn sync_fired(conn: &Connection, now: DateTime<Utc>, probe: &dyn Probe, rep: &mu
                 let note = cnote.unwrap_or_default();
                 if note == "예약 취소" || note == "보내기 취소" {
                     set("cancelled");
+                    finish_schedule(conn, &id, now);
+                } else if note == conoti::DENIED_NOTE {
+                    // 데스크톱 확인에서 PC 가 거절한 폰 예약 — 사용자의 결정이므로 끝낸다(대기·재알림으로 되살리지 않는다)
+                    let _ = conn.execute(
+                        "UPDATE schedule_run SET state = 'cancelled', note = ?3 WHERE schedule_id = ?1 AND occurrence_at = ?2 AND state IN ('fired','delivered')",
+                        params![id, occ, conoti::DENIED_NOTE],
+                    );
                     finish_schedule(conn, &id, now);
                 } else {
                     // 세션이 꺼져서(또는 훅이 없어서) 거절됐다면 그 사유로 — 다시 받을 수 있게 되면 재알림한다
@@ -2429,12 +2465,21 @@ mod tests {
         };
         ins("scfresh0000000001-1", 120); // 2시간 전에 발사(일하는 세션 뒤에 줄 서 있음) — 10분 규칙에 안 걸린다
         ins("scstale0000000002-1", 181); // 3시간 넘게 — 거절
+        // 폰이 건 예약은 그 기기의 줄로 들어가지만(폰 답 겹), 폰 말의 10분 규칙 대신 예약 쪽 정체 규칙을 따른다
+        c.execute("INSERT INTO relay_device (pid, name, phone_pub, can_reply, can_manage, can_schedule, created_at) VALUES ('d1', '폰', 'ff', 1, 0, 1, 't')", []).unwrap();
+        db::set_meta(&c, "conoti.bg_resume", "1").unwrap(); // 시험 세션은 떠 있지 않다 — 폰 경로의 "꺼진 세션" 거절을 피한다
+        c.execute(
+            "INSERT INTO conoti_reply (reply_id, session_id, kind, text, created_at, received_at, state, device, sched) VALUES ('scphone000000003-1', ?1, 'text', '예약', ?2, ?2, 'delivering', 'd1', 'scphone000000003-1')",
+            params![S1, iso(now - Duration::minutes(20))],
+        )
+        .unwrap();
         let mut pipe = conoti::Pipeline::new(c);
         pipe.tick(&AlwaysBusy);
         let c = pipe.conn();
         let st = |rid: &str| c.query_row("SELECT state FROM conoti_reply WHERE reply_id = ?1", params![rid], |r| r.get::<_, String>(0)).unwrap();
         assert_eq!(st("scfresh0000000001-1"), "delivering");
         assert_eq!(st("scstale0000000002-1"), "rejected");
+        assert_eq!(st("scphone000000003-1"), "delivering", "폰 예약 줄이 폰 말 10분 규칙에 걸렸다");
     }
 
     #[test]

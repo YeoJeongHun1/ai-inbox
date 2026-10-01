@@ -516,10 +516,27 @@ fn sched_out(v: &Value, pid: &str) -> Value {
     })
 }
 
-fn sched_exists(conn: &Connection, id: &str) -> Result<(), (&'static str, String)> {
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM schedule WHERE id = ?1", params![id], |r| r.get(0)).map_err(|e| ("internal", e.to_string()))?;
-    if n == 0 {
-        return Err(("not_found", "예약이 없습니다".into()));
+/// 예약을 고르고 만든 쪽(`created_by` — `desktop` 또는 기기 pid)을 돌려준다. 없거나 이 기기가 볼 수 없는 세션(보관 · 기록 관리 꺼짐)의 예약이면 `not_found`(목록과 같은 규칙)
+fn sched_owner(conn: &Connection, id: &str, caller: &Caller) -> Result<String, (&'static str, String)> {
+    let row: Option<(String, Option<i64>)> = conn
+        .query_row("SELECT sc.created_by, s.hidden FROM schedule sc LEFT JOIN session s ON s.id = sc.session_id WHERE sc.id = ?1", params![id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()
+        .map_err(|e| ("internal", e.to_string()))?;
+    match row {
+        Some((by, hidden)) if visible(hidden, caller) => Ok(by),
+        _ => Err(("not_found", "예약이 없습니다".into())),
+    }
+}
+
+const NOT_MINE: &str = "이 기기가 만든 예약만 고치거나 취소할 수 있습니다 — PC 나 다른 기기가 만든 예약은 그곳에서 고치세요";
+
+/// 고치기·취소는 **그 기기가 만든 예약(`mine`)만** — PC·다른 기기가 만든 예약을 폰이 고치면 발사 때의 기기 재검사(`device_block`)와
+/// 기기 해제 때의 회수(`cancel_device`)가 만든 쪽 기준이라 모두 비켜 간다(10-01 보안 점검). 거절은 `rejected`.
+fn check_mine(by: &str, caller: &Caller) -> Result<(), (&'static str, String)> {
+    if by != caller.pid {
+        return Err(("rejected", NOT_MINE.into()));
     }
     Ok(())
 }
@@ -597,7 +614,16 @@ pub fn sched_list(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
             visible(hidden, caller)
         })
         .take(100)
-        .map(|v| sched_out(v, caller.pid))
+        .map(|v| {
+            let mut out = sched_out(v, caller.pid);
+            // 예약 권한(예약 허용 + 답 보내기)이 없는 기기는 목록만 본다 — PC·다른 기기가 걸어 둔 말(아직 세션에 들어가지 않은 프롬프트)과
+            // 이미지는 비운다. 필드·타입은 그대로(옛 폰 파서 호환), 값만 줄인다. 자기가 만든 예약은 그대로 보인다.
+            if !(caller.can_schedule && caller.can_reply) && out["mine"] != true {
+                out["text"] = json!("");
+                out["atts"] = json!([]);
+            }
+            out
+        })
         .collect();
     let (active, held) = crate::sched::counts(conn);
     Ok(json!({"items": items, "active": active, "held": held, "can_schedule": caller.can_schedule}))
@@ -606,7 +632,7 @@ pub fn sched_list(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
 pub fn sched_edit(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
     check_sched(conn, caller)?;
     let id = sched_id(p)?;
-    sched_exists(conn, id)?;
+    check_mine(&sched_owner(conn, id, caller)?, caller)?;
     let rev = p.get("rev").and_then(Value::as_i64).ok_or_else(|| bad("rev"))?;
     let atts = ids_of(p.get("atts"))?;
     // 새 이미지는 이 기기가 rid 로 올린 것만, 이미 붙어 있던 이미지는 그대로 남길 수 있다
@@ -642,16 +668,18 @@ pub fn sched_edit(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
 pub fn sched_cancel(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
     check_sched(conn, caller)?;
     let id = sched_id(p)?;
-    sched_exists(conn, id)?;
+    check_mine(&sched_owner(conn, id, caller)?, caller)?;
     crate::sched::cancel(conn, chrono::Utc::now(), id).map_err(sched_err)?;
     Ok(json!({}))
 }
 
-/// 받지 못해 처리를 기다리는 예약을 `send`(지금 보낸다 — 폰 답과 같은 검사) · `drop`(버린다)
+/// 받지 못해 처리를 기다리는 예약을 `send`(지금 보낸다 — 폰 답과 같은 검사) · `drop`(버린다).
+/// 누가 만든 예약이든 된다(규격 §4-3 — 못 받은 예약은 알림을 받은 폰이 처리하도록 설계됐다): 보내기는 이 기기의 폰 답과 같은 겹
+/// (답 보내기 허용·전체 멈춤·세션 차단·이어서 실행 설정)과 데스크톱 확인을 거치므로 폰이 직접 답을 보내는 것 이상의 힘이 없고, 버리기는 실행을 만들지 않는다.
 pub fn sched_act(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
     check_sched(conn, caller)?;
     let id = sched_id(p)?;
-    sched_exists(conn, id)?;
+    sched_owner(conn, id, caller)?;
     let op = str_of(p, "op").filter(|o| matches!(*o, "send" | "drop")).ok_or_else(|| bad("op"))?;
     crate::sched::act_by(conn, chrono::Utc::now(), id, op, Some((caller.pid, caller.can_reply))).map_err(sched_err)?;
     Ok(json!({}))
@@ -659,10 +687,33 @@ pub fn sched_act(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
 
 // ── 요청 태그(0.10.0, §4-4) ──────────────────────────────────────────────────
 
-/// 전체 태그 `{items:[{n, c, minor, k}]}` — k = 그 태그가 붙은 요청 수. 페어링된 기기면 누구나
-pub fn tag_list(conn: &Connection, _p: &Value, _caller: &Caller) -> RpcResult {
+/// 전체 태그 `{items:[{n, c, minor, k}]}` — k = 그 태그가 붙은 요청 수. 페어링된 기기면 누구나.
+/// 기록 관리를 허용하지 않은 기기는 보관한 세션을 볼 수 없으므로, 보관한 세션의 요청에만 붙은 태그(폴더 이름으로 생긴 프로젝트 태그 등)는 빼고 `k` 도 보이는 세션만 센다.
+pub fn tag_list(conn: &Connection, _p: &Value, caller: &Caller) -> RpcResult {
     let ov = crate::tags::overview(conn);
-    let items: Vec<Value> = ov.tags.iter().map(|t| json!({"n": t.name, "c": t.color, "minor": t.minor, "k": t.turns})).collect();
+    let seen: Option<std::collections::HashMap<i64, i64>> = (!caller.can_manage).then(|| {
+        conn.prepare(
+            "SELECT x.tag_id, COUNT(*) FROM turn_tag x JOIN turn t ON t.id = x.turn_id JOIN session s ON s.id = t.session_id
+              WHERE x.state IN ('auto','manual') AND t.hidden = 0 AND s.hidden = 0 GROUP BY x.tag_id",
+        )
+        .and_then(|mut st| st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).map(|r| r.flatten().collect()))
+        .unwrap_or_default()
+    });
+    let items: Vec<Value> = ov
+        .tags
+        .iter()
+        .filter_map(|t| {
+            let k = match &seen {
+                None => t.turns,
+                Some(m) => match m.get(&t.id).copied().unwrap_or(0) {
+                    // 요청이 있는데 보이는 세션에는 하나도 없다 = 보관 세션에서만 쓰인 태그
+                    0 if t.turns > 0 => return None,
+                    k => k,
+                },
+            };
+            Some(json!({"n": t.name, "c": t.color, "minor": t.minor, "k": k}))
+        })
+        .collect();
     Ok(json!({"items": items}))
 }
 
@@ -1186,6 +1237,267 @@ mod tests {
         c.execute("DELETE FROM relay_device", []).unwrap();
         due(&c);
         assert_eq!(tick(&c, at, &Up).alerts.len(), 1);
+    }
+
+    // ── 보안 점검(10-01): 폰 예약이 폰 답과 같은 통제(데스크톱 확인 · 세션 차단 · 기기 해제/허용 끔)를 타는가 ──
+
+    struct UpProbe;
+    impl crate::sched::Probe for UpProbe {
+        fn route(&self, _: &str) -> crate::deliver::Route {
+            crate::deliver::Route::Live
+        }
+        fn work(&self, _: &str) -> crate::deliver::Work {
+            crate::deliver::Work::Idle
+        }
+    }
+
+    /// 세션에 넣은 말을 적어 두는 가짜 전달기
+    #[derive(Default)]
+    struct Sink(std::cell::RefCell<Vec<String>>);
+    impl conoti::Deliver for Sink {
+        fn deliver(&self, _t: &conoti::Target, id: &str, _text: &str, _d: bool) -> conoti::Outcome {
+            self.0.borrow_mut().push(id.to_string());
+            conoti::Outcome::Done("전달".into())
+        }
+    }
+
+    /// 폰 d1(답·예약 허용)이 건 예약을 지금 발사한다. 파이프라인의 3시간 상한은 실제 현재 시각으로 보므로 발사 시각도 현재 기준.
+    /// 시험 세션은 실제로 떠 있지 않다(`deliver::route` = 꺼짐) — 폰 경로의 "꺼진 세션" 거절을 피하려고 이어서 실행 설정을 켠다(가짜 전달기라 실행은 없다).
+    fn fired_phone_schedule(confirm: bool) -> (Connection, String) {
+        let c = mem();
+        add_dev(&c, "d1", 1, 1);
+        db::set_meta(&c, "conoti.bg_resume", "1").unwrap();
+        db::set_meta(&c, "conoti.confirm", if confirm { "1" } else { "0" }).unwrap();
+        let v = sched_add(&c, &sched_body("rid-sched-0061", json!({"after_min": 1})), &dev("d1", true, false, true)).unwrap();
+        let now = chrono::Utc::now();
+        c.execute("UPDATE schedule SET next_due_at = ?1", params![(now - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)]).unwrap();
+        crate::sched::tick(&c, now, &UpProbe);
+        assert_eq!(c.query_row::<i64, _, _>("SELECT COUNT(*) FROM conoti_reply WHERE sched IS NOT NULL", [], |r| r.get(0)).unwrap(), 1, "발사됨");
+        (c, v["id"].as_str().unwrap().to_string())
+    }
+
+    fn line_of(c: &Connection) -> (String, String) {
+        c.query_row("SELECT state, COALESCE(device, '') FROM conoti_reply WHERE sched IS NOT NULL", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn phone_schedule_waits_for_desktop_confirm_like_a_phone_reply() {
+        let (c, id) = fired_phone_schedule(true);
+        let mut pipe = conoti::Pipeline::new(c);
+        let sink = Sink::default();
+        pipe.tick(&sink);
+        assert!(sink.0.borrow().is_empty(), "데스크톱 확인 모드인데 PC 허용 없이 세션에 넣었다");
+        assert_eq!(line_of(pipe.conn()), ("confirm".to_string(), "d1".to_string()), "폰이 건 예약은 그 기기의 줄로 확인 대기");
+        // 폰 화면의 보낸 말(replies)에는 예약 줄이 끼지 않는다(예약은 sched_list 로 본다 — 예전과 같다)
+        assert!(conoti::replies_for(pipe.conn(), "sess-0001", 20).is_empty());
+        // PC 가 거절하면 회차는 끝(대기 → 재알림으로 돌지 않는다)
+        pipe.conn().execute("UPDATE conoti_reply SET state = 'rejected', note = ?1 WHERE state = 'confirm'", params![conoti::DENIED_NOTE]).unwrap();
+        let rep = crate::sched::tick(pipe.conn(), chrono::Utc::now(), &UpProbe);
+        assert!(rep.alerts.is_empty(), "PC 가 거절한 것을 '전달되지 못했어요'로 다시 알리지 않는다");
+        let st: (String, String) = pipe.conn().query_row("SELECT r.state, s.state FROM schedule_run r JOIN schedule s ON s.id = r.schedule_id WHERE s.id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(st, ("cancelled".to_string(), "done".to_string()));
+        // PC 가 허용하면 들어간다
+        let (c, _) = fired_phone_schedule(true);
+        let mut pipe = conoti::Pipeline::new(c);
+        pipe.tick(&sink);
+        pipe.conn().execute("UPDATE conoti_reply SET state = 'delivering', acked = 'approved' WHERE state = 'confirm'", []).unwrap();
+        pipe.tick(&sink);
+        assert_eq!(sink.0.borrow().len(), 1);
+        assert_eq!(line_of(pipe.conn()).0, "delivered");
+    }
+
+    #[test]
+    fn phone_schedule_is_rechecked_at_delivery_session_block_and_device_permissions() {
+        // 확인 모드가 아니어도, 발사 뒤 전달 전에 PC 가 막으면 넣지 않는다(바쁜 세션 뒤에서 최대 3시간 기다릴 수 있다)
+        type Setup = fn(&Connection);
+        let cases: [(&str, Setup); 4] = [
+            ("세션 차단(폰 답 막기)", |c| {
+                c.execute("INSERT INTO conoti_session (session_id, mode) VALUES ('sess-0001', 1)", []).unwrap();
+            }),
+            ("답 보내기 끔", |c| {
+                c.execute("UPDATE relay_device SET can_reply = 0", []).unwrap();
+            }),
+            ("예약 허용 끔", |c| {
+                c.execute("UPDATE relay_device SET can_schedule = 0", []).unwrap();
+            }),
+            ("기기 행이 사라짐", |c| {
+                c.execute("DELETE FROM relay_device", []).unwrap();
+            }),
+        ];
+        for (what, setup) in cases {
+            let (c, id) = fired_phone_schedule(false);
+            setup(&c);
+            let mut pipe = conoti::Pipeline::new(c);
+            let sink = Sink::default();
+            pipe.tick(&sink);
+            assert!(sink.0.borrow().is_empty(), "{what}: 막았는데 세션에 넣었다");
+            assert_eq!(line_of(pipe.conn()).0, "rejected", "{what}");
+            // 예약 쪽은 받지 못한 것으로(held) — PC 앞의 사용자가 보내기/버리기
+            crate::sched::tick(pipe.conn(), chrono::Utc::now(), &UpProbe);
+            let run: String = pipe.conn().query_row("SELECT state FROM schedule_run WHERE schedule_id = ?1", params![id], |r| r.get(0)).unwrap();
+            assert_eq!(run, "held", "{what}");
+        }
+        // 막는 것이 없으면 그대로 들어간다(예약 머리말·예약 표식 유지)
+        let (c, _) = fired_phone_schedule(false);
+        let mut pipe = conoti::Pipeline::new(c);
+        let sink = Sink::default();
+        pipe.tick(&sink);
+        assert_eq!((sink.0.borrow().len(), line_of(pipe.conn()).0), (1, "delivered".to_string()));
+    }
+
+    #[test]
+    fn unpairing_takes_back_a_phone_schedule_waiting_for_confirm() {
+        let (c, id) = fired_phone_schedule(true);
+        let mut pipe = conoti::Pipeline::new(c);
+        let sink = Sink::default();
+        pipe.tick(&sink);
+        assert_eq!(line_of(pipe.conn()).0, "confirm");
+        // 기기 해제(remove_device 가 하는 DB 일) — 확인 대기 줄까지 거둔다
+        crate::sched::cancel_device(pipe.conn(), "d1");
+        pipe.conn().execute("DELETE FROM relay_device WHERE pid = 'd1'", []).unwrap();
+        assert_eq!(line_of(pipe.conn()).0, "rejected");
+        let st: (String, String) = pipe.conn().query_row("SELECT r.state, s.state FROM schedule_run r JOIN schedule s ON s.id = r.schedule_id WHERE s.id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(st, ("cancelled".to_string(), "done".to_string()));
+        // PC 화면에 남은 확인 단추를 눌러도(이미 처리됨) 들어가지 않는다
+        assert_eq!(pipe.conn().execute("UPDATE conoti_reply SET state = 'delivering', acked = 'approved' WHERE state = 'confirm'", []).unwrap(), 0);
+        pipe.tick(&sink);
+        assert!(sink.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn pc_can_still_cancel_a_fired_phone_schedule_from_the_chat() {
+        let (c, id) = fired_phone_schedule(false);
+        let rid: String = c.query_row("SELECT reply_id FROM conoti_reply WHERE sched IS NOT NULL", [], |r| r.get(0)).unwrap();
+        conoti::cancel_desktop(&c, &rid).unwrap();
+        assert_eq!(line_of(&c).0, "rejected");
+        crate::sched::tick(&c, chrono::Utc::now(), &UpProbe);
+        assert_eq!(c.query_row::<String, _, _>("SELECT state FROM schedule_run WHERE schedule_id = ?1", params![id], |r| r.get(0)).unwrap(), "cancelled");
+        // 폰 답(예약 아님)은 여전히 PC 의 "보내기 취소" 대상이 아니다
+        add_dev(&c, "d3", 1, 0);
+        conoti::accept_reply(&c, "d3", true, "sess-0001", None, "폰 답", "rid-plain-0001", &[], None).unwrap();
+        conoti::cancel_desktop(&c, "rid-plain-0001").unwrap();
+        assert_ne!(c.query_row::<String, _, _>("SELECT COALESCE(note, '') FROM conoti_reply WHERE reply_id = 'rid-plain-0001'", [], |r| r.get(0)).unwrap(), "보내기 취소");
+    }
+
+    #[test]
+    fn a_phone_reply_cannot_squat_the_queue_key_of_a_schedule() {
+        // 회차의 대기열 번호 = `<예약 id>-<예정 시각 ms>` — 둘 다 sched_list 로 보인다. 폰이 그 번호로 답을 먼저 넣어 두면
+        // 발사가 INSERT OR IGNORE 로 조용히 그 답에 묶여(PC 예약 대신 폰의 글이 그 예약의 결과가 된다) 안 된다
+        let c = mem();
+        add_dev(&c, "d1", 1, 1);
+        db::set_meta(&c, "conoti.bg_resume", "1").unwrap();
+        let id = desktop_schedule(&c, "PC 예약 원문");
+        let now = chrono::Utc::now();
+        let due = (now - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        c.execute("UPDATE schedule SET next_due_at = ?1", params![due]).unwrap();
+        let key = format!("{id}-{}", chrono::DateTime::parse_from_rfc3339(&due).unwrap().timestamp_millis());
+        assert_eq!(reply(&c, &json!({"sid": "sess-0001", "text": "폰이 끼워 넣은 말", "rid": key}), &dev("d1", true, false, false)).unwrap()["state"], "delivering");
+        crate::sched::tick(&c, now, &UpProbe);
+        let (state, linked): (String, Option<String>) = c.query_row("SELECT state, reply_id FROM schedule_run WHERE schedule_id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(state, "held", "남의 답에 묶여 발사된 것으로 처리됐다");
+        assert_ne!(linked.as_deref(), Some(key.as_str()));
+        // 폰의 답은 그 답대로(예약 표식이 붙지 않는다)
+        assert!(c.query_row::<Option<String>, _, _>("SELECT sched FROM conoti_reply WHERE reply_id = ?1", params![key], |r| r.get(0)).unwrap().is_none());
+    }
+
+    fn desktop_schedule(c: &Connection, text: &str) -> String {
+        let n = crate::sched::NewSchedule {
+            session_id: "sess-0001".into(),
+            text: text.into(),
+            atts: vec![],
+            quote_turn: None,
+            quote_part: None,
+            when: crate::sched::WhenIn::After { min: 30 },
+            on_missed: "within".into(),
+            missed_within_min: None,
+            busy_policy: None,
+            rid: None,
+        };
+        crate::sched::add(c, chrono::Utc::now(), conoti::DESKTOP, &n, &UpProbe).unwrap()["id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn phone_can_edit_and_cancel_only_its_own_schedules() {
+        let c = mem();
+        add_dev(&c, "d1", 1, 1);
+        add_dev(&c, "d2", 1, 1);
+        let (d1, d2) = (dev("d1", true, false, true), dev("d2", true, false, true));
+        let pc = desktop_schedule(&c, "PC 에서 건 예약");
+        let other = sched_add(&c, &sched_body("rid-sched-0071", json!({"after_min": 30})), &d2).unwrap()["id"].as_str().unwrap().to_string();
+        let mine = sched_add(&c, &sched_body("rid-sched-0072", json!({"after_min": 30})), &d1).unwrap()["id"].as_str().unwrap().to_string();
+        let edit = |id: &str| json!({"id": id, "rev": 1, "text": "rm -rf 로 바꿔 줘", "when": {"after_min": 2}});
+        // PC 가 만든 예약 · 다른 폰이 만든 예약 → 고치기·취소 거절(rejected), 내용·상태 그대로
+        for id in [&pc, &other] {
+            let e = sched_edit(&c, &edit(id), &d1).unwrap_err();
+            assert_eq!(e.0, "rejected", "{e:?}");
+            assert!(e.1.contains("이 기기가 만든 예약만"), "{e:?}");
+            assert_eq!(sched_cancel(&c, &json!({"id": id}), &d1).unwrap_err().0, "rejected");
+            let (text, state, rev): (String, String, i64) = c.query_row("SELECT text, state, rev FROM schedule WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            assert!(!text.contains("rm -rf") && state == "active" && rev == 1, "{text} {state} {rev}");
+        }
+        // 자기 예약은 예전처럼 고치고 취소한다(옛 폰의 정상 흐름)
+        assert_eq!(sched_edit(&c, &edit(&mine), &d1).unwrap()["rev"], 2);
+        sched_cancel(&c, &json!({"id": mine}), &d1).unwrap();
+        // 없는 예약은 여전히 not_found
+        assert_eq!(sched_edit(&c, &edit("scnope"), &d1).unwrap_err().0, "not_found");
+        // PC 가 만든 예약이 받지 못해 대기(held)면 폰도 처리(보내기·버리기)할 수 있다 — 규격 §4-3(보내기는 폰 답과 같은 검사·확인)
+        c.execute("UPDATE schedule SET next_due_at = NULL WHERE id = ?1", params![pc]).unwrap();
+        c.execute("INSERT INTO schedule_run (schedule_id, occurrence_at, created_at, state, reason, notified_at) VALUES (?1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', 'held', 'ended', 't')", params![pc]).unwrap();
+        sched_act(&c, &json!({"id": pc, "op": "drop"}), &d1).unwrap();
+        assert_eq!(c.query_row::<String, _, _>("SELECT state FROM schedule_run WHERE schedule_id = ?1", params![pc], |r| r.get(0)).unwrap(), "cancelled");
+    }
+
+    #[test]
+    fn sched_list_hides_bodies_from_devices_without_schedule_permission() {
+        let c = mem();
+        add_dev(&c, "d1", 1, 1);
+        desktop_schedule(&c, "PC 의 비밀 계획");
+        let full = sched_list(&c, &json!({}), &dev("d1", true, false, true)).unwrap();
+        assert_eq!(full["items"][0]["text"], "PC 의 비밀 계획");
+        for who in [dev("d9", true, false, false), dev("d9", false, false, true), dev("d9", false, false, false)] {
+            let l = sched_list(&c, &json!({}), &who).unwrap();
+            let it = &l["items"][0];
+            assert_eq!(it["text"], "", "예약 권한 없는 기기에 본문");
+            assert_eq!(it["atts"], json!([]));
+            // 응답 모양(필드·타입)은 그대로 — 값만 줄인다
+            let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            assert_eq!(keys(it), keys(&full["items"][0]));
+            assert_eq!((l["active"].as_i64(), it["state"].as_str()), (Some(1), Some("active")));
+        }
+    }
+
+    #[test]
+    fn tag_list_leaves_out_tags_seen_only_in_archived_sessions_for_devices_without_manage() {
+        let c = tagged_mem();
+        // 보관한 세션(sess-0002)에만 붙은 태그 하나
+        let hidden_tag = crate::tags::create_tag(&c, "감춘프로젝트", "", false).unwrap();
+        let t2: i64 = c.query_row("SELECT id FROM turn WHERE session_id = 'sess-0002'", [], |r| r.get(0)).unwrap();
+        crate::tags::set_turn_tag(&c, t2, hidden_tag, true).unwrap();
+        archive::set_archived(&c, &["sess-0002".to_string()], true).unwrap();
+        let names = |l: &Value| l["items"].as_array().unwrap().iter().map(|t| (t["n"].as_str().unwrap().to_string(), t["k"].as_i64().unwrap())).collect::<std::collections::HashMap<_, _>>();
+        let plain = names(&tag_list(&c, &json!({}), &dev("d1", true, false, false)).unwrap());
+        assert!(!plain.contains_key("감춘프로젝트"), "보관 세션을 볼 수 없는 기기에 보관 세션의 태그");
+        assert_eq!(plain.get("베타"), Some(&1), "개수도 보이는 세션만");
+        assert_eq!(plain.get("알파"), Some(&2));
+        let managed = names(&tag_list(&c, &json!({}), &dev("d1", true, true, false)).unwrap());
+        assert_eq!((managed.get("감춘프로젝트"), managed.get("베타")), (Some(&1), Some(&2)), "기록 관리 허용 기기는 전체");
+    }
+
+    #[test]
+    fn a_phone_cannot_grow_the_schedule_table_without_bound() {
+        let c = mem();
+        let d = dev("d1", true, false, true);
+        for i in 0..crate::sched::MAX_DEVICE_ADDS_PER_DAY {
+            let v = sched_add(&c, &sched_body(&format!("rid-sched-{i:05}"), json!({"after_min": 30})), &d).unwrap();
+            sched_cancel(&c, &json!({"id": v["id"]}), &d).unwrap();
+        }
+        let e = sched_add(&c, &sched_body("rid-sched-99999", json!({"after_min": 30})), &d).unwrap_err();
+        assert_eq!(e.0, "rejected", "{e:?}");
+        // 같은 rid 재전송은 새로 만드는 것이 아니라 그대로 처음 결과
+        assert!(sched_add(&c, &sched_body("rid-sched-00000", json!({"after_min": 30})), &d).is_ok());
+        // 다른 기기·PC 는 따로 센다
+        assert!(sched_add(&c, &sched_body("rid-sched-99999", json!({"after_min": 30})), &dev("d2", true, false, true)).is_ok());
+        desktop_schedule(&c, "PC 예약");
     }
 
     #[test]
