@@ -1419,6 +1419,10 @@ impl Ingestor {
         if !acc.codex && crate::tags::attach_for_turn(&self.conn, sid, turn_id, &acc.prompt_text, &acc.prompt_at) {
             rep.tags_changed = true;
         }
+        // 폴더 규칙(0.10.1): 이 요청이 실제로 다룬 경로(위에서 저장한 turn_touch)가 경로 규칙에 들 때만 — 다룬 경로는 작업 중에 늘어나므로 쓸 때마다 본다
+        if !acc.codex && !acc.touched.is_empty() && crate::tags::attach_folder(&self.conn, turn_id) {
+            rep.tags_changed = true;
+        }
         let _ = self.conn.execute("DELETE FROM turn_subagent WHERE turn_id = ?1", params![turn_id]);
         for (i, s) in acc.subs.iter().enumerate() {
             let dur = match (&s.started_at, &s.ended_at) {
@@ -2474,6 +2478,69 @@ mod tests {
         // Ingestor::new 가 파서 버전이 달라 다시 읽게 해도 태그를 붙이지 않는다
         ing.conn.execute("DELETE FROM source_file", []).unwrap();
         assert_eq!(ing.conn.query_row("SELECT COUNT(*) FROM turn_tag", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn folder_tags_follow_the_paths_a_request_touched_not_the_session_folder() {
+        // 0.10.1 A안: 작업 폴더(git 최상위)의 프로젝트 태그는 그 요청이 실제로 그 폴더 경로를 다뤘을 때만 — 수집기가 다룬 경로를 확정한 뒤 붙인다
+        let mut ing = ingestor();
+        let base = std::env::temp_dir().join(format!("aiinbox-ingest-folder-{}", std::process::id()));
+        let repo = base.join("kappa");
+        let other = base.join("lambda");
+        for r in [&repo, &other] {
+            std::fs::create_dir_all(r.join(".git")).unwrap();
+        }
+        let cwd = repo.to_string_lossy().into_owned();
+        ing.conn.execute("INSERT INTO session (id, project_dir) VALUES ('s', ?1)", params![cwd]).unwrap();
+        let tool = |at: &str, id: &str, name: &str, input: Value| {
+            json!({"type":"assistant","timestamp":at,"requestId":format!("r-{id}"),
+                   "message":{"content":[{"type":"tool_use","id":id,"name":name,"input":input}],"usage":{"output_tokens":1}}})
+        };
+        let (texts, now) = (
+            ["오늘 서울 날씨가 어떤지 우산을 챙겨야 하는지 알려 줘", "옆 저장소의 설정 파일을 열어서 무슨 값이 있는지 읽어 줘", "이 저장소의 로그인 화면이 어색하니 코드를 고쳐서 손봐 줘"],
+            chrono::Utc::now().timestamp_millis(),
+        );
+        let mut rep = Report::default();
+        for (i, t) in texts.iter().enumerate() {
+            let entry = crate::hook::spool_entry(
+                &json!({"hook_event_name":"UserPromptSubmit","session_id":"s","cwd":cwd,"prompt":t}),
+                (now + i as i64 * 10 * 60_000) as u64,
+            )
+            .unwrap();
+            ing.apply_hook(&entry, &mut rep);
+        }
+        let (mut closed, _) = run(&[
+            human("u1", &at(0), texts[0]),
+            said(&at(1), "맑아요"),
+            human("u2", &at(10), texts[1]),
+            tool(&at(11), "t1", "Read", json!({ "file_path": other.join("conf.toml").to_string_lossy() })),
+            said(&at(12), "읽었습니다"),
+            human("u3", &at(20), texts[2]),
+            tool(&at(21), "t2", "Edit", json!({ "file_path": repo.join("src/login.rs").to_string_lossy() })),
+            said(&at(22), "고쳤습니다"),
+            human("u4", &at(30), "다음"),
+        ]);
+        for acc in closed.iter_mut() {
+            ing.flush_turn("s", acc, &mut rep);
+        }
+        let names = |uuid: &str| -> Vec<String> {
+            ing.conn
+                .prepare("SELECT g.name FROM turn_tag x JOIN tag g ON g.id = x.tag_id JOIN turn t ON t.id = x.turn_id WHERE t.prompt_uuid = ?1 AND x.state = 'auto'")
+                .unwrap()
+                .query_map(params![uuid], |r| r.get(0))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        assert!(names("u1").is_empty(), "경로를 안 다룬 요청은 미분류");
+        assert!(names("u2").is_empty(), "다른 저장소만 다룬 요청엔 작업 폴더 태그가 안 붙는다");
+        assert_eq!(names("u3"), vec!["kappa".to_string()]);
+        // 다시 써도(틱마다·재수집) 중복 없음
+        for acc in closed.iter_mut() {
+            ing.flush_turn("s", acc, &mut rep);
+        }
+        assert_eq!(ing.conn.query_row("SELECT COUNT(*) FROM turn_tag", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

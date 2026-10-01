@@ -168,7 +168,8 @@ CREATE TABLE IF NOT EXISTS turn_hint (
     src        TEXT NOT NULL,                  -- hashtag | rule | project | kind | inherit | none
     tag_ids    TEXT NOT NULL DEFAULT '',
     exact      INTEGER NOT NULL DEFAULT 0,     -- 1 = 앱이 직접 기록(입력창·폰) — 지문이 같을 때만 잇는다
-    turn_id    INTEGER                         -- 이어진 요청(아직 없으면 NULL)
+    turn_id    INTEGER,                        -- 이어진 요청(아직 없으면 NULL)
+    folder     TEXT                            -- 0.10.1: 폴더 규칙을 요청이 다룬 경로(turn_touch)로 볼 기록이면 '<git 최상위>\n<이름>'(저장소 밖이면 ''). NULL = 볼 일 없음(#태그·낱말로 정함, 또는 0.10.0 이하가 남긴 기록)
 );
 CREATE INDEX IF NOT EXISTS turn_hint_session ON turn_hint (session_id, at_ms);
 CREATE INDEX IF NOT EXISTS turn_hint_turn ON turn_hint (turn_id) WHERE turn_id IS NOT NULL;
@@ -585,6 +586,14 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             backup_before(conn, "v13");
             conn.execute_batch("ALTER TABLE conoti_reply ADD COLUMN sched TEXT;")?;
         }
+    }
+    // 0.10.1: 훅 기록에 폴더 규칙 표식 열(turn_hint.folder) — 열 하나 추가뿐, 기존 행은 NULL 이라 지난 요청은 다시 계산하지 않는다.
+    // 스키마 버전은 그대로(옛 버전이 열어도 이 열을 모르고 지나간다). 새 DB 는 위 SCHEMA 가 열째 만든다.
+    let has_folder: bool = conn
+        .query_row("SELECT COUNT(*) FROM pragma_table_info('turn_hint') WHERE name = 'folder'", [], |r| r.get::<_, i64>(0))
+        .map(|n| n > 0)?;
+    if !has_folder {
+        conn.execute_batch("ALTER TABLE turn_hint ADD COLUMN folder TEXT;")?;
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS conoti_reply_sched ON conoti_reply (sched) WHERE sched IS NOT NULL;")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS schedule_due ON schedule (state, next_due_at);")?;

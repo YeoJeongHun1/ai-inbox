@@ -213,6 +213,8 @@ cd src-tauri && cargo test   # 수집 엔진·훅 설치·텍스트 처리 테�
 진단용 명령: `ai-inbox ingest-once` 는 창 없이 수집만 끝까지 돌리고 요약을 출력합니다
 (`AI_INBOX_DATA_DIR=<임시 폴더>` 를 주면 실제 데이터 폴더를 건드리지 않습니다 — 이 변수는 이 명령과 개발 빌드에서만 읽습니다).
 
+GitHub Actions: `ci.yml`(main push·PR 시험) · `release.yml`(`v*` 태그 → 서명한 초안 릴리스) · `test-build.yml`(**`test-build/**` 브랜치에 push 하거나 수동 실행했을 때만** Windows 설치 파일을 빌드해 Actions 아티팩트로만 남긴다 — 태그·릴리스·배포 없음, 수정 브랜치를 실기에서 확인할 때 쓴다).
+
 ## English
 
 **AI Inbox** is a desktop app (macOS · Windows) that turns your Claude Code and OpenAI Codex sessions into a messenger-style inbox:

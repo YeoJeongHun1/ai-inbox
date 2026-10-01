@@ -578,16 +578,12 @@ pub fn run() {
             build_tray(app.handle())?;
             spawn_ingest(app.handle().clone(), rescan.clone());
             spawn_phone(app.handle().clone(), kick.clone());
-            // 훅을 이미 설치한 사용자가 0.3.0 으로 올라오면 **한 번만** 첨부 이미지 폴더 읽기 허용을 더한다(바뀐 점에 적어 둠).
+            // 훅을 이미 설치했는데 첨부 이미지 폴더 읽기 허용이 빠진 사용자에게 **한 번만** 규칙을 더한다(0.10.1 — 0.3.0 의 옛 1회용
+            // 표식 `install.read_rule_once` 가 남아 0.8.0 에서 올라온 사용자가 못 받던 것을 새 표식으로 한 번 더). 훅 미설치면 아무것도 안 한다.
             // 사용자가 그 뒤 규칙을 지웠으면 다시 넣지 않는다 — 그다음은 설정의 "다시 설치" 로만.
             std::thread::spawn(|| {
                 let Ok(conn) = db::open(&paths::db_path()) else { return };
-                if db::get_meta(&conn, "install.read_rule_once").is_some() {
-                    return;
-                }
-                if install::ensure_read_rule().is_ok() {
-                    let _ = db::set_meta(&conn, "install.read_rule_once", &time::now_iso());
-                }
+                let _ = install::read_rule_fix_once(&conn);
             });
             spawn_relay(app.handle().clone());
             update::spawn(app.handle().clone());

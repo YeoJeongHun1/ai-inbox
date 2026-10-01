@@ -114,12 +114,16 @@ fn strip_rule(settings: &mut Value) -> bool {
 
 fn add_rule(settings: &mut Value) -> Result<(), String> {
     let Some(rule) = read_rule() else { return Ok(()) };
+    add_rule_of(settings, &rule)
+}
+
+fn add_rule_of(settings: &mut Value, rule: &str) -> Result<(), String> {
     let root = settings.as_object_mut().ok_or("settings.json 최상위가 객체가 아닙니다")?;
     let perms = root.entry("permissions").or_insert_with(|| json!({}));
     let perms = perms.as_object_mut().ok_or("settings.json 의 permissions 가 객체가 아닙니다")?;
     let allow = perms.entry("allow").or_insert_with(|| json!([]));
     let allow = allow.as_array_mut().ok_or("settings.json 의 permissions.allow 가 배열이 아닙니다")?;
-    if !allow.iter().any(|r| r.as_str() == Some(rule.as_str())) {
+    if !allow.iter().any(|r| r.as_str() == Some(rule)) {
         allow.push(json!(rule));
     }
     Ok(())
@@ -127,25 +131,68 @@ fn add_rule(settings: &mut Value) -> Result<(), String> {
 
 fn has_rule(settings: &Value) -> bool {
     let Some(rule) = read_rule() else { return true };
+    has_rule_of(settings, &rule)
+}
+
+fn has_rule_of(settings: &Value, rule: &str) -> bool {
     settings
         .get("permissions")
         .and_then(|p| p.get("allow"))
         .and_then(Value::as_array)
-        .is_some_and(|a| a.iter().any(|r| r.as_str() == Some(rule.as_str())))
+        .is_some_and(|a| a.iter().any(|r| r.as_str() == Some(rule)))
 }
 
-/// 훅을 이미 설치한 사용자가 새 버전으로 올라오면 읽기 규칙만 더한다(훅은 건드리지 않는다). 더했으면 true.
-pub fn ensure_read_rule() -> Result<bool, String> {
-    let st = status()?;
-    if !st.read_missing {
+/// 우리 `hook` 훅이 하나라도 걸려 있나(실행 파일 경로는 따지지 않는다 — `status().installed_events` 가 비어 있지 않은 것과 같다)
+fn hooks_installed(settings: &Value) -> bool {
+    EVENTS.iter().any(|ev| settings.get("hooks").and_then(|h| h.get(*ev)).is_some_and(|g| !our_commands(g, "hook").is_empty()))
+}
+
+/// 0.10.1 한 번만 하는 보정의 표식(meta). 옛 1회용 표식 `install.read_rule_once`(0.3.0)가 이미 있어 0.8.0 → 0.10.x 로 올라온
+/// 사용자가 읽기 규칙을 못 받은 문제(`read_missing`)를 풀려고 따로 둔다. 한 번 시도한 뒤에는 사용자가 규칙을 지워도 다시 넣지 않는다.
+pub const READ_RULE_FIX_KEY: &str = "install.read_rule_fix_0101";
+const READ_RULE_OLD_KEY: &str = "install.read_rule_once";
+
+/// 앱 시작 때 한 번: 훅이 설치돼 있고 읽기 규칙이 빠졌으면 규칙만 더한다(훅·다른 설정은 건드리지 않는다). 더했으면 true.
+/// 훅 미설치 사용자는 아무것도 바꾸지 않는다(나중에 "훅 설치"가 규칙을 함께 넣는다).
+pub fn read_rule_fix_once(conn: &rusqlite::Connection) -> Result<bool, String> {
+    read_rule_fix_at(conn, &paths::settings_path(), read_rule().as_deref())
+}
+
+fn read_rule_fix_at(conn: &rusqlite::Connection, path: &Path, rule: Option<&str>) -> Result<bool, String> {
+    use crate::db;
+    if db::get_meta(conn, READ_RULE_FIX_KEY).is_some() {
         return Ok(false);
     }
-    let path = paths::settings_path();
-    let loaded = read_settings(&path)?;
+    // 표식을 먼저 남긴다 — 표식을 못 남기는 상태(DB 준비 전)면 설정도 건드리지 않고 다음 실행에 다시 본다(두 번 넣는 일이 없게)
+    let now = crate::time::now_iso();
+    db::set_meta(conn, READ_RULE_FIX_KEY, &now).map_err(|e| e.to_string())?;
+    match add_missing_rule_at(path, rule) {
+        Ok(added) => {
+            // 0.10.0 이하로 되돌아가도 옛 1회용 보정이 다시 돌지 않게
+            if db::get_meta(conn, READ_RULE_OLD_KEY).is_none() {
+                let _ = db::set_meta(conn, READ_RULE_OLD_KEY, &now);
+            }
+            Ok(added)
+        }
+        Err(err) => {
+            // 읽기 실패·동시 수정 등으로 못 했으면 다음 실행에 한 번 더 본다
+            let _ = conn.execute("DELETE FROM meta WHERE key = ?1", [READ_RULE_FIX_KEY]);
+            Err(err)
+        }
+    }
+}
+
+/// 훅이 있고 규칙이 없을 때만 규칙을 더한다(데이터 폴더가 바뀐 옛 규칙은 지금 것으로 바꾼다)
+fn add_missing_rule_at(path: &Path, rule: Option<&str>) -> Result<bool, String> {
+    let Some(rule) = rule else { return Ok(false) };
+    let loaded = read_settings(path)?;
+    if !hooks_installed(&loaded.value) || has_rule_of(&loaded.value, rule) {
+        return Ok(false);
+    }
     let mut settings = loaded.value.clone();
     strip_rule(&mut settings);
-    add_rule(&mut settings)?;
-    write_settings(&path, &loaded, &settings)?;
+    add_rule_of(&mut settings, rule)?;
+    write_settings(path, &loaded, &settings)?;
     Ok(true)
 }
 
@@ -528,6 +575,112 @@ mod tests {
         assert_eq!(rule_for_dir(r"\\server\share\attachments", true), None, "네트워크 경로는 넣지 않는다");
         assert_eq!(rule_for_dir("/Users/me/x", false).as_deref(), Some("Read(//Users/me/x/**)"));
         assert_eq!(rule_for_dir("/Users/me/a)b", false), None);
+    }
+
+    fn meta_db() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&c).unwrap();
+        c
+    }
+
+    fn temp_settings(name: &str, value: Option<Value>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aiinbox-readfix-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        if let Some(v) = value {
+            std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        }
+        path
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn allow_of(path: &Path) -> Vec<String> {
+        read_json(path)["permissions"]["allow"].as_array().map(|a| a.iter().filter_map(|r| r.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    }
+
+    fn with_hook(cmd: &str) -> Value {
+        json!({
+            "model": "opus",
+            "hooks": { "Stop": [ {"hooks": [{"type": "command", "command": "/opt/tools/other-hook.sh"}]}, {"hooks": [{"type": "command", "command": cmd}]} ] },
+            "permissions": { "allow": ["Bash(git status:*)"] }
+        })
+    }
+
+    #[test]
+    fn read_rule_fix_runs_once_for_users_with_hooks_and_missing_rule() {
+        // 0.8.0 에서 올라온 사용자: 훅은 있고 규칙이 없으며, 옛 1회용 표식은 이미 있다
+        let rule = "Read(//Users/me/Library/Application Support/com.yeojeonghun.ai-inbox/attachments/**)";
+        let path = temp_settings("mac", Some(with_hook(OURS_MAC)));
+        let c = meta_db();
+        crate::db::set_meta(&c, READ_RULE_OLD_KEY, "2026-01-01T00:00:00Z").unwrap();
+        assert!(read_rule_fix_at(&c, &path, Some(rule)).unwrap(), "한 번은 넣는다");
+        assert_eq!(allow_of(&path), vec!["Bash(git status:*)".to_string(), rule.to_string()]);
+        let v = read_json(&path);
+        assert_eq!(v["model"], "opus");
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 2, "훅은 건드리지 않는다");
+        assert!(path.with_file_name("settings.json.ai-inbox-backup").exists(), "바꾸기 전 사본");
+        assert!(crate::db::get_meta(&c, READ_RULE_FIX_KEY).is_some());
+        // 사용자가 그 뒤 규칙을 지우면 다시 넣지 않는다
+        let mut v = read_json(&path);
+        v["permissions"]["allow"] = json!(["Bash(git status:*)"]);
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        assert!(!read_rule_fix_at(&c, &path, Some(rule)).unwrap());
+        assert_eq!(allow_of(&path), vec!["Bash(git status:*)".to_string()]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn read_rule_fix_leaves_users_without_hooks_alone() {
+        let rule = "Read(//Users/me/x/com.yeojeonghun.ai-inbox/attachments/**)";
+        // 훅 미설치(남의 훅만) · 설정 파일 없음 — 아무것도 쓰지 않는다
+        let path = temp_settings("nohook", Some(json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "\"/opt/tools/my-ai-inbox\" hook"}]}]}})));
+        let before = std::fs::read_to_string(&path).unwrap();
+        let c = meta_db();
+        assert!(!read_rule_fix_at(&c, &path, Some(rule)).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(!path.with_file_name("settings.json.ai-inbox-backup").exists());
+        let missing = temp_settings("nofile", None);
+        let c2 = meta_db();
+        assert!(!read_rule_fix_at(&c2, &missing, Some(rule)).unwrap());
+        assert!(!missing.exists(), "설정 파일을 새로 만들지 않는다");
+        // 한 번 본 뒤에 훅을 설치하면(설치가 규칙을 함께 넣는다) 이 보정은 다시 돌지 않는다
+        std::fs::write(&missing, serde_json::to_string(&with_hook(OURS_MAC)).unwrap()).unwrap();
+        assert!(!read_rule_fix_at(&c2, &missing, Some(rule)).unwrap());
+        assert_eq!(allow_of(&missing), vec!["Bash(git status:*)".to_string()]);
+        // 규칙이 이미 있으면 그대로
+        let has = temp_settings("has", Some(json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": OURS_MAC}]}]}, "permissions": {"allow": [rule]}})));
+        let before = std::fs::read_to_string(&has).unwrap();
+        assert!(!read_rule_fix_at(&meta_db(), &has, Some(rule)).unwrap());
+        assert_eq!(std::fs::read_to_string(&has).unwrap(), before);
+        for p in [&path, &missing, &has] {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn read_rule_fix_uses_the_windows_rule_form_and_replaces_an_old_data_folder_rule() {
+        let rule = rule_for_dir(r"C:\Users\me\AppData\Local\com.yeojeonghun.ai-inbox\attachments", true).unwrap();
+        assert_eq!(rule, "Read(//c/Users/me/AppData/Local/com.yeojeonghun.ai-inbox/attachments/**)");
+        let mut s = with_hook(OURS_WIN);
+        // 옛 데이터 폴더를 가리키던 우리 규칙은 지금 것으로 바뀐다(남의 규칙은 그대로)
+        s["permissions"]["allow"] = json!(["Bash(git status:*)", "Read(//d/old/com.yeojeonghun.ai-inbox/attachments/**)"]);
+        let path = temp_settings("win", Some(s));
+        let c = meta_db();
+        assert!(read_rule_fix_at(&c, &path, Some(&rule)).unwrap());
+        assert_eq!(allow_of(&path), vec!["Bash(git status:*)".to_string(), rule.clone()]);
+        // 실패(설정 JSON 이 깨짐)면 표식을 남기지 않아 다음 실행에 다시 본다
+        let broken = temp_settings("broken", None);
+        std::fs::write(&broken, "{ not json").unwrap();
+        let c2 = meta_db();
+        assert!(read_rule_fix_at(&c2, &broken, Some(&rule)).is_err());
+        assert!(crate::db::get_meta(&c2, READ_RULE_FIX_KEY).is_none());
+        for p in [&path, &broken] {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
     }
 
     #[test]

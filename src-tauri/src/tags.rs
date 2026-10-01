@@ -485,11 +485,11 @@ fn worktree_main(git_file: &std::path::Path) -> Option<std::path::PathBuf> {
 pub struct HookPrompt {
     pub session_id: String,
     pub at_ms: i64,
-    pub cwd: Option<String>,
     /// 규칙 매칭용 프롬프트 글(앞 3,000자) — 메모리에서만 쓰고 저장하지 않는다
     pub prompt: String,
     pub key: String,
     pub hashtags: Vec<String>,
+    /// 작업 폴더의 git 최상위(경로, 이름) — 폴더 표식으로만 남기고, 붙일지는 요청이 다룬 경로로 수집기가 정한다(0.10.1)
     pub project: Option<(String, String)>,
     /// 앱이 직접 기록한 것(입력창·폰) — 지문이 같을 때만 잇는다(시각만 비슷한 다른 요청을 잡지 않게)
     pub exact: bool,
@@ -505,7 +505,6 @@ impl HookPrompt {
         Some(HookPrompt {
             session_id: s("session_id")?,
             at_ms: v.get("received_at_ms").and_then(Value::as_i64).unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
-            cwd: s("cwd"),
             prompt: text::clip(&s("prompt_head").unwrap_or_default(), 3000),
             key,
             hashtags: v
@@ -537,7 +536,6 @@ impl HookPrompt {
         HookPrompt {
             session_id: session_id.to_string(),
             at_ms: chrono::Utc::now().timestamp_millis(),
-            cwd,
             prompt: text::clip(body, 3000),
             key: prompt_key(&typed_body(body)),
             hashtags: parse_hashtags(body),
@@ -610,87 +608,88 @@ fn ensure_project_tag(conn: &Connection, root: &str, name: &str) {
     let _ = conn.execute("INSERT OR IGNORE INTO tag_rule (tag_id, kind, pattern, source) VALUES (?1, 'path', ?2, ?3)", params![tag_id, nfc_hangul(&rule), SRC_HOOK]);
 }
 
-/// 요청 시점 텍스트·폴더로 태그를 정한다. 근거 순서:
+/// 요청 시점 글로 태그를 정한다. 근거 순서:
 /// 1. 프롬프트에 직접 쓴 `#태그`(있으면 그것만)
 /// 2. 사용자·기본 규칙의 낱말이 프롬프트에 있고 그 중 큰(종류가 아닌) 태그가 있으면 그 결과
-/// 3. 작업 폴더(경로 규칙 — git 최상위 폴더로 자동 만든 프로젝트 규칙 포함) + 종류 태그의 낱말
+/// 3. 종류 태그의 낱말
 /// 4. 24자 이하의 짧은 말이면 같은 세션의 직전 요청(12시간 안)의 태그 이어받기
 /// 5. 없음(미분류)
-fn decide(conn: &Connection, p: &HookPrompt) -> (Vec<i64>, &'static str) {
+///
+/// **폴더 규칙은 여기서 정하지 않는다**(0.10.1, A안): 1·2 로 정해지지 않은 요청은 세 번째 값(폴더 표식 —
+/// git 최상위 폴더 `<경로>\n<이름>`, 저장소 밖이면 빈 글)을 받고, 수집기가 그 요청이 **실제로 읽거나 고친 경로**(`turn_touch`)를
+/// 확정한 뒤 `attach_folder` 가 경로 규칙에 드는 태그만 더한다. 작업 폴더(cwd)만으로는 붙이지 않는다.
+fn decide(conn: &Connection, p: &HookPrompt) -> (Vec<i64>, &'static str, Option<String>) {
     if !p.hashtags.is_empty() {
         let ids: Vec<i64> = p.hashtags.iter().filter_map(|n| ensure_tag(conn, n)).collect();
         if !ids.is_empty() {
-            return (ids, "hashtag");
+            return (ids, "hashtag", None);
         }
     }
-    let mut rs = load_rules(conn);
+    let rs = load_rules(conn);
     let minor: HashSet<i64> = conn
         .prepare("SELECT id FROM tag WHERE minor = 1")
         .and_then(|mut st| st.query_map([], |r| r.get::<_, i64>(0)).map(|rows| rows.flatten().collect()))
         .unwrap_or_default();
     let body = typed_body(&p.prompt);
-    let mut sig = Signals { prompt: norm(&text::clip(body.trim(), 4000)), ..Default::default() };
+    let sig = Signals { prompt: norm(&text::clip(body.trim(), 4000)), ..Default::default() };
     let found = classify(&rs, &sig);
     if found.iter().any(|(id, _)| !minor.contains(id)) {
-        return (found.into_iter().map(|f| f.0).collect(), "rule");
+        return (found.into_iter().map(|f| f.0).collect(), "rule", None);
     }
-    // 낱말로 정해지지 않았으면 작업 폴더가 근거 — git 최상위 폴더의 프로젝트 태그가 없으면 이때 만든다
-    if let Some((root, name)) = &p.project {
-        ensure_project_tag(conn, root, name);
-        rs = load_rules(conn);
-    }
-    if let Some(cwd) = &p.cwd {
-        sig.dirs = vec![as_dir(cwd)];
-    }
-    let found = classify(&rs, &sig);
+    // 낱말로 정해지지 않았다 — 폴더 규칙은 요청이 다룬 경로가 확정된 뒤(수집기) 본다. 지금은 표식만 남긴다
+    let folder = Some(p.project.as_ref().map(|(root, name)| format!("{root}\n{name}")).unwrap_or_default());
     if !found.is_empty() {
-        let src = if found.iter().any(|(id, _)| !minor.contains(id)) { "project" } else { "kind" };
-        return (found.into_iter().map(|f| f.0).collect(), src);
+        return (found.into_iter().map(|f| f.0).collect(), "kind", folder);
     }
     if body.trim().chars().count() <= INHERIT_MAX_CHARS {
         let ids = inherited_from_previous(conn, &p.session_id, p.at_ms);
         if !ids.is_empty() {
-            return (ids, "inherit");
+            return (ids, "inherit", folder);
         }
     }
-    (vec![], "none")
+    (vec![], "none", folder)
 }
 
-/// 같은 세션의 직전 요청(12시간 안)이 가진 태그 — 그 요청이 이미 대화 기록과 이어졌으면 지금의 태그(사용자가 고친 것 포함), 아니면 훅이 정한 태그
+/// 같은 세션의 직전 요청(12시간 안)이 가진 태그 — 그 요청이 이미 대화 기록과 이어졌으면 지금의 태그(사용자가 고친 것·폴더 규칙으로
+/// 나중에 붙은 것 포함), 아니면 훅이 정한 태그. 아무 신호가 없던 요청(`none`)은 건너뛴다 — 단 폴더 규칙을 기다리던 요청(폴더 표식)은
+/// 다룬 경로로 태그가 붙었으면 그것을 이어받는다.
 fn inherited_from_previous(conn: &Connection, sid: &str, at_ms: i64) -> Vec<i64> {
-    let prev: Option<(i64, String, Option<i64>)> = conn
-        .query_row(
-            "SELECT at_ms, tag_ids, turn_id FROM turn_hint WHERE session_id = ?1 AND at_ms < ?2 AND src != 'none' ORDER BY at_ms DESC LIMIT 1",
-            params![sid, at_ms],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    let rows: Vec<(String, String, Option<i64>)> = conn
+        .prepare(
+            "SELECT src, tag_ids, turn_id FROM turn_hint WHERE session_id = ?1 AND at_ms < ?2 AND at_ms >= ?3
+               AND (src != 'none' OR folder IS NOT NULL) ORDER BY at_ms DESC LIMIT 20",
         )
-        .optional()
-        .ok()
-        .flatten();
-    let Some((pat, ids, turn)) = prev else { return vec![] };
-    if at_ms - pat > INHERIT_MAX_HOURS * 3600_000 {
-        return vec![];
+        .and_then(|mut st| {
+            st.query_map(params![sid, at_ms, at_ms - INHERIT_MAX_HOURS * 3600_000], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    for (src, ids, turn) in rows {
+        let mut out = match turn {
+            Some(t) => conn
+                .prepare("SELECT tag_id FROM turn_tag WHERE turn_id = ?1 AND state IN ('auto','manual') ORDER BY tag_id")
+                .and_then(|mut st| st.query_map(params![t], |r| r.get::<_, i64>(0)).map(|rows| rows.flatten().collect::<Vec<_>>()))
+                .unwrap_or_default(),
+            None => parse_ids(&ids),
+        };
+        out.retain(|id| conn.query_row("SELECT COUNT(*) FROM tag WHERE id = ?1", params![id], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false));
+        if src == "none" && out.is_empty() {
+            continue; // 폴더 근거도 끝내 없었던 요청 — 신호 없는 요청으로 보고 그 앞을 본다
+        }
+        return out;
     }
-    let mut out = match turn {
-        Some(t) => conn
-            .prepare("SELECT tag_id FROM turn_tag WHERE turn_id = ?1 AND state IN ('auto','manual') ORDER BY tag_id")
-            .and_then(|mut st| st.query_map(params![t], |r| r.get::<_, i64>(0)).map(|rows| rows.flatten().collect::<Vec<_>>()))
-            .unwrap_or_default(),
-        None => parse_ids(&ids),
-    };
-    out.retain(|id| conn.query_row("SELECT COUNT(*) FROM tag WHERE id = ?1", params![id], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false));
-    out
+    vec![]
 }
 
 /// 요청 시점 기록 하나를 처리한다: 태그를 정해 `turn_hint` 에 남기고, 같은 요청이 이미 대화 기록에 있으면 바로 잇는다.
 /// 반환: (태그 id 들, 근거, 요청에 바로 이어졌는가)
 pub fn record_prompt(conn: &Connection, p: &HookPrompt) -> (Vec<i64>, &'static str, bool) {
-    let (ids, src) = decide(conn, p);
+    let (ids, src, folder) = decide(conn, p);
     let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     if conn
         .execute(
-            "INSERT INTO turn_hint (session_id, key, at_ms, src, tag_ids, exact) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![p.session_id, p.key, p.at_ms, src, list, p.exact as i64],
+            "INSERT INTO turn_hint (session_id, key, at_ms, src, tag_ids, exact, folder) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![p.session_id, p.key, p.at_ms, src, list, p.exact as i64, folder],
         )
         .is_err()
     {
@@ -714,6 +713,8 @@ pub fn record_prompt(conn: &Connection, p: &HookPrompt) -> (Vec<i64>, &'static s
     let attached = match pick(&cands, &p.key, p.at_ms, p.exact) {
         Some(turn) => {
             apply_hint(conn, hint, turn, &ids, src);
+            // 요청이 먼저 읽혀 다룬 경로가 이미 있으면 폴더 규칙도 바로 본다
+            attach_folder(conn, turn);
             true
         }
         None => false,
@@ -792,6 +793,60 @@ pub fn attach_for_turn(conn: &Connection, sid: &str, turn_id: i64, prompt_text: 
     };
     apply_hint(conn, id, turn_id, &parse_ids(&h.4), src);
     true
+}
+
+/// 폴더 규칙(0.10.1, A안): 요청이 **실제로 읽거나 고친 경로**(`turn_touch`)가 경로 규칙에 들 때만 그 태그를 더한다.
+/// 이 요청의 훅 기록에 폴더 표식(`turn_hint.folder`)이 있을 때만 — `#태그`·낱말로 정한 요청과 0.10.0 이하의 기록(표식 NULL)은
+/// 건드리지 않는다(지난 요청을 다시 계산하지 않는다). 작업 폴더의 git 최상위 아래 경로를 다뤘는데 그 폴더를 덮는 규칙이 없으면
+/// 이때 프로젝트 태그를 만든다(사용자가 지운 것은 다시 안 만든다). 수동·뗌 표식은 덮지 않는다(모델 제안만 대체).
+/// 수집기가 요청을 쓸 때마다 부른다(작업 중 다룬 경로가 늘면 그때 붙는다) — 표식이 없으면 조회 한 번으로 끝난다. 새로 붙었으면 true.
+pub fn attach_folder(conn: &Connection, turn_id: i64) -> bool {
+    let folder: Option<String> = conn
+        .query_row("SELECT folder FROM turn_hint WHERE turn_id = ?1 AND folder IS NOT NULL LIMIT 1", params![turn_id], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten();
+    let Some(folder) = folder else { return false };
+    let touched: Vec<String> = conn
+        .query_row("SELECT paths FROM turn_touch WHERE turn_id = ?1", params![turn_id], |r| r.get::<_, String>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .map(|s| s.lines().filter(|p| !p.trim().is_empty()).map(as_dir).collect())
+        .unwrap_or_default();
+    if touched.is_empty() {
+        return false;
+    }
+    let now = time::now_iso();
+    let mut added = false;
+    for tid in folder_tags(conn, &folder, &touched) {
+        let n = conn
+            .execute(
+                "INSERT INTO turn_tag (turn_id, tag_id, state, score, at, src) VALUES (?1, ?2, 'auto', 4.0, ?3, ?4)
+                 ON CONFLICT(turn_id, tag_id) DO UPDATE SET state = 'auto', score = excluded.score, at = excluded.at, src = excluded.src WHERE turn_tag.state = 'ai'",
+                params![turn_id, tid, now, SRC_HOOK],
+            )
+            .unwrap_or(0);
+        added |= n > 0;
+    }
+    added
+}
+
+/// 다룬 경로(`as_dir` 꼴)가 드는 경로 규칙의 태그들. `folder` = 훅이 본 git 최상위(`<경로>\n<이름>`, 저장소 밖이면 빈 글)
+fn folder_tags(conn: &Connection, folder: &str, touched: &[String]) -> Vec<i64> {
+    if let Some((root, name)) = folder.split_once('\n') {
+        let pat = as_dir(root);
+        if pat.len() > 1 && touched.iter().any(|t| t.starts_with(&pat)) {
+            ensure_project_tag(conn, root, name);
+        }
+    }
+    load_rules(conn)
+        .tags
+        .iter()
+        .filter(|t| t.paths.iter().any(|r| touched.iter().any(|p| p.contains(r.as_str()))))
+        .map(|t| t.id)
+        .take(MAX_AUTO_TAGS)
+        .collect()
 }
 
 /// 오래된 훅 기록을 지운다
@@ -1950,27 +2005,40 @@ mod tests {
         assert_eq!((src, ids.contains(&alpha), ids.contains(&deploy)), ("rule", true, true));
         assert_eq!(all_tag_names(&c), before, "이 경우 프로젝트 태그는 만들어지지 않는다(#태그·낱말 규칙이 먼저 — 폴더 신호는 아래 단계)");
 
-        // (c) 낱말이 없으면 작업 폴더 → git 최상위 폴더 이름으로 프로젝트 태그가 **DB 에** 자동 생성된다
-        let (ids, src, _) = record_prompt(&c, &hook_prompt("s1", T0 + 120_000, &cwd, "이 화면 좀 봐줘 자세히 부탁해요"));
-        assert_eq!(src, "project");
+        // (c) 낱말이 없으면 요청 시점엔 미분류 — 작업 폴더(cwd)만으로는 붙이지도, 프로젝트 태그를 만들지도 않는다(0.10.1, A안)
+        // (24자 넘는 글 — 짧은 말은 앞 요청의 태그를 이어받는다)
+        let p = "이 화면 구성이 어색한데 어디가 문제인지 자세히 봐 주세요";
+        let (ids, src, _) = record_prompt(&c, &hook_prompt("s1", T0 + 120_000, &cwd, p));
+        assert_eq!((ids.len(), src), (0, "none"));
+        assert!(!all_tag_names(&c).contains(&"delta".to_string()), "작업 폴더만으로는 프로젝트 태그를 만들지 않는다");
+        // 그 요청이 저장소 안 경로를 실제로 다룬 것이 수집기에서 확정되면 그때 git 최상위 폴더 이름으로 프로젝트 태그가 **DB 에** 생기고 붙는다
+        let t1 = turn_touching(&c, "s1", "u1", T0 + 120_500, p, &[&repo.join("src/deep/a.rs")]);
         let proj: i64 = c.query_row("SELECT id FROM tag WHERE name = 'delta'", [], |r| r.get(0)).expect("delta 태그 생성");
-        assert_eq!(ids, vec![proj]);
+        assert_eq!(state_rows(&c, t1), vec![("delta".into(), "auto".into(), Some("hook".into()))]);
         let (kind, source): (String, String) = c.query_row("SELECT kind, source FROM tag_rule WHERE tag_id = ?1", [proj], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((kind.as_str(), source.as_str()), ("path", "hook"), "폴더 경로 규칙(출처 hook)이 함께 생긴다");
-        // 종류 태그 낱말은 요청 시점 글로 계산: 프로젝트 + 배포
-        let (ids, src, _) = record_prompt(&c, &hook_prompt("s1", T0 + 180_000, &cwd, "지금 배포 좀 해줘 제발 부탁해"));
-        assert_eq!((src, ids.len(), ids.contains(&proj), ids.contains(&deploy)), ("project", 2, true, true));
+        // 종류 태그 낱말은 요청 시점 글로 계산(배포), 프로젝트는 경로를 다뤘을 때 더해진다
+        let p2 = "지금 배포 좀 해줘 제발 부탁해";
+        let (ids, src, _) = record_prompt(&c, &hook_prompt("s1", T0 + 180_000, &cwd, p2));
+        assert_eq!((ids, src), (vec![deploy], "kind"));
+        let t2 = turn_touching(&c, "s1", "u2", T0 + 180_500, p2, &[&repo.join("src/main.rs")]);
+        assert_eq!(state_rows(&c, t2).iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec!["delta".to_string(), "배포".to_string()]);
         assert_eq!(c.query_row("SELECT COUNT(*) FROM tag WHERE name = 'delta'", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "같은 폴더는 태그를 또 만들지 않는다");
 
         // 이름 바꾸기·색 지정 뒤에도 같은 폴더는 그 태그로(다시 만들지 않는다)
         update_tag(&c, proj, Some("델타 앱"), Some("#112233"), None).unwrap();
-        let (ids, _, _) = record_prompt(&c, &hook_prompt("s1", T0 + 240_000, &cwd, "화면 하나 더 봐줘 자세히 부탁해요"));
-        assert_eq!(ids, vec![proj]);
+        let p3 = "다른 화면도 하나 더 열어서 무엇이 어색한지 봐 주세요";
+        record_prompt(&c, &hook_prompt("s1", T0 + 240_000, &cwd, p3));
+        let t3 = turn_touching(&c, "s1", "u3", T0 + 240_500, p3, &[&repo.join("src/view.rs")]);
+        assert_eq!(state_rows(&c, t3).iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec!["델타 앱".to_string()]);
         assert!(!all_tag_names(&c).contains(&"delta".to_string()));
         // 사용자가 그 폴더 규칙·태그를 지우면 다시 만들지 않는다
         delete_tag(&c, proj).unwrap();
-        let (ids, src, _) = record_prompt(&c, &hook_prompt("s2", T0 + 300_000, &cwd, "이 화면 좀 봐줘 자세히 부탁해요"));
-        assert!((ids.is_empty(), src) == (true, "none"), "지운 프로젝트는 되살리지 않는다: {ids:?} {src}");
+        session(&c, "s2", &cwd);
+        record_prompt(&c, &hook_prompt("s2", T0 + 300_000, &cwd, p));
+        let t4 = turn_touching(&c, "s2", "u4", T0 + 300_500, p, &[&repo.join("src/view.rs")]);
+        assert!(state_rows(&c, t4).is_empty(), "지운 프로젝트는 되살리지 않는다");
+        assert!(!all_tag_names(&c).iter().any(|n| n == "delta" || n == "델타 앱"));
 
         // 저장소도 규칙도 없는 폴더 → 미분류(없음)
         let (ids, src, _) = record_prompt(&c, &hook_prompt("s3", T0, "/nowhere/plain", "그냥 궁금한 게 있어서 물어봅니다"));
@@ -1986,8 +2054,12 @@ mod tests {
         session(&c, "s1", &cwd);
         // 사용자가 이미 그 폴더를 다른 이름의 태그로 만들어 둔 경우 — 자동 생성하지 않고 그 태그를 쓴다
         let mine = tag(&c, "내 앱", &[], &["/epsilon/"]);
-        let (ids, src, _) = record_prompt(&c, &hook_prompt("s1", T0, &cwd, "이 화면 좀 봐줘 자세히 부탁해요"));
-        assert_eq!((ids, src), (vec![mine], "project"));
+        let p = "이 화면 좀 봐줘 자세히 부탁해요";
+        let (ids, src, _) = record_prompt(&c, &hook_prompt("s1", T0, &cwd, p));
+        assert_eq!((ids.len(), src), (0, "none"), "작업 폴더 규칙도 요청 시점엔 붙이지 않는다");
+        let t = turn_touching(&c, "s1", "u1", T0 + 500, p, &[&repo.join("src/a.rs")]);
+        assert_eq!(state_rows(&c, t), vec![("내 앱".into(), "auto".into(), Some("hook".into()))]);
+        assert!(tags_of_turns(&c, &[t])[&t].iter().any(|x| x.id == mine));
         assert_eq!(all_tag_names(&c), vec!["내 앱".to_string()]);
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
@@ -2026,6 +2098,156 @@ mod tests {
             .unwrap()
             .flatten()
             .collect()
+    }
+
+    /// 수집기가 하는 일 그대로: 요청을 쓰고 → 다룬 경로(`turn_touch`)를 저장하고 → 훅 기록을 잇고 → 폴더 규칙을 본다
+    fn turn_touching(c: &Connection, sid: &str, uuid: &str, at_ms: i64, text: &str, paths: &[&std::path::Path]) -> i64 {
+        let t = insert_turn(c, sid, uuid, at_ms, text);
+        let mut set = BTreeSet::new();
+        for p in paths {
+            collect_touched(&mut set, "Read", &json!({ "file_path": p.to_string_lossy() }));
+        }
+        save_touched(c, t, &set);
+        attach_for_turn(c, sid, t, text, &iso(at_ms));
+        attach_folder(c, t);
+        t
+    }
+
+    #[test]
+    fn folder_rule_needs_the_request_to_touch_that_folder() {
+        // 0.10.1 A안: 폴더 규칙은 그 요청이 실제로 그 폴더의 경로를 읽거나 고쳤을 때만
+        let c = clean();
+        let alpha = fake_repo("alpha");
+        let beta = fake_repo("beta");
+        let cwd = alpha.to_string_lossy().into_owned();
+        session(&c, "s1", &cwd);
+        // 근거 없는 요청(경로를 안 다룸) → 미분류, 태그도 안 생긴다
+        let q = "오늘 서울 날씨가 어떤지 우산을 챙겨야 하는지 알려 줘";
+        record_prompt(&c, &hook_prompt("s1", T0, &cwd, q));
+        let t0 = turn_touching(&c, "s1", "u0", T0 + 300, q, &[]);
+        assert!(state_rows(&c, t0).is_empty());
+        assert!(all_tag_names(&c).is_empty());
+        assert_eq!(overview(&c).untagged, 1);
+        // 다른 레포만 다룬 요청 → 작업 폴더(alpha)의 태그는 안 붙는다. 그 레포에 경로 규칙이 있으면 그 태그
+        let q = "옆 저장소의 설정 파일을 열어서 무슨 값이 있는지 읽어 줘";
+        record_prompt(&c, &hook_prompt("s1", T0 + 60_000, &cwd, q));
+        let t1 = turn_touching(&c, "s1", "u1", T0 + 60_300, q, &[&beta.join("src/conf.toml")]);
+        assert!(state_rows(&c, t1).is_empty(), "다른 레포를 다룬 요청엔 작업 폴더 태그가 안 붙는다");
+        assert!(all_tag_names(&c).is_empty());
+        let b = tag(&c, "베타", &[], &["/beta/"]);
+        let q = "옆 저장소의 설정 파일을 하나 더 열어서 무슨 값인지 읽어 줘";
+        record_prompt(&c, &hook_prompt("s1", T0 + 120_000, &cwd, q));
+        let t2 = turn_touching(&c, "s1", "u2", T0 + 120_300, q, &[&beta.join("src/conf.toml")]);
+        assert_eq!(state_rows(&c, t2).iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec!["베타".to_string()]);
+        // 작업 폴더 경로를 다룬 요청 → 붙는다. 다룬 경로가 작업 중에 늘어나면 그때(같은 요청을 다시 쓸 때) 붙는다
+        let q = "이 저장소의 로그인 화면이 어색하니 코드를 고쳐서 손봐 줘";
+        record_prompt(&c, &hook_prompt("s1", T0 + 180_000, &cwd, q));
+        let t3 = turn_touching(&c, "s1", "u3", T0 + 180_300, q, &[]);
+        assert!(state_rows(&c, t3).is_empty());
+        let mut set = BTreeSet::new();
+        collect_touched(&mut set, "Edit", &json!({ "file_path": alpha.join("src/login.rs").to_string_lossy() }));
+        save_touched(&c, t3, &set);
+        assert!(attach_folder(&c, t3));
+        assert!(!attach_folder(&c, t3), "다시 써도 중복 없음");
+        assert_eq!(state_rows(&c, t3).iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec!["alpha".to_string()]);
+        // 앞 요청이 다룬 경로로 태그를 얻었으면 짧은 말은 그것을 이어받는다
+        let (ids, src, _) = record_prompt(&c, &hook_prompt("s1", T0 + 240_000, &cwd, "응 그렇게 해줘"));
+        let a: i64 = c.query_row("SELECT id FROM tag WHERE name = 'alpha'", [], |r| r.get(0)).unwrap();
+        assert_eq!((ids, src), (vec![a], "inherit"));
+        // #태그·낱말로 정한 요청엔 폴더 규칙을 더하지 않는다(그 단계가 결정하면 멈춘다)
+        let q = "로그인 고쳐 줘 #인증";
+        record_prompt(&c, &hook_prompt("s1", T0 + 300_000, &cwd, q));
+        let t5 = turn_touching(&c, "s1", "u5", T0 + 300_300, q, &[&alpha.join("src/login.rs")]);
+        assert_eq!(state_rows(&c, t5).iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec!["인증".to_string()]);
+        // 수집기가 먼저 읽은 요청(경로까지 저장된 뒤 훅 기록이 온 경우)도 같은 결과
+        let q = "이 저장소의 문서를 한 번 더 처음부터 끝까지 읽어 줘 부탁";
+        let t6 = insert_turn(&c, "s1", "u6", T0 + 360_000, q);
+        let mut set = BTreeSet::new();
+        collect_touched(&mut set, "Read", &json!({ "file_path": alpha.join("README.md").to_string_lossy() }));
+        save_touched(&c, t6, &set);
+        assert!(!attach_for_turn(&c, "s1", t6, q, &iso(T0 + 360_000)));
+        let (_, _, attached) = record_prompt(&c, &hook_prompt("s1", T0 + 359_800, &cwd, q));
+        assert!(attached);
+        assert_eq!(state_rows(&c, t6).iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec!["alpha".to_string()]);
+        let _ = b;
+        let _ = std::fs::remove_dir_all(alpha.parent().unwrap());
+        let _ = std::fs::remove_dir_all(beta.parent().unwrap());
+    }
+
+    #[test]
+    fn folder_rule_does_not_recompute_old_requests_or_override_manual_tags() {
+        let c = clean();
+        let repo = fake_repo("theta");
+        let cwd = repo.to_string_lossy().into_owned();
+        session(&c, "s1", &cwd);
+        let mine = tag(&c, "세타", &[], &["/theta/"]);
+        // 0.10.0 이하가 남긴 훅 기록(폴더 표식 없음): 'none' 이든 옛 'project' 든 다룬 경로가 맞아도 다시 계산하지 않는다
+        let old_none = insert_turn(&c, "s1", "u1", T0, "옛 요청 하나");
+        let old_proj = insert_turn(&c, "s1", "u2", T0 + 1_000, "옛 요청 둘");
+        c.execute("INSERT INTO turn_hint (session_id, key, at_ms, src, tag_ids, exact, turn_id) VALUES ('s1', 'k1', ?1, 'none', '', 0, ?2)", params![T0, old_none]).unwrap();
+        c.execute("INSERT INTO turn_hint (session_id, key, at_ms, src, tag_ids, exact, turn_id) VALUES ('s1', 'k2', ?1, 'project', '', 0, ?2)", params![T0 + 1_000, old_proj])
+            .unwrap();
+        for t in [old_none, old_proj] {
+            let mut set = BTreeSet::new();
+            collect_touched(&mut set, "Read", &json!({ "file_path": repo.join("src/a.rs").to_string_lossy() }));
+            save_touched(&c, t, &set);
+            for _ in 0..2 {
+                assert!(!attach_folder(&c, t), "지난 요청은 그대로");
+            }
+            assert!(state_rows(&c, t).is_empty());
+        }
+        // 훅 기록이 아예 없는 요청도 그대로(백필 없음)
+        let bare = insert_turn(&c, "s1", "u3", T0 + 2_000_000, "훅 없던 요청");
+        let mut set = BTreeSet::new();
+        collect_touched(&mut set, "Read", &json!({ "file_path": repo.join("src/a.rs").to_string_lossy() }));
+        save_touched(&c, bare, &set);
+        assert!(!attach_folder(&c, bare));
+        // 사용자가 미리 뗀(off) 태그는 다룬 경로가 맞아도 되살리지 않고, 직접 붙인(manual) 것은 그대로
+        let other = tag(&c, "기타", &[], &[]);
+        let q = "이 저장소 파일 하나 고쳐 줘 부탁";
+        record_prompt(&c, &hook_prompt("s1", T0 + 3_000_000, &cwd, q));
+        let t = insert_turn(&c, "s1", "u4", T0 + 3_000_300, q);
+        attach_for_turn(&c, "s1", t, q, &iso(T0 + 3_000_300));
+        set_turn_tag(&c, t, mine, false).unwrap();
+        set_turn_tag(&c, t, other, true).unwrap();
+        let mut set = BTreeSet::new();
+        collect_touched(&mut set, "Edit", &json!({ "file_path": repo.join("src/a.rs").to_string_lossy() }));
+        save_touched(&c, t, &set);
+        assert!(!attach_folder(&c, t));
+        let rows = state_rows(&c, t);
+        assert!(rows.contains(&("세타".into(), "off".into(), None)), "{rows:?}");
+        assert!(rows.contains(&("기타".into(), "manual".into(), None)), "{rows:?}");
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[test]
+    fn folder_rule_matches_windows_paths_by_drive_and_slashes() {
+        // Windows: 훅이 본 git 최상위(`C:\…`)와 도구 대상 경로(`C:/…`·`c:\…`)를 같은 꼴로 맞춘다
+        let _rules = path_rules(true);
+        let c = clean();
+        session(&c, "s1", r"C:\Users\me\work\iota");
+        let mut hp = hook_prompt("s1", T0, "/nowhere", "이 화면 좀 봐줘 자세히 부탁해요");
+        hp.project = Some((r"C:\Users\me\work\iota".into(), "iota".into()));
+        record_prompt(&c, &hp);
+        let t = insert_turn(&c, "s1", "u1", T0 + 300, "이 화면 좀 봐줘 자세히 부탁해요");
+        attach_for_turn(&c, "s1", t, "이 화면 좀 봐줘 자세히 부탁해요", &iso(T0 + 300));
+        let mut set = BTreeSet::new();
+        collect_touched(&mut set, "Read", &json!({ "file_path": r"c:\Users\me\work\iota\src\main.rs" }));
+        save_touched(&c, t, &set);
+        assert!(attach_folder(&c, t));
+        assert_eq!(state_rows(&c, t).iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec!["iota".to_string()]);
+        let pat: String = c.query_row("SELECT pattern FROM tag_rule WHERE source = 'hook'", [], |r| r.get(0)).unwrap();
+        assert_eq!(pat, "c:/users/me/work/iota/");
+        // 이름이 앞부분만 같은 다른 폴더(`iota2`)는 그 저장소가 아니다
+        let mut hp = hook_prompt("s1", T0 + 60_000, "/nowhere", "다른 화면도 열어서 어디가 어색한지 자세히 봐 주세요");
+        hp.project = Some((r"C:\Users\me\work\iota".into(), "iota".into()));
+        record_prompt(&c, &hp);
+        let t2 = insert_turn(&c, "s1", "u2", T0 + 60_300, "다른 화면도 열어서 어디가 어색한지 자세히 봐 주세요");
+        attach_for_turn(&c, "s1", t2, "다른 화면도 열어서 어디가 어색한지 자세히 봐 주세요", &iso(T0 + 60_300));
+        let mut set = BTreeSet::new();
+        collect_touched(&mut set, "Read", &json!({ "file_path": r"C:\Users\me\work\iota2\a.rs" }));
+        save_touched(&c, t2, &set);
+        assert!(!attach_folder(&c, t2));
     }
 
     #[test]
@@ -2139,17 +2361,19 @@ mod tests {
         let repo = fake_repo("zeta");
         let cwd = repo.to_string_lossy().into_owned();
         session(&c, "s1", &cwd);
-        record_prompt(&c, &hook_prompt("s1", T0, &cwd, "화면 하나 만들어 줘 자세히 부탁해요"));
+        let p = "화면 하나 만들어 줘 자세히 부탁해요";
+        record_prompt(&c, &hook_prompt("s1", T0, &cwd, p));
+        let t = turn_touching(&c, "s1", "u1", T0 + 100, p, &[&repo.join("src/a.rs")]);
         let auto: i64 = c.query_row("SELECT id FROM tag WHERE name = 'zeta'", [], |r| r.get(0)).unwrap();
         let mine = create_tag(&c, "내 제타", "#445566", false).unwrap();
-        let t = insert_turn(&c, "s1", "u1", T0 + 100, "화면 하나 만들어 줘 자세히 부탁해요");
-        assert!(attach_for_turn(&c, "s1", t, "화면 하나 만들어 줘 자세히 부탁해요", &iso(T0 + 100)));
         update_tag(&c, auto, Some("제타 앱"), Some("#abcdef"), None).unwrap();
         merge_tags(&c, auto, mine).unwrap();
-        // 병합: 표식·(훅 출처) 경로 규칙이 이전되어, 같은 폴더의 다음 요청도 병합된 태그로 간다
+        // 병합: 표식·(훅 출처) 경로 규칙이 이전되어, 같은 폴더를 다룬 다음 요청도 병합된 태그로 간다
         assert_eq!(state_rows(&c, t), vec![("내 제타".into(), "auto".into(), Some("hook".into()))]);
-        let (ids, _, _) = record_prompt(&c, &hook_prompt("s1", T0 + 60_000, &cwd, "화면 둘째 만들어 줘 자세히 부탁해요"));
-        assert_eq!(ids, vec![mine]);
+        let p2 = "두 번째 화면도 만들어 주세요 지난번처럼 자세히 부탁해요";
+        record_prompt(&c, &hook_prompt("s1", T0 + 60_000, &cwd, p2));
+        let t2 = turn_touching(&c, "s1", "u2", T0 + 60_100, p2, &[&repo.join("src/b.rs")]);
+        assert_eq!(state_rows(&c, t2), vec![("내 제타".into(), "auto".into(), Some("hook".into()))]);
         assert_eq!(all_tag_names(&c), vec!["내 제타".to_string()]);
         let _ = std::fs::remove_dir_all(repo.parent().unwrap());
     }
@@ -2449,8 +2673,11 @@ mod tests {
         set_turn_tag(&c, t1, a, true).unwrap();
         let cand = suggest_for_turn(&c, t1, a).into_iter().find(|r| r.pattern == "/gamma/").expect("gamma 후보");
         add_rule(&c, a, "path", &cand.pattern, "suggested").unwrap();
+        // 앞으로의 요청: 그 폴더의 경로를 실제로 다루면 붙는다(작업 폴더만으로는 안 붙는다)
         let (ids, src, _) = record_prompt(&c, &hook_prompt("s1", T0, "/w/gamma/app", "저 화면 마저 봐줘 부탁"));
-        assert_eq!((ids, src), (vec![a], "project"));
+        assert_eq!((ids.len(), src), (0, "none"));
+        let t2 = turn_touching(&c, "s1", "u2", T0 + 300, "저 화면 마저 봐줘 부탁", &[std::path::Path::new("/w/gamma/lib/b.dart")]);
+        assert_eq!(state_rows(&c, t2), vec![("알파".into(), "auto".into(), Some("hook".into()))]);
     }
 
     // ── 모델 제안 ──
