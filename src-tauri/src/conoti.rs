@@ -231,12 +231,12 @@ fn reply_out(conn: &Connection, rid: &str) -> Option<Value> {
 
 /// 세션의 최근 폰 답(폰 화면의 상태 표시용). 요청으로 잡힌 답은 빠진다 — 그때부터는 대화의 요청 카드가 그 말이고,
 /// 작업 중이면 "작업 중", 답이 오면 그 카드가 채워진다(보낸 말풍선과 카드가 겹쳐 보이지 않게, 09-28).
-/// 예약이 넣은 줄은 폰이 건 것(`device`=그 기기)이어도 싣지 않는다 — 예약은 `sched_list` 로 보고, 폰 화면은 예전과 같다.
+/// 예약에서 온 줄은 폰이 건 것·폰이 보내기로 넣은 것(`device`=그 기기)이어도 싣지 않는다 — 예약은 `sched_list` 로 보고, 폰 화면은 예전과 같다.
 pub fn replies_for(conn: &Connection, sid: &str, limit: i64) -> Vec<Value> {
-    let Ok(mut st) = conn.prepare(
-        "SELECT reply_id FROM conoti_reply WHERE session_id = ?1 AND device IS NOT NULL AND device <> 'desktop' AND sched IS NULL
-            AND (result_turn IS NULL OR state = 'rejected') ORDER BY received_at DESC LIMIT ?2",
-    ) else {
+    let Ok(mut st) = conn.prepare(&format!(
+        "SELECT r.reply_id FROM conoti_reply r WHERE r.session_id = ?1 AND r.device IS NOT NULL AND r.device <> 'desktop' AND NOT {FROM_SCHED}
+            AND (r.result_turn IS NULL OR r.state = 'rejected') ORDER BY r.received_at DESC LIMIT ?2"
+    )) else {
         return vec![];
     };
     let ids: Vec<String> = st.query_map(params![sid, limit], |r| r.get(0)).map(|r| r.flatten().collect()).unwrap_or_default();
@@ -360,19 +360,7 @@ pub fn accept_desktop(conn: &Connection, sid: &str, body: &str, atts: &[String],
     if crate::deliver::route(sid) == Route::Terminal {
         return Err(crate::deliver::TERMINAL_TEXT.into());
     }
-    let turn: Option<i64> = match quote {
-        Some((t, _)) => {
-            let found = conn
-                .query_row("SELECT id FROM turn WHERE id = ?1 AND session_id = ?2", params![t, sid], |r| r.get(0))
-                .optional()
-                .map_err(|e| e.to_string())?;
-            Some(found.ok_or("답장할 요청을 찾을 수 없습니다")?)
-        }
-        None => conn
-            .query_row("SELECT id FROM turn WHERE session_id = ?1 AND hidden = 0 ORDER BY seq DESC LIMIT 1", params![sid], |r| r.get(0))
-            .optional()
-            .map_err(|e| e.to_string())?,
-    };
+    let turn = reply_turn(conn, sid, quote)?;
     let rid = format!("dk{}", crate::relay::hex(&crate::relay::random::<8>()));
     let now = time::now_iso();
     conn.execute(
@@ -388,6 +376,51 @@ pub fn accept_desktop(conn: &Connection, sid: &str, body: &str, atts: &[String],
         .map_err(|e| e.to_string())?;
     reply_out(conn, &rid).ok_or_else(|| "기록을 읽지 못함".into())
 }
+
+/// 보낸 말을 붙일 요청: 답장이면 그 요청(없으면 오류), 아니면 세션의 마지막 요청
+fn reply_turn(conn: &Connection, sid: &str, quote: Option<(i64, &str)>) -> Result<Option<i64>, String> {
+    match quote {
+        Some((t, _)) => {
+            let found = conn
+                .query_row("SELECT id FROM turn WHERE id = ?1 AND session_id = ?2", params![t, sid], |r| r.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok(Some(found.ok_or("답장할 요청을 찾을 수 없습니다")?))
+        }
+        None => conn
+            .query_row("SELECT id FROM turn WHERE session_id = ?1 AND hidden = 0 ORDER BY seq DESC LIMIT 1", params![sid], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// 폰이 누른 예약 "보내기"(`sched_act send`) — 받지 못해 대기 중인 예약의 글을 **그 기기의 폰 답 줄**(`device`=pid, 머리말도 폰 답)로 넣는다.
+/// 그래서 전달 직전의 기기 허용·전체 멈춤·세션 차단·데스크톱 확인 재검사와 기기 해제 때의 회수를 폰 답과 똑같이 탄다.
+/// 확인 모드면 처음부터 확인 대기 — **상태까지 INSERT 한 번에**(넣은 뒤에 바꾸면 그 사이 전달 스레드가 다른 연결로 집어 갈 수 있다).
+/// 누를 때의 검사(`reply_block`)·태그 기록은 부르는 쪽(`sched::act_by`)이 한다. 돌려주는 값 = 줄 번호(폰 rid 가 쓸 수 없는 `_` 를 넣는다).
+pub fn accept_phone_send(conn: &Connection, device: &str, sid: &str, body: &str, atts: &[String], quote: Option<(i64, &str)>) -> Result<String, String> {
+    check_body(body, !atts.is_empty())?;
+    if quote.is_some_and(|(_, q)| !valid_quote(q)) {
+        return Err("답장 대상 형식 오류".into());
+    }
+    // 예약에 묶여 이미 저장된 이미지(만들 때 이 기기·PC 의 것으로 검사했다)
+    attach::check_desktop_ids(conn, atts)?;
+    let turn = reply_turn(conn, sid, quote)?;
+    let rid = format!("ps_{}", crate::relay::hex(&crate::relay::random::<8>()));
+    let state = if flag(conn, "conoti.confirm") { "confirm" } else { "delivering" };
+    let now = time::now_iso();
+    conn.execute(
+        "INSERT INTO conoti_reply (reply_id, turn_id, session_id, kind, text, created_at, received_at, state, device, quote)
+         VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?5, ?6, ?7, ?8)",
+        params![rid, turn, sid, text::clip(&text::redact(body), MAX_REPLY_CHARS + 10), now, state, device, quote.map(|q| q.1)],
+    )
+    .map_err(|e| e.to_string())?;
+    attach::link(conn, &rid, atts)?;
+    Ok(rid)
+}
+
+/// 예약에서 온 줄인가 — 발사한 줄(`sched` 표식) 또는 대기 예약을 "보내기"로 넣은 줄(회차가 이 줄을 가리킨다)
+const FROM_SCHED: &str = "(r.sched IS NOT NULL OR EXISTS (SELECT 1 FROM schedule_run x WHERE x.reply_id = r.reply_id))";
 
 /// 새 작업을 띄운 기록 — 첫 요청이 끝나면 백그라운드 세션을 멈추도록 `link_results` 가 이어받는다.
 pub fn record_started(conn: &Connection, sid: Option<&str>, body: &str, how: &str, atts: &[String]) -> Result<(), String> {
@@ -406,13 +439,13 @@ pub fn record_started(conn: &Connection, sid: Option<&str>, body: &str, how: &st
 /// 채팅 화면 아래에 보일 "보낸 말" — 아직 요청으로 잡히지 않은 것(대기·전달 중·전달됐지만 기록 전·거절)
 pub fn outbox_for(conn: &Connection, sid: &str) -> Vec<Value> {
     let since = time::iso_from_ms(chrono::Utc::now().timestamp_millis() - 15 * 60_000);
-    let Ok(mut st) = conn.prepare(
-        "SELECT r.reply_id, r.text, r.state, r.note, r.received_at, r.device, r.quote, t.seq, r.sched IS NOT NULL FROM conoti_reply r
+    let Ok(mut st) = conn.prepare(&format!(
+        "SELECT r.reply_id, r.text, r.state, r.note, r.received_at, r.device, r.quote, t.seq, {FROM_SCHED} FROM conoti_reply r
            LEFT JOIN turn t ON t.id = r.turn_id
           WHERE r.session_id = ?1 AND r.result_turn IS NULL
             AND (r.state IN ('confirm', 'delivering') OR (r.state IN ('delivered', 'rejected') AND r.received_at >= ?2))
-          ORDER BY r.received_at LIMIT 20",
-    ) else {
+          ORDER BY r.received_at LIMIT 20"
+    )) else {
         return vec![];
     };
     st.query_map(params![sid, since], |r| {
@@ -443,18 +476,35 @@ pub fn outbox_for(conn: &Connection, sid: &str) -> Vec<Value> {
     .unwrap_or_default()
 }
 
-/// 보낸 말 지우기(대기·거절된 것만) — 사용자가 마음을 바꿨을 때. 예약이 넣은 줄은 폰이 건 것도 PC 에서 거둘 수 있다
-/// (폰 예약이 그 기기의 줄로 들어가게 된 뒤에도 PC 화면의 "취소"가 예전처럼 듣게)
-pub fn cancel_desktop(conn: &Connection, rid: &str) -> Result<(), String> {
+/// 데스크톱 확인 모드에서 PC 가 폰 말(폰이 건 예약·폰이 누른 예약 보내기 포함)을 전달하거나 거절한다.
+/// 허용 = `acked='approved'`(전달 직전에 "확인 모드인데 확인을 거쳤나"를 다시 본다) + `wait_from`=지금(못 넣은 시간은 허용한 때부터 센다).
+/// 거절 문구는 상수 — 예약 회차는 이 문구를 보고 끝낸다(`sched::sync_fired`).
+pub fn decide(conn: &Connection, reply_id: &str, approve: bool) -> Result<(), String> {
+    let (next, note) = if approve { ("delivering", None) } else { ("rejected", Some(DENIED_NOTE)) };
     let n = conn
         .execute(
-            "UPDATE conoti_reply SET state = 'rejected', note = '보내기 취소' WHERE reply_id = ?1 AND (device = ?2 OR sched IS NOT NULL) AND state = 'delivering'",
-            params![rid, DESKTOP],
+            "UPDATE conoti_reply SET state = ?2, note = COALESCE(?3, note), acked = CASE WHEN ?2 = 'delivering' THEN 'approved' ELSE acked END,
+                    wait_from = CASE WHEN ?2 = 'delivering' THEN ?4 ELSE wait_from END
+              WHERE reply_id = ?1 AND state = 'confirm'",
+            params![reply_id, next, note, time::now_iso()],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {
+        return Err("이미 처리된 답입니다".into());
+    }
+    Ok(())
+}
+
+/// 보낸 말 지우기(대기·거절된 것만) — 사용자가 마음을 바꿨을 때. 예약에서 온 줄은 폰이 건 것·폰이 보내기로 넣은 것도 PC 에서 거둘 수 있다
+/// (그 줄들이 그 기기의 줄로 들어가게 된 뒤에도 PC 화면의 "취소"가 예전처럼 듣게)
+pub fn cancel_desktop(conn: &Connection, rid: &str) -> Result<(), String> {
+    let mine = format!("r.reply_id = ?1 AND (r.device = ?2 OR {FROM_SCHED})");
+    let n = conn
+        .execute(&format!("UPDATE conoti_reply AS r SET state = 'rejected', note = '보내기 취소' WHERE {mine} AND r.state = 'delivering'"), params![rid, DESKTOP])
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
         let gone = conn
-            .execute("DELETE FROM conoti_reply WHERE reply_id = ?1 AND (device = ?2 OR sched IS NOT NULL) AND state = 'rejected'", params![rid, DESKTOP])
+            .execute(&format!("DELETE FROM conoti_reply AS r WHERE {mine} AND r.state = 'rejected'"), params![rid, DESKTOP])
             .map_err(|e| e.to_string())?;
         // 이미지 연결만 푼다 — 파일은 "다시 쓰기"로 다시 붙일 수 있게 두고, 7일 안에 안 쓰면 정리된다(attach::gc)
         if gone > 0 {
@@ -592,8 +642,14 @@ impl Pipeline {
                             .flatten()
                     })
                     .unwrap_or((false, false));
+                // 예약에서 온 줄(폰이 건 예약의 발사 · 폰이 누른 대기 예약 보내기)은 그 기기의 예약 허용도 본다
+                let from_sched = sched.is_some()
+                    || self
+                        .conn
+                        .query_row("SELECT EXISTS (SELECT 1 FROM schedule_run WHERE reply_id = ?1)", params![reply_id], |r| r.get::<_, bool>(0))
+                        .unwrap_or(false);
                 let note = match reply_block(&self.conn, can_reply, &sid) {
-                    "" if sched.is_some() && !can_schedule => Some(SCHED_OFF_TEXT),
+                    "" if from_sched && !can_schedule => Some(SCHED_OFF_TEXT),
                     "" => None,
                     block => Some(block_text(block)),
                 };

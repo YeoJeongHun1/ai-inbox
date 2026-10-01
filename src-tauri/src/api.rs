@@ -1716,20 +1716,7 @@ pub fn conoti_set_session_mode(state: State<AppState>, shared: Relay, session_id
 #[tauri::command]
 pub fn conoti_decide(state: State<AppState>, shared: Relay, reply_id: String, approve: bool) -> R<()> {
     let conn = state.conn.lock().map_err(e)?;
-    // 거절 문구는 상수 — 폰이 건 예약의 회차는 이 문구를 보고 끝낸다(sched::sync_fired)
-    let (next, note) = if approve { ("delivering", None) } else { ("rejected", Some(crate::conoti::DENIED_NOTE)) };
-    // acked = 'approved' — 전달 직전에 "확인 모드인데 확인을 거쳤나"를 다시 본다
-    let n = conn
-        .execute(
-            "UPDATE conoti_reply SET state = ?2, note = COALESCE(?3, note), acked = CASE WHEN ?2 = 'delivering' THEN 'approved' ELSE acked END,
-                    wait_from = CASE WHEN ?2 = 'delivering' THEN ?4 ELSE wait_from END
-              WHERE reply_id = ?1 AND state = 'confirm'",
-            params![reply_id, next, note, time::now_iso()],
-        )
-        .map_err(e)?;
-    if n == 0 {
-        return Err("이미 처리된 답입니다".into());
-    }
+    crate::conoti::decide(&conn, &reply_id, approve)?;
     shared.bump_changed();
     Ok(())
 }

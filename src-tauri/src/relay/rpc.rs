@@ -559,7 +559,7 @@ pub fn sched_add(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
     if !visible(hidden, caller) {
         return Err(("not_found", "세션이 없습니다".into()));
     }
-    // 폰 답과 같은 겹: 세션 차단·전체 멈춤·기기 허용은 이 자리에서도 본다(발사 때 한 번 더)
+    // 폰 답과 같은 겹: 세션 차단·전체 멈춤·기기 허용은 이 자리에서도 본다(발사 때 한 번 더, 발사 뒤엔 이 기기의 줄로 넣기 직전에 또 한 번 — 확인 모드면 PC 확인)
     if matches!(conoti::reply_block(conn, caller.can_reply, sid), "device_off" | "paused" | "session_blocked" | "no_session") {
         return Err(("rejected", "이 세션은 폰에서 예약을 받을 수 없습니다(PC 에서 막아 둠)".into()));
     }
@@ -674,8 +674,9 @@ pub fn sched_cancel(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult 
 }
 
 /// 받지 못해 처리를 기다리는 예약을 `send`(지금 보낸다 — 폰 답과 같은 검사) · `drop`(버린다).
-/// 누가 만든 예약이든 된다(규격 §4-3 — 못 받은 예약은 알림을 받은 폰이 처리하도록 설계됐다): 보내기는 이 기기의 폰 답과 같은 겹
-/// (답 보내기 허용·전체 멈춤·세션 차단·이어서 실행 설정)과 데스크톱 확인을 거치므로 폰이 직접 답을 보내는 것 이상의 힘이 없고, 버리기는 실행을 만들지 않는다.
+/// 누가 만든 예약이든 된다(규격 §4-3 — 못 받은 예약은 알림을 받은 폰이 처리하도록 설계됐다). 보내기는 **이 기기의 폰 답 줄**로 들어간다
+/// (`sched::act_by` → `conoti::accept_phone_send`): 누를 때와 세션에 넣기 직전에 답 보내기·예약 허용·전체 멈춤·세션 차단·이어서 실행 설정을 보고,
+/// 데스크톱 확인이면 처음부터 확인 대기, 기기를 해제하면 거둔다 — 폰이 직접 답을 보내는 것 이상의 힘이 없다. 버리기는 실행을 만들지 않는다.
 pub fn sched_act(conn: &Connection, p: &Value, caller: &Caller) -> RpcResult {
     check_sched(conn, caller)?;
     let id = sched_id(p)?;
@@ -1381,8 +1382,9 @@ mod tests {
 
     #[test]
     fn a_phone_reply_cannot_squat_the_queue_key_of_a_schedule() {
-        // 회차의 대기열 번호 = `<예약 id>-<예정 시각 ms>` — 둘 다 sched_list 로 보인다. 폰이 그 번호로 답을 먼저 넣어 두면
-        // 발사가 INSERT OR IGNORE 로 조용히 그 답에 묶여(PC 예약 대신 폰의 글이 그 예약의 결과가 된다) 안 된다
+        // 회차의 대기열 번호는 예약 id 와 예정 시각(ms)으로 만든다 — 둘 다 sched_list 로 보인다. 폰이 그 번호로 답을 먼저 넣어 두면
+        // 발사가 INSERT OR IGNORE 로 막혀 예약이 대기(held)로 밀린다(답 보내기만 허용된 폰도 PC 예약을 방해할 수 있었다).
+        // 번호는 폰 답 번호(rid)가 쓸 수 없는 글자(`_`)로 잇는다 — 옛 번호 형식(`-`)으로 넣은 폰 답은 이제 겹치지 않는다
         let c = mem();
         add_dev(&c, "d1", 1, 1);
         db::set_meta(&c, "conoti.bg_resume", "1").unwrap();
@@ -1390,14 +1392,180 @@ mod tests {
         let now = chrono::Utc::now();
         let due = (now - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         c.execute("UPDATE schedule SET next_due_at = ?1", params![due]).unwrap();
-        let key = format!("{id}-{}", chrono::DateTime::parse_from_rfc3339(&due).unwrap().timestamp_millis());
-        assert_eq!(reply(&c, &json!({"sid": "sess-0001", "text": "폰이 끼워 넣은 말", "rid": key}), &dev("d1", true, false, false)).unwrap()["state"], "delivering");
+        let ms = chrono::DateTime::parse_from_rfc3339(&due).unwrap().timestamp_millis();
+        let (old_key, key) = (format!("{id}-{ms}"), format!("{id}_{ms}"));
+        assert_eq!(reply(&c, &json!({"sid": "sess-0001", "text": "폰이 끼워 넣은 말", "rid": old_key}), &dev("d1", true, false, false)).unwrap()["state"], "delivering");
+        assert_eq!(reply(&c, &json!({"sid": "sess-0001", "text": "x", "rid": key}), &dev("d1", true, false, false)).unwrap_err().0, "bad_request", "폰은 회차 번호 형식을 못 쓴다");
         crate::sched::tick(&c, now, &UpProbe);
         let (state, linked): (String, Option<String>) = c.query_row("SELECT state, reply_id FROM schedule_run WHERE schedule_id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert_eq!(state, "held", "남의 답에 묶여 발사된 것으로 처리됐다");
-        assert_ne!(linked.as_deref(), Some(key.as_str()));
+        assert_eq!(state, "fired", "폰 답이 회차 번호를 막아 예약이 밀렸다");
+        assert_eq!(linked.as_deref(), Some(key.as_str()));
+        assert_eq!(c.query_row::<Option<String>, _, _>("SELECT sched FROM conoti_reply WHERE reply_id = ?1", params![key], |r| r.get(0)).unwrap().as_deref(), Some(key.as_str()));
         // 폰의 답은 그 답대로(예약 표식이 붙지 않는다)
-        assert!(c.query_row::<Option<String>, _, _>("SELECT sched FROM conoti_reply WHERE reply_id = ?1", params![key], |r| r.get(0)).unwrap().is_none());
+        assert!(c.query_row::<Option<String>, _, _>("SELECT sched FROM conoti_reply WHERE reply_id = ?1", params![old_key], |r| r.get(0)).unwrap().is_none());
+        // 그래도 같은 번호의 남의 줄이 있으면(어떤 경로로든) 묶지 않고 held
+        let c = mem();
+        let id = desktop_schedule(&c, "PC 예약 원문");
+        c.execute("UPDATE schedule SET next_due_at = ?1", params![due]).unwrap();
+        let key = format!("{id}_{ms}");
+        c.execute("INSERT INTO conoti_reply (reply_id, session_id, kind, text, created_at, received_at, state, device) VALUES (?1, 'sess-0001', 'text', '남의 줄', 't', 't', 'delivering', 'd2')", params![key]).unwrap();
+        crate::sched::tick(&c, now, &UpProbe);
+        assert_eq!(c.query_row::<String, _, _>("SELECT state FROM schedule_run WHERE schedule_id = ?1", params![id], |r| r.get(0)).unwrap(), "held");
+    }
+
+    /// PC 가 만든 예약을 받지 못해 대기(held)로 둔다
+    fn held_pc_schedule(c: &Connection) -> String {
+        let id = desktop_schedule(c, "PC 가 걸어 둔 말");
+        c.execute("UPDATE schedule SET next_due_at = NULL WHERE id = ?1", params![id]).unwrap();
+        c.execute(
+            "INSERT INTO schedule_run (schedule_id, occurrence_at, created_at, state, reason, notified_at) VALUES (?1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', 'held', 'ended', 't')",
+            params![id],
+        )
+        .unwrap();
+        id
+    }
+
+    /// 세션에 넣은 글을 적어 두는 가짜 전달기(머리말 확인용)
+    #[derive(Default)]
+    struct TextSink(std::cell::RefCell<Vec<String>>);
+    impl conoti::Deliver for TextSink {
+        fn deliver(&self, _t: &conoti::Target, _id: &str, text: &str, _d: bool) -> conoti::Outcome {
+            self.0.borrow_mut().push(text.to_string());
+            conoti::Outcome::Done("전달".into())
+        }
+    }
+
+    fn run_of(c: &Connection, id: &str) -> (String, Option<String>) {
+        c.query_row("SELECT state, reply_id FROM schedule_run WHERE schedule_id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn phone_send_of_a_held_schedule_is_rechecked_at_delivery_like_a_phone_reply() {
+        // 폰이 누른 "보내기"는 그 기기의 폰 답 줄 — 누른 뒤 전달 전에 PC 가 거두면(해제·답 끔·전체 멈춤·세션 차단·예약 허용 끔) 넣지 않는다
+        type Setup = fn(&Connection);
+        let cases: [(&str, Setup); 5] = [
+            ("기기 해제", |c| {
+                crate::sched::cancel_device(c, "d1");
+                c.execute("DELETE FROM relay_device WHERE pid = 'd1'", []).unwrap();
+            }),
+            ("답 보내기 끔", |c| {
+                c.execute("UPDATE relay_device SET can_reply = 0", []).unwrap();
+            }),
+            ("전체 멈춤", |c| {
+                db::set_meta(c, "conoti.paused", "1").unwrap();
+            }),
+            ("세션 차단(폰 답 막기)", |c| {
+                c.execute("INSERT INTO conoti_session (session_id, mode) VALUES ('sess-0001', 1)", []).unwrap();
+            }),
+            ("예약 허용 끔", |c| {
+                c.execute("UPDATE relay_device SET can_schedule = 0", []).unwrap();
+            }),
+        ];
+        // 경우마다 결과를 모아 한 번에 단언한다(어느 철회가 새는지 모두 보이게)
+        let mut wrong: Vec<String> = Vec::new();
+        for (what, setup) in cases {
+            let c = mem();
+            add_dev(&c, "d1", 1, 1);
+            db::set_meta(&c, "conoti.bg_resume", "1").unwrap();
+            let id = held_pc_schedule(&c);
+            sched_act(&c, &json!({"id": id, "op": "send"}), &dev("d1", true, false, true)).unwrap();
+            let rid = run_of(&c, &id).1.unwrap();
+            setup(&c);
+            let mut pipe = conoti::Pipeline::new(c);
+            let sink = TextSink::default();
+            pipe.tick(&sink);
+            let (state, device): (String, String) = pipe.conn().query_row("SELECT state, COALESCE(device, '') FROM conoti_reply WHERE reply_id = ?1", params![rid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            // PC 예약은 다시 대기 — 만든 쪽(PC)이 보내기/버리기를 고른다
+            crate::sched::tick(pipe.conn(), chrono::Utc::now(), &UpProbe);
+            let run = run_of(pipe.conn(), &id).0;
+            let got = (sink.0.borrow().len(), state.as_str(), device.as_str(), run.as_str());
+            if got != (0, "rejected", "d1", "held") {
+                wrong.push(format!("{what}: 넣은 수·줄·기기·회차 = {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "거뒀는데 세션에 넣었거나 상태가 다름:\n{}", wrong.join("\n"));
+        // 거두지 않으면 폰 답처럼 들어간다 — 머리말도 폰 답(데스크톱 입력이 아니다), 폰 화면의 보낸 말(replies)에는 끼지 않는다
+        let c = mem();
+        add_dev(&c, "d1", 1, 1);
+        db::set_meta(&c, "conoti.bg_resume", "1").unwrap();
+        let id = held_pc_schedule(&c);
+        sched_act(&c, &json!({"id": id, "op": "send"}), &dev("d1", true, false, true)).unwrap();
+        assert!(conoti::replies_for(&c, "sess-0001", 20).is_empty());
+        let mut pipe = conoti::Pipeline::new(c);
+        let sink = TextSink::default();
+        pipe.tick(&sink);
+        assert_eq!(sink.0.borrow().len(), 1);
+        assert!(sink.0.borrow()[0].starts_with(conoti::REPLY_HEADER), "{}", sink.0.borrow()[0]);
+        crate::sched::tick(pipe.conn(), chrono::Utc::now(), &UpProbe);
+        assert_eq!(run_of(pipe.conn(), &id).0, "delivered");
+    }
+
+    #[test]
+    fn phone_send_waits_for_desktop_confirm_in_one_insert_and_pc_can_cancel_it() {
+        let c = mem();
+        add_dev(&c, "d1", 1, 1);
+        db::set_meta(&c, "conoti.bg_resume", "1").unwrap();
+        db::set_meta(&c, "conoti.confirm", "1").unwrap();
+        let id = held_pc_schedule(&c);
+        sched_act(&c, &json!({"id": id, "op": "send"}), &dev("d1", true, false, true)).unwrap();
+        let rid = run_of(&c, &id).1.unwrap();
+        // 처음부터 확인 대기(넣은 뒤에 상태를 바꾸면 그 사이 전달 스레드가 집어 갈 수 있다)
+        assert_eq!(c.query_row::<(String, String), _, _>("SELECT state, device FROM conoti_reply WHERE reply_id = ?1", params![rid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap(), ("confirm".into(), "d1".into()));
+        // PC 채팅의 보낸 말에서 예약 표식으로 보이고 PC 가 거둘 수 있다
+        let ob = conoti::outbox_for(&c, "sess-0001");
+        assert_eq!((ob[0]["from_phone"].as_bool(), ob[0]["sched"].as_bool()), (Some(true), Some(true)));
+        conoti::decide(&c, &rid, true).unwrap();
+        conoti::cancel_desktop(&c, &rid).unwrap();
+        crate::sched::tick(&c, chrono::Utc::now(), &UpProbe);
+        assert_eq!(run_of(&c, &id).0, "cancelled");
+        // 확인을 기다리는 동안 기기를 해제하면 그 줄은 바로 거둔다(PC 확인 목록에 남지 않게) — 예약은 다시 대기
+        let id = held_pc_schedule(&c);
+        sched_act(&c, &json!({"id": id, "op": "send"}), &dev("d1", true, false, true)).unwrap();
+        let rid = run_of(&c, &id).1.unwrap();
+        crate::sched::cancel_device(&c, "d1");
+        c.execute("DELETE FROM relay_device WHERE pid = 'd1'", []).unwrap();
+        assert_eq!(c.query_row::<String, _, _>("SELECT state FROM conoti_reply WHERE reply_id = ?1", params![rid], |r| r.get(0)).unwrap(), "rejected");
+        crate::sched::tick(&c, chrono::Utc::now(), &UpProbe);
+        assert_eq!(run_of(&c, &id).0, "held");
+    }
+
+    #[test]
+    fn confirm_approved_more_than_ten_minutes_after_fire_is_delivered() {
+        // 발사 → PC 확인 대기 → 11분 뒤 PC 가 "전달" — 정체 판정은 허용한 때부터 센다(발사 시각부터 세면 바로 held 로 튕긴다)
+        let (c, id) = fired_phone_schedule(true);
+        let mut pipe = conoti::Pipeline::new(c);
+        let sink = Sink::default();
+        pipe.tick(&sink);
+        let long_ago = (chrono::Utc::now() - chrono::Duration::minutes(11)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        pipe.conn().execute("UPDATE schedule_run SET fired_at = ?1", params![long_ago]).unwrap();
+        pipe.conn().execute("UPDATE conoti_reply SET received_at = ?1, created_at = ?1", params![long_ago]).unwrap();
+        let rid = run_of(pipe.conn(), &id).1.unwrap();
+        conoti::decide(pipe.conn(), &rid, true).unwrap();
+        // 실제 루프 순서: 예약 틱 → 파이프라인 틱
+        let rep = crate::sched::tick(pipe.conn(), chrono::Utc::now(), &UpProbe);
+        assert!(rep.alerts.is_empty(), "허용하자마자 '10분 넘게 받지 못했습니다' 알림");
+        pipe.tick(&sink);
+        assert_eq!(sink.0.borrow().len(), 1, "PC 가 허용했는데 넣지 않았다");
+        assert_eq!(line_of(pipe.conn()).0, "delivered");
+    }
+
+    #[test]
+    fn confirm_waiting_schedule_lines_expire_after_three_hours_and_free_the_slot() {
+        // PC 가 확인하지 않은 예약 줄은 받은 뒤 3시간(그 뒤엔 허용해도 넣지 않는 상한)에 거두고 대기(held)로 알린다 — 세션당 상한을 계속 차지하지 않게
+        let (c, id) = fired_phone_schedule(true);
+        let mut pipe = conoti::Pipeline::new(c);
+        let sink = Sink::default();
+        pipe.tick(&sink);
+        let now = chrono::Utc::now();
+        let iso = |m: i64| (now - chrono::Duration::minutes(m)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        pipe.conn().execute("UPDATE schedule_run SET fired_at = ?1", params![iso(179)]).unwrap();
+        assert!(crate::sched::tick(pipe.conn(), now, &UpProbe).alerts.is_empty(), "3시간 전에는 그대로");
+        assert_eq!(line_of(pipe.conn()).0, "confirm");
+        pipe.conn().execute("UPDATE schedule_run SET fired_at = ?1", params![iso(181)]).unwrap();
+        let rep = crate::sched::tick(pipe.conn(), now, &UpProbe);
+        assert_eq!(rep.alerts.len(), 1);
+        assert_eq!(line_of(pipe.conn()).0, "rejected");
+        assert_eq!(run_of(pipe.conn(), &id).0, "held");
     }
 
     fn desktop_schedule(c: &Connection, text: &str) -> String {

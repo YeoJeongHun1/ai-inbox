@@ -34,6 +34,9 @@ pub const STUCK_SECS: i64 = 600;
 pub const HELD_EXPIRE_DAYS: i64 = 7;
 pub const MAX_ACTIVE_PER_SESSION: i64 = 20;
 pub const MAX_ACTIVE_TOTAL: i64 = 200;
+/// 예약에서 온 줄이 PC 확인을 기다릴 수 있는 시간 — 파이프라인의 "받은 뒤 3시간" 상한과 같다(그 뒤엔 허용해도 넣지 않으므로 거둔다)
+pub const CONFIRM_LIMIT_SECS: i64 = 3 * 3600;
+const CONFIRM_EXPIRED_NOTE: &str = "PC 확인 없이 3시간이 지나 넣지 않음";
 /// 폰 한 대가 24시간 동안 만들 수 있는 예약 수(취소한 것도 센다) — 만들고 취소하기를 되풀이해 표가 끝없이 커지지 않게
 pub const MAX_DEVICE_ADDS_PER_DAY: i64 = 100;
 /// 하루 발사 상한 — 폭주·실수로 무인 실행이 쌓이지 않게
@@ -743,7 +746,8 @@ pub fn act(conn: &Connection, now: DateTime<Utc>, id: &str, op: &str) -> R<()> {
 }
 
 /// `phone` = (기기 pid, 그 기기의 답 보내기 허용) — 폰이 누른 "보내기"는 폰 답과 같은 검사(허용·멈춤·세션 차단·이어서 실행 설정)를 통과해야 하고,
-/// PC 의 "데스크톱 확인" 옵션이 켜져 있으면 확인 대기로 들어간다.
+/// **그 기기의 폰 답 줄**로 들어가 세션에 넣기 직전에 같은 검사를 다시 받는다(그사이 해제·끔·멈춤·차단이면 넣지 않고 회차는 다시 held).
+/// PC 의 "데스크톱 확인" 옵션이 켜져 있으면 처음부터 확인 대기로 들어간다.
 pub fn act_by(conn: &Connection, now: DateTime<Utc>, id: &str, op: &str, phone: Option<(&str, bool)>) -> R<()> {
     let occ: String = conn
         .query_row(
@@ -794,24 +798,38 @@ pub fn act_by(conn: &Connection, now: DateTime<Utc>, id: &str, op: &str, phone: 
                 .query_row("SELECT session_id, text, quote, turn_id FROM schedule WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .map_err(|e| e.to_string())?;
             let q = turn.zip(quote.as_deref());
-            match conoti::accept_desktop(conn, &sid, &body, &atts_of(conn, id), q) {
-                Ok(v) => {
-                    let rid = v["rid"].as_str().unwrap_or_default().to_string();
-                    if phone.is_some() && conoti::flag(conn, "conoti.confirm") {
-                        // 데스크톱 확인 옵션 — 폰이 보낸 말은 PC 에서 허용해야 세션에 들어간다
-                        let _ = conn.execute("UPDATE conoti_reply SET state = 'confirm' WHERE reply_id = ?1 AND state = 'delivering'", params![rid]);
+            let mark = |rid: &str| {
+                conn.execute(
+                    "UPDATE schedule_run SET state = 'fired', fired_at = ?3, reply_id = ?4, note = '사용자가 보냄' WHERE schedule_id = ?1 AND occurrence_at = ?2",
+                    params![id, occ, iso(now), rid],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            };
+            let sent: R<()> = match phone {
+                // 폰이 누른 보내기 = 그 기기의 폰 답 줄(확인 대기 여부까지 INSERT 한 번에) — 전달 직전 재검사·확인·해제 회수를 폰 답처럼 탄다.
+                // 줄과 회차 연결을 한 트랜잭션으로: 전달 스레드(다른 연결)가 "예약에서 온 줄"임을 모르는 채 집어 가지 않게
+                Some((pid, _)) => {
+                    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
+                    match conoti::accept_phone_send(conn, pid, &sid, &body, &atts_of(conn, id), q).and_then(|rid| mark(&rid)) {
+                        Ok(()) => {
+                            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+                            conoti::record_tag_hint(conn, &sid, &body);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            Err(e)
+                        }
                     }
-                    let _ = conn.execute(
-                        "UPDATE schedule_run SET state = 'fired', fired_at = ?3, reply_id = ?4, note = '사용자가 보냄' WHERE schedule_id = ?1 AND occurrence_at = ?2",
-                        params![id, occ, iso(now), rid],
-                    );
-                    Ok(())
                 }
-                Err(e) => {
-                    let _ = conn.execute("UPDATE schedule_run SET state = 'held' WHERE schedule_id = ?1 AND occurrence_at = ?2 AND state = 'sending'", params![id, occ]);
-                    Err(e)
-                }
+                // PC 앞의 사용자가 누른 보내기 — 입력창과 같은 데스크톱 경로
+                None => conoti::accept_desktop(conn, &sid, &body, &atts_of(conn, id), q).and_then(|v| mark(v["rid"].as_str().unwrap_or_default())),
+            };
+            if sent.is_err() {
+                let _ = conn.execute("UPDATE schedule_run SET state = 'held' WHERE schedule_id = ?1 AND occurrence_at = ?2 AND state = 'sending'", params![id, occ]);
             }
+            sent
         }
         _ => Err("send · drop 중 하나".into()),
     }
@@ -1061,7 +1079,17 @@ pub fn cancel_device(conn: &Connection, pid: &str) {
             // 이미 세션에 전달됐으면 그대로 둔다(끝난 것)
         }
     }
+    // 이 기기가 다른 쪽(PC·다른 폰)이 만든 대기 예약을 "보내기"로 넣었는데 아직 세션에 들어가지 않은 줄도 거둔다 —
+    // 그 예약은 다시 대기(held)로 돌아가 만든 쪽이 보내기/버리기를 고른다(sync_fired)
+    let _ = conn.execute(
+        "UPDATE conoti_reply SET state = 'rejected', note = ?2
+          WHERE device = ?1 AND state IN ('delivering', 'confirm') AND reply_id IN (SELECT reply_id FROM schedule_run WHERE reply_id IS NOT NULL)",
+        params![pid, UNPAIRED_NOTE],
+    );
 }
+
+/// 기기 해제로 거둔 "보내기" 줄의 거절 사유
+const UNPAIRED_NOTE: &str = "이 말을 보낸 폰의 연결이 해제됨";
 
 /// 세션마다 (걸려 있는 예약 수, 처리를 기다리는 수) — 폰 세션 목록의 `sched_n`
 pub fn counts_by_session(conn: &Connection) -> std::collections::HashMap<String, (i64, i64)> {
@@ -1114,7 +1142,9 @@ fn fire_run(conn: &Connection, now: DateTime<Utc>, id: &str, occ: &str) -> R<()>
     // 확인 모드면 폰 답처럼 처음부터 확인 대기(파이프라인도 전달 직전에 한 번 더 본다)
     let state = if phone && conoti::flag(conn, "conoti.confirm") { "confirm" } else { "delivering" };
     let ms = time::ms_of_iso(occ).unwrap_or(0);
-    let key = format!("{id}-{ms}");
+    // 회차 키 = 예약 id + 예정 시각(ms). 둘 다 목록으로 보이므로 폰 답 번호(rid — 영숫자·`-` 만, `conoti::valid_rid`)가 쓸 수 없는 `_` 로 잇는다 —
+    // 폰이 이 키로 답을 먼저 넣어 예약을 밀어내지 못하게(10-01 리뷰). 0.10.1 이전에 발사된 줄의 `-` 키는 회차가 reply_id 로 그대로 가리킨다(마이그레이션 불필요)
+    let key = format!("{id}_{ms}");
     let turn = match turn {
         Some(t) => Some(t),
         None => conn
@@ -1164,16 +1194,21 @@ fn fire_run(conn: &Connection, now: DateTime<Utc>, id: &str, occ: &str) -> R<()>
 
 /// 대기열에 넣은 회차의 결과를 따라간다: 전달됨 → 처리됨 · 거절 → held(알림) · 세션이 못 받은 채 오래 걸림 → 되돌려 held
 fn sync_fired(conn: &Connection, now: DateTime<Utc>, probe: &dyn Probe, rep: &mut TickReport) {
-    type Row = (String, String, String, String, Option<String>, Option<String>, Option<String>, String);
+    type Row = (String, String, String, String, Option<String>, Option<String>, Option<String>, String, String);
+    // `since` = 못 넣은 시간을 세기 시작한 때 — 대기열 줄의 `wait_from`(PC 가 확인에서 허용한 때 · 같은 세션의 앞 말·바쁜 세션 뒤에서 기다린 마지막 때)이
+    // 있으면 그것, 없으면 발사 시각. 발사 시각부터 세면 확인을 10분 넘게 기다렸다 허용한 줄이 허용하자마자 held 로 튕긴다(10-01 리뷰)
     let rows: Vec<Row> = conn
         .prepare(
-            "SELECT r.schedule_id, r.occurrence_at, r.state, COALESCE(r.fired_at, r.created_at), r.reply_id, c.state, c.note, s.session_id
+            "SELECT r.schedule_id, r.occurrence_at, r.state, COALESCE(r.fired_at, r.created_at), r.reply_id, c.state, c.note, s.session_id,
+                    COALESCE(c.wait_from, r.fired_at, r.created_at)
                FROM schedule_run r JOIN schedule s ON s.id = r.schedule_id LEFT JOIN conoti_reply c ON c.reply_id = r.reply_id
               WHERE r.state IN ('fired','delivered') LIMIT 100",
         )
-        .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).map(|r| r.flatten().collect()))
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))).map(|r| r.flatten().collect())
+        })
         .unwrap_or_default();
-    for (id, occ, state, fired_at, reply, cstate, cnote, sid) in rows {
+    for (id, occ, state, fired_at, reply, cstate, cnote, sid, since) in rows {
         let set = |to: &str| {
             let _ = conn.execute("UPDATE schedule_run SET state = ?3 WHERE schedule_id = ?1 AND occurrence_at = ?2 AND state IN ('fired','delivered')", params![id, occ, to]);
         };
@@ -1213,9 +1248,25 @@ fn sync_fired(conn: &Connection, now: DateTime<Utc>, probe: &dyn Probe, rep: &mu
                     }
                 }
             }
-            (Some(_), Some("delivering" | "confirm")) => {
+            (Some(_), Some("confirm")) => {
+                // PC 확인 대기 — 받은 지 3시간(그 뒤엔 허용해도 파이프라인이 넣지 않는 상한)이 지나면 거두고 held 로 알린다.
+                // 확인을 기다리는 동안 회차가 열려 있어 세션당·전체 예약 한도를 차지하므로 끝없이 두지 않는다
+                let expired = time::parse(&fired_at).map(|f| (now - f).num_seconds() >= CONFIRM_LIMIT_SECS).unwrap_or(false);
+                if expired {
+                    let took = conn
+                        .execute("UPDATE conoti_reply SET state = 'rejected', note = ?2 WHERE reply_id = ?1 AND state = 'confirm'", params![reply, CONFIRM_EXPIRED_NOTE])
+                        .unwrap_or(0);
+                    if took == 1 {
+                        rep.changed_sessions.push(sid.clone());
+                        if let Some(a) = hold_or_fail(conn, &id, &occ, "held", "rejected", CONFIRM_EXPIRED_NOTE, now) {
+                            rep.alerts.push(a);
+                        }
+                    }
+                }
+            }
+            (Some(_), Some("delivering")) => {
                 // 세션이 일하는 중이면 기다린다(3시간 상한은 파이프라인이 맡는다). 일하지도 않는데 오래 못 넣으면 되돌려 알린다
-                let stuck = time::parse(&fired_at).map(|f| (now - f).num_seconds() >= STUCK_SECS).unwrap_or(false);
+                let stuck = time::parse(&since).map(|f| (now - f).num_seconds() >= STUCK_SECS).unwrap_or(false);
                 if stuck && probe.work(&sid) != Work::Busy {
                     let took = conn
                         .execute(
@@ -1938,7 +1989,8 @@ mod tests {
         assert_eq!(at, "2026-10-01T00:30:00.000Z", "3시간 상한이 발사 기준이 되도록");
         assert_eq!((dev.as_str(), state.as_str(), text.as_str()), ("desktop", "delivering", "테스트를 돌려 줘"));
         assert_eq!(sched.as_deref(), Some(rid.as_str()));
-        assert!(rid.starts_with(&id) && rid.len() <= 64 && conoti::valid_rid(&rid));
+        // 회차 키는 폰 답 번호가 쓸 수 없는 형식이어야 한다(폰이 키를 먼저 차지해 예약을 밀어내지 못하게)
+        assert!(rid.starts_with(&id) && rid.len() <= 64 && !conoti::valid_rid(&rid), "{rid}");
         // 같은 시각으로 몇 번을 더 불러도 한 줄
         for s in 0..5 {
             tick(&c, plus(30, s), &p);
