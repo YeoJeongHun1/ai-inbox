@@ -141,6 +141,12 @@ export function ScheduleDialog({ sessionId, sessionName, text: initText, attIds:
   useEffect(() => {
     if (item) setMode("at"); // 고칠 때는 정한 시각 그대로 보이게
   }, [item]);
+  // Esc 로 닫기 — 설정·기록 창과 같게(보내는 중에는 닫지 않는다)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !working && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, working]);
 
   const now = Date.now();
   const preset = useMemo(() => {

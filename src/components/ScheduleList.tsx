@@ -69,6 +69,12 @@ export function ScheduleList({ sessionId, onClose, onOpenSession, toast }: Props
       un.then((f) => f());
     };
   }, [load]);
+  // Esc 로 닫기 — 설정·기록 창과 같게. 고치기 창이 떠 있으면 그 창만 닫힌다(그쪽이 Esc 를 받는다)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !edit && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, edit]);
 
   const act = async (id: string, op: "send" | "drop") => {
     setBusy(id);

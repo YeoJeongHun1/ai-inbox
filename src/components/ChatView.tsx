@@ -766,6 +766,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
           )}
           <button
             className="text-btn"
+            aria-label={s.attach_command ? "터미널에서 열기" : "이어가기"}
             title={s.attach_command ?? (s.resume_shells?.length ? "쓰는 셸을 골라 이어가기 명령을 복사" : s.resume_command)}
             onClick={async (e) => {
               // Windows: 셸마다 문법이 달라 고르게 한다(백그라운드 세션을 여는 명령은 어느 셸에서나 같다)
@@ -778,7 +779,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
               toast(s.attach_command ? "백그라운드 세션을 여는 명령을 복사했습니다" : "이어가기 명령을 복사했습니다");
             }}
           >
-            <SquareTerminal size={16} /> {s.attach_command ? "터미널에서 열기" : "이어가기"}
+            <SquareTerminal size={16} /> <span className="btn-label">{s.attach_command ? "터미널에서 열기" : "이어가기"}</span>
           </button>
           {shellMenu && s.resume_shells && (
             <ShellMenu

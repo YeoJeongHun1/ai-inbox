@@ -167,9 +167,9 @@ export function Sidebar(p: Props) {
     <aside className="sidebar">
       <header className="side-head" data-tauri-drag-region>
         <span className="wordmark">AI Inbox</span>
-        <button className="bar-btn new-btn" title={`새 작업 — 폴더를 골라 Claude Code·Codex 에 새 일을 시키기 (${kbd("⌘N")})`} onClick={p.onNewTask}>
+        <button className="bar-btn new-btn" title={`새 작업 — 폴더를 골라 Claude Code·Codex 에 새 일을 시키기 (${kbd("⌘N")})`} aria-label="새 작업" onClick={p.onNewTask}>
           <Plus size={15} />
-          새 작업
+          <span className="btn-label">새 작업</span>
         </button>
       </header>
 
@@ -334,7 +334,7 @@ export function Sidebar(p: Props) {
       <footer className="side-foot">
         <button className="foot-btn" title={`설정 (${kbd("⌘,")})`} onClick={p.onSettings}>
           <Settings size={16} />
-          <span>설정</span>
+          <span className="btn-label">설정</span>
         </button>
         <span className="foot-sp" />
         {p.working && (
