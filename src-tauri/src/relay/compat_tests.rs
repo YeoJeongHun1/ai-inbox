@@ -62,6 +62,16 @@ fn volatile(key: &str) -> bool {
     key == "at"
 }
 
+/// 문서 본문(`turn.markdown`) — 폰은 해석하지 않고 그대로 그린다. 구성은 바뀔 수 있고(0.11.0 턴 카드),
+/// 종류(문자열)와 첫 줄(`# 제목`)만 같으면 된다. 구성은 `markdown_is_turn_card` 가 따로 본다.
+fn document(key: &str) -> bool {
+    key == "markdown"
+}
+
+fn head_line(v: &Value) -> Option<&str> {
+    v.as_str().map(|m| m.lines().next().unwrap_or(""))
+}
+
 fn diff(old: &Value, new: &Value, path: &str, key: &str, added: &mut BTreeSet<String>, bad: &mut Vec<String>) {
     match (old, new) {
         (Value::Object(o), Value::Object(n)) => {
@@ -89,6 +99,10 @@ fn diff(old: &Value, new: &Value, path: &str, key: &str, added: &mut BTreeSet<St
             if volatile(key) {
                 if !same_kind {
                     bad.push(format!("{path}: 종류가 바뀜 {a} → {b}"));
+                }
+            } else if document(key) {
+                if !same_kind || head_line(a) != head_line(b) {
+                    bad.push(format!("{path}: 문서 종류·제목 줄이 바뀜 {:?} → {:?}", head_line(a), head_line(b)));
                 }
             } else if a != b {
                 bad.push(format!("{path}: {a} → {b}"));
@@ -128,6 +142,22 @@ fn old_phone_script_keeps_every_080_field() {
     assert!(bad.is_empty(), "0.8.0 이 준 필드가 바뀜 — 운영 폰이 깨질 수 있다:\n{}", bad.join("\n"));
     let expected: BTreeSet<String> = ADDED.iter().map(|s| s.to_string()).collect();
     assert_eq!(added, expected, "0.10.0 이 더한 필드 목록이 다르다 — 새 필드는 폰이 견디는지 확인하고 ADDED 와 docs/COMPAT.md 에 적는다");
+}
+
+/// 폰에 가는 문서가 턴 카드 순서(질문 · 이해 · 결과 · 응답 필요 · 과정 · 비용)인지 — 이해·응답 필요는 있을 때만
+#[test]
+fn markdown_is_turn_card() {
+    let c = upgraded_db();
+    let new = run_script(&c);
+    for name in ["turn_done", "turn_running", "turn_phone_reply"] {
+        let md = new[name]["r"]["markdown"].as_str().unwrap_or_else(|| panic!("{name}: markdown 없음"));
+        let mut at = 0;
+        for h in ["## 질문", "## 결과", "## 과정", "## 비용", "## 이어진 요청"] {
+            let i = md[at..].find(h).unwrap_or_else(|| panic!("{name}: {h} 없음(또는 순서 다름)\n{md}"));
+            at += i + h.len();
+        }
+        assert!(!md.contains("훅 이벤트") && !md.contains('$'), "{name}: 빠져야 할 절·달러가 남음\n{md}");
+    }
 }
 
 // ── 2·3. 폰 Dart 모델과 같은 규칙으로 읽기 ────────────────────────────────────
@@ -248,7 +278,9 @@ fn phone_chat(r: &Value, errs: &mut Vec<String>) -> Value {
 
 fn phone_turn_doc(r: &Value) -> Value {
     json!({
-        "id": i(&r["id"]), "sid": or(s(&r["sid"]), ""), "title": or(s(&r["title"]), ""), "markdown": or(s(&r["markdown"]), ""),
+        "id": i(&r["id"]), "sid": or(s(&r["sid"]), ""), "title": or(s(&r["title"]), ""),
+        // 폰은 문서를 그대로 그린다 — 본문 구성 대신 문자열 여부와 제목 줄만 비교한다(`document`)
+        "markdown": or(s(&r["markdown"]), "").as_str().map(|m| m.lines().next().unwrap_or("").to_string()),
         "status": or(s(&r["status"]), "done"), "needs_input": b(&r["needs_input"]), "prev_id": i_null(&r["prev_id"]), "next_id": i_null(&r["next_id"]),
     })
 }

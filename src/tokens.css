@@ -1,0 +1,238 @@
+/* AI Inbox — 디자인 토큰(한 곳). 정본 설명은 DESIGN.md.
+   코노티(폰 앱) 우드톤을 데스크톱으로 옮긴 것: 코르크 캔버스 위 크림 종이, 오크가 기본 액션,
+   의미색 다섯(오크·플럼·앰버·세이지·브릭)만 쓴다. 코노티는 라이트 전용이라 다크는 같은 나무를 밤에 본 "에스프레소"로 새로 짰다.
+   글자색은 코노티 원값의 색상(hue)을 지키되 본문 대비 4.5:1 을 넘게 한 단계 어둡게(다크는 밝게) 맞췄다 — 표는 DESIGN.md.
+   예전 이름(--bg · --accent · --sel-* …)은 다른 규칙·브랜치가 그대로 쓰도록 맨 아래에서 새 토큰으로 잇는다. */
+
+:root {
+  /* ── 표면: 캔버스(코르크) < 종이 < 입력(순백) ── */
+  --canvas: #ece1cb; /* 대화 영역 바탕 — 코르크판 */
+  --paper: #fffdf6; /* 사이드바·머리줄·카드·창 — 크림 종이 */
+  --paper-line: #f0e7d4; /* 종이 카드 테두리 */
+  --tint: #f7f0e3; /* brand-50 — 누르기 전 살짝(호버)·보조 버튼 */
+  --wood: #ecdcc2; /* brand-100 — 고른 줄(세션·설정 범주) */
+  --track: #ece3d2; /* 세그먼트 바닥·날짜 알약·움푹한 칸 */
+  --input: #ffffff; /* 입력창·바깥선 버튼만 순백 */
+  --code: #f5eee1;
+  --line: #e8ddc8;
+  --line-strong: #d9cbb0;
+
+  /* ── 잉크(에스프레소 3단) — ink-3 은 종이·틴트·입력 위에서만(캔버스·고른 줄 위에선 ink-2) ── */
+  --ink: #3a2c20;
+  --ink-2: #6e5847;
+  --ink-3: #7f6955;
+  --hint: #7f6955; /* 자리표시 글자 — 코노티 #B8A78F 는 2.3:1 이라 올림 */
+
+  /* ── 오크(기본 액션) ── */
+  --brand: #9c6b43; /* 채움(흰 글자 4.57:1)·포커스 링·선 */
+  --brand-ink: #7e5430; /* 오크 글자 — 링크·켜진 탭 */
+  --brand-hover: #7e5430;
+  --on-brand: #ffffff;
+  /* 내 요청 말풍선 — 폰과 같은 오크 채움. 보조 줄(누가·언제)도 흰색: 오크 위에서 4.5:1 을 넘는 건 흰색뿐 */
+  --me: #9c6b43;
+  --me-ink: #ffffff;
+  --me-meta: #ffffff;
+
+  /* ── 의미색: 채움/점은 원값, 글자는 -ink ── */
+  --unread: #b1492f; /* 브릭 — 안 읽음 배지·점·선(흰 글자 5.44:1) */
+  --unread-ink: #9e3d25;
+  --danger: #b1492f; /* 지우기·오류 채움 */
+  --danger-ink: #9e3d25;
+  --danger-bg: #f6e6e0;
+  --danger-line: #e8c3b3;
+  --live: #5f8a58; /* 세이지 — 작업 중(코노티 폰 aiToneColor.live) */
+  --live-ink: #4a7044;
+  --live-bg: #eef3e8;
+  --attn: #c0822e; /* 앰버 — 응답 필요·예약(폰 attention·scheduled) */
+  --attn-ink: #8a5a14;
+  --attn-bg: #fff4e6;
+  --attn-line: #ecd3ad;
+  --attn-fill: #8a5a14; /* 숫자 배지 채움(흰 글자 5.9:1) */
+  --on-attn: #ffffff;
+  --ai: #7d5a86; /* 플럼 — 모델을 부르는 기능(대화 이력 찾기·태그 제안) */
+  --ai-ink: #7d5a86;
+  --ai-bg: #f3ecf2;
+  --ai-line: #cbb2d2;
+  --dot-idle: #cdbfa6; /* 켜져 있지만 쉬는 세션 */
+
+  /* ── 깊이: 검정이 아니라 브라운 그림자 ── */
+  --shadow-card: 0 8px 20px rgba(95, 62, 30, 0.1);
+  --shadow-float: 0 4px 14px rgba(95, 62, 30, 0.18);
+  --shadow-pop: 0 14px 36px rgba(95, 62, 30, 0.2), 0 2px 6px rgba(95, 62, 30, 0.08);
+  --scrim: rgba(48, 30, 18, 0.42);
+  --focus: #9c6b43;
+
+  /* ── 모서리(코노티 규격 · 데스크톱 30~34px 컨트롤은 sm) ── */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 12px;
+  --r-card: 14px;
+  --r-dialog: 16px;
+  --r-bubble: 16px;
+  --r-tail: 4px;
+  --r-pill: 999px;
+
+  /* ── 간격(2px 단위 — 실제로 쓰는 값만) ── */
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 6px;
+  --sp-4: 8px;
+  --sp-5: 10px;
+  --sp-6: 12px;
+  --sp-7: 14px;
+  --sp-8: 16px;
+  --sp-10: 20px;
+  --sp-12: 24px;
+
+  /* ── 글자: 시스템 글꼴(코노티도 번들 폰트 없음) · 위계는 크기·굵기로만 ── */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", system-ui, sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, Consolas, "D2Coding", monospace;
+  --fs-h1: 24px; /* 800 · -0.4px */
+  --fs-h2: 19px; /* 700 */
+  --fs-title: 17px; /* 800 · -0.2px — 창·머리줄 제목 */
+  --fs-card: 16px;
+  --fs-h3: 15px;
+  --fs-bubble: 14.5px;
+  --fs-body: 14px;
+  --fs-sm: 13px;
+  --fs-sub: 12.5px;
+  --fs-caption: 12px;
+  --fs-badge: 11px; /* 배지는 예외 없이 11/700 */
+  --fs-nano: 10px;
+
+  /* ── 움직임: 사용자가 한 일에 답할 때만, 짧게 ── */
+  --dur-1: 120ms;
+  --dur-2: 180ms;
+  --dur-3: 250ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  color-scheme: light;
+}
+
+/* 다크 — 에스프레소. 코노티엔 다크가 없어 같은 의미색을 밝은 쪽으로 옮겨 새로 맞췄다 */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #1a1511;
+    --paper: #231c16;
+    --paper-line: #33291f;
+    --tint: #2b231c;
+    --wood: #3a2d22;
+    --track: #322820;
+    --input: #1e1813;
+    --code: #2a221b;
+    --line: #362c23;
+    --line-strong: #4a3d31;
+
+    --ink: #f2e9dc;
+    --ink-2: #cdbda8;
+    --ink-3: #a8957e;
+    --hint: #a8957e;
+
+    --brand: #d2a276;
+    --brand-ink: #d9ac82;
+    --brand-hover: #e0b68f;
+    --on-brand: #1a1511;
+    --me: #6e4a2c;
+    --me-ink: #f2e9dc;
+    --me-meta: #dcc9ae;
+
+    --unread: #b84d33;
+    --unread-ink: #ee8b70;
+    --danger: #b84d33;
+    --danger-ink: #ee8b70;
+    --danger-bg: #3a221b;
+    --danger-line: #6b3527;
+    --live: #7fae76;
+    --live-ink: #97c08e;
+    --live-bg: #243021;
+    --attn: #d99a48;
+    --attn-ink: #e5ac5c;
+    --attn-bg: #332816;
+    --attn-line: #5c4421;
+    --attn-fill: #d99a48;
+    --on-attn: #1a1511;
+    --ai: #b48fc0;
+    --ai-ink: #c6a3d1;
+    --ai-bg: #2e2331;
+    --ai-line: #5a4462;
+    --dot-idle: #6b5a49;
+
+    --shadow-card: 0 1px 0 rgba(8, 5, 2, 0.35);
+    --shadow-float: 0 4px 16px rgba(8, 5, 2, 0.5);
+    --shadow-pop: 0 16px 40px rgba(8, 5, 2, 0.6), 0 0 0 1px rgba(242, 233, 220, 0.04);
+    --scrim: rgba(8, 5, 2, 0.6);
+    --focus: #d2a276;
+
+    color-scheme: dark;
+  }
+}
+
+/* ── 예전 이름 → 새 토큰(App.css 와 다른 브랜치의 규칙이 그대로 쓴다) ── */
+:root {
+  --bg: var(--paper);
+  --bg-soft: var(--tint);
+  --bg-sunk: var(--track);
+  --accent: var(--unread); /* 강조 = 안 읽음(코노티의 "빨간불") */
+  --accent-ink: #ffffff;
+  --accent-soft: var(--danger-bg);
+  --user: var(--me); /* 내 요청 말풍선 = 오크(폰과 같다) */
+  --sel-bg: var(--wood);
+  --sel-ink: var(--ink);
+  --sel-ink-2: var(--ink-2);
+  --code-bg: var(--code);
+  --shadow: var(--shadow-card);
+  --warn: var(--attn);
+}
+
+/* ── 기본 ── */
+::selection {
+  background: var(--wood);
+  color: var(--ink);
+}
+html {
+  scrollbar-color: var(--line-strong) transparent;
+}
+/* 키보드 포커스 — 오크 2px 링(모든 표면에서 3:1 이상) */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline-offset: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* 진행 표시는 정보라 남긴다(천천히) */
+  .spin {
+    animation-duration: 2.4s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}

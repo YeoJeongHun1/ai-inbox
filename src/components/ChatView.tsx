@@ -26,6 +26,7 @@ import {
 import {
   api,
   filterActive,
+  isFinished,
   isUnread,
   NO_FILTER,
   phoneReply,
@@ -45,11 +46,12 @@ import {
   type ToastFn,
   type Turn,
 } from "../api";
-import { clock, dayKey, dayParts, daysLeft, duration, fullTime, modelName, numeral, statusView, tokens, toolName, usd } from "../format";
+import { clock, dayKey, dayParts, daysLeft, duration, fullTime, modelName, numeral, statusView, toolName, usd } from "../format";
 import { kbd } from "../keys";
 import { AttStrip, Lightbox } from "./Attachments";
 import { Composer } from "./Composer";
-import { Markdown } from "./Markdown";
+import { AttentionBadge, CostLine, ProcessBlock, ResultBlock, UnderstandingLine } from "./TurnCard";
+import { attentionOf } from "../turncard";
 import { Outline, outlineTitle } from "./Outline";
 import { TagBar } from "./TagBar";
 import { TagBadges, TagPicker } from "./TagUi";
@@ -1116,26 +1118,6 @@ const UserBubble = memo(function UserBubble({
   );
 });
 
-/** 본문이 칸을 넘칠 때만 아래를 흐리게 */
-function Clamp({ children }: { children: React.ReactNode }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [over, setOver] = useState(false);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const check = () => setOver(el.scrollHeight > el.clientHeight + 2);
-    check();
-    const ro = new ResizeObserver(check);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [children]);
-  return (
-    <div ref={ref} className={`ai-body ${over ? "over" : ""}`}>
-      {children}
-    </div>
-  );
-}
-
 function StatusIcon({ t }: { t: Turn }) {
   if (t.status === "running" || t.status === "background") return <Loader2 size={15} className="spin" />;
   if (t.status === "waiting") return <PauseCircle size={15} />;
@@ -1179,7 +1161,7 @@ const AiBubble = memo(function AiBubble({
   const live = t.status === "running" || t.status === "background" || t.status === "waiting";
   const unread = isUnread(t);
   const onOpen = () => onOpenTurn(t.id);
-  const body = t.response_text?.trim() || (live ? t.understanding?.trim() : "") || "";
+  const attention = attentionOf(t);
   const step = t.last_step;
   const stepLine =
     live && step
@@ -1212,29 +1194,16 @@ const AiBubble = memo(function AiBubble({
         </span>
       </div>
 
+      {/* 턴 카드 순서: (질문은 위 말풍선) 응답 필요 배지 · 이해 · 결과 · 과정 · 비용 */}
+      {attention && <AttentionBadge a={attention} />}
       {stepLine && <div className="ai-step">지금: {stepLine}</div>}
-      {t.summary && <p className="ai-summary">{t.summary}</p>}
-      {body ? (
-        <Clamp>
-          <Markdown>{body.length > 6000 ? body.slice(0, 6000) + "\n\n…" : body}</Markdown>
-        </Clamp>
-      ) : (
-        !live && (
-          <div className="ai-empty">
-            {t.prompt_source === "mid-turn" ? "따로 답한 글 없이 앞 요청 안에서 이어졌습니다." : "응답 텍스트 없이 끝났습니다."}
-          </div>
-        )
-      )}
+      <UnderstandingLine t={t} />
+      <ResultBlock t={t} cap />
+      {(isFinished(t.status) || t.tool_calls > 0) && <ProcessBlock t={t} />}
 
       <div className="ai-foot">
-        <span className="facts">
-          {t.tool_calls > 0 && <span>도구 {t.tool_calls}</span>}
-          {t.files_changed > 0 && <span>파일 {t.files_changed}</span>}
-          {t.subagent_count > 0 && <span>에이전트 {t.subagent_count}</span>}
-          {t.output_tokens > 0 && <span>출력 {tokens(t.output_tokens)}</span>}
-          {t.model && <span>{modelName(t.model)}</span>}
-          {t.ended_at && <time>{clock(t.ended_at)}</time>}
-        </span>
+        <CostLine t={t} />
+        {t.ended_at && <time>{clock(t.ended_at)}</time>}
         <button className="reply-btn" title="이 결과에 답장" onClick={() => onReply(t, "response")}>
           <Reply size={13} /> 답장
         </button>
