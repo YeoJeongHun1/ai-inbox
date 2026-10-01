@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { ChevronDown, ChevronUp, Code2, Copy, Download, Eye, MailOpen, Star, X } from "lucide-react";
 import { api, isFinished, type TurnDetail } from "../api";
+import { kbd } from "../keys";
 import { buildTurnMarkdown, suggestedFileName } from "../markdown";
 import { Markdown } from "./Markdown";
 
@@ -54,10 +55,10 @@ export function DocPanel({ turnId, refreshKey, onClose, onNavigate, onChanged, t
     <aside className="doc">
       <header className="doc-head" data-tauri-drag-region>
         <div className="doc-nav">
-          <button className="icon-btn" title="이전 요청 (⌥↑)" disabled={!detail.prev_id} onClick={() => detail.prev_id && onNavigate(detail.prev_id)}>
+          <button className="icon-btn" title={`이전 요청 (${kbd("⌥↑")})`} disabled={!detail.prev_id} onClick={() => detail.prev_id && onNavigate(detail.prev_id)}>
             <ChevronUp size={17} />
           </button>
-          <button className="icon-btn" title="다음 요청 (⌥↓)" disabled={!detail.next_id} onClick={() => detail.next_id && onNavigate(detail.next_id)}>
+          <button className="icon-btn" title={`다음 요청 (${kbd("⌥↓")})`} disabled={!detail.next_id} onClick={() => detail.next_id && onNavigate(detail.next_id)}>
             <ChevronDown size={17} />
           </button>
           <span className="doc-seq">요청 {t.seq}</span>

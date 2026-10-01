@@ -3,6 +3,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { listen } from "@tauri-apps/api/event";
 import { ArrowUp, Clock, ImagePlus, Lock, Reply, X } from "lucide-react";
 import { api, quoteLabel, type AttMeta, type QuoteTarget, type SessionHeader, type SendMode } from "../api";
+import { kbd } from "../keys";
 import { DraftTray, MAX_ATTS, hasFiles, imagesFromClipboard, useAttachDraft } from "./Attachments";
 import { tagColor, useTags } from "../tags";
 import { ScheduleDialog } from "./ScheduleDialog";
@@ -238,7 +239,7 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
         <button
           type="button"
           className="attach-btn"
-          title={`이미지 붙이기 — 붙여넣기(⌘V)·끌어다 놓기도 됩니다 (${MAX_ATTS}장까지)`}
+          title={`이미지 붙이기 — 붙여넣기(${kbd("⌘V")})·끌어다 놓기도 됩니다 (${MAX_ATTS}장까지)`}
           disabled={att.items.length >= MAX_ATTS}
           onClick={() => picker.current?.click()}
         >

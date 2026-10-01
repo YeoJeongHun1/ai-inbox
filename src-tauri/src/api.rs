@@ -338,6 +338,8 @@ pub struct SessionHeader {
     input_total: i64,
     api_calls: i64,
     resume_command: String,
+    /// Windows 에서만: 셸별 이어가기 명령(PowerShell · 명령 프롬프트 · Git Bash). 다른 OS 는 비어 있다
+    resume_shells: Vec<ShellCommand>,
     /// 폰 답: 0 받음(기본) · 1 막음
     conoti_mode: i64,
     /// AI Inbox 채널과 함께 실행 중
@@ -408,7 +410,9 @@ fn session_header_row(conn: &Connection, sid: &str) -> R<SessionHeader> {
             let (name, named) = display_name(r.get(1)?, r.get(2)?, r.get(3)?, r.get(16)?, &dir);
             let id: String = r.get(0)?;
             let agent = agent_of(r.get(25)?);
-            let resume = if agent == "codex" { resume_command_with(dir.as_deref(), &id, "codex resume") } else { resume_command(dir.as_deref(), &id) };
+            let base = if agent == "codex" { "codex resume" } else { "claude --resume" };
+            let resume = if agent == "codex" { resume_command_with(dir.as_deref(), &id, base) } else { resume_command(dir.as_deref(), &id) };
+            let resume_shells = if cfg!(windows) { resume_commands_windows(dir.as_deref(), &id, base) } else { vec![] };
             Ok(SessionHeader {
                 name,
                 named,
@@ -432,6 +436,7 @@ fn session_header_row(conn: &Connection, sid: &str) -> R<SessionHeader> {
                 input_total: r.get(21)?,
                 api_calls: r.get(22)?,
                 resume_command: resume,
+                resume_shells,
                 conoti_mode: r.get::<_, Option<i64>>(23)?.unwrap_or(0),
                 archived: r.get::<_, i64>(24)? != 0,
                 channel_live: crate::channel::channel_alive(&id),
@@ -454,18 +459,67 @@ pub fn resume_command(dir: Option<&str>, id: &str) -> String {
 
 /// `base` 는 이 앱이 정한 고정 문자열(`claude --resume` · `codex resume`)만 넘긴다
 pub fn resume_command_with(dir: Option<&str>, id: &str, base: &str) -> String {
-    let id_ok = (8..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    let resume = if id_ok { format!("{base} {id}") } else { base.to_string() };
-    let Some(d) = dir.filter(|d| !d.is_empty() && !d.chars().any(char::is_control)) else {
-        return resume;
-    };
+    let resume = resume_part(id, base);
+    let Some(d) = usable_dir(dir) else { return resume };
     if cfg!(windows) {
-        // PowerShell: 작은따옴표 안에서는 '' 만 특별하다
-        format!("Set-Location -LiteralPath '{}'; {resume}", d.replace('\'', "''"))
+        in_powershell(d, &resume)
     } else {
-        // sh/bash/zsh: 작은따옴표 안에서는 아무것도 해석되지 않는다. ' 는 '\'' 로 끊어 넣는다
-        format!("cd '{}' && {resume}", d.replace('\'', "'\\''"))
+        in_sh(d, &resume)
     }
+}
+
+fn resume_part(id: &str, base: &str) -> String {
+    let id_ok = (8..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if id_ok { format!("{base} {id}") } else { base.to_string() }
+}
+
+fn usable_dir(dir: Option<&str>) -> Option<&str> {
+    dir.filter(|d| !d.is_empty() && !d.chars().any(char::is_control))
+}
+
+/// PowerShell 이 작은따옴표로 치는 글자 — ASCII `'` 말고도 ‘ ’ ‚ ‛(U+2018~201B). 어느 것이든 작은따옴표 문자열을 닫는다
+fn ps_single_quote(c: char) -> bool {
+    matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
+}
+
+/// PowerShell: 작은따옴표 안에서는 작은따옴표(위 다섯 글자)만 특별하다 — 두 번 쓰면 그 글자 하나가 된다
+fn in_powershell(d: &str, resume: &str) -> String {
+    let mut q = String::with_capacity(d.len() + 8);
+    for c in d.chars() {
+        if ps_single_quote(c) {
+            q.push(c);
+        }
+        q.push(c);
+    }
+    format!("Set-Location -LiteralPath '{q}'; {resume}")
+}
+
+/// sh/bash/zsh: 작은따옴표 안에서는 아무것도 해석되지 않는다. ' 는 '\'' 로 끊어 넣는다
+fn in_sh(d: &str, resume: &str) -> String {
+    format!("cd '{}' && {resume}", d.replace('\'', "'\\''"))
+}
+
+#[derive(Serialize)]
+pub struct ShellCommand {
+    /// powershell | cmd | bash
+    shell: &'static str,
+    command: String,
+}
+
+/// Windows: 셸마다 문법이 달라 셸별 이어가기 명령 — PowerShell(기본) · 명령 프롬프트 · Git Bash.
+/// 명령 프롬프트는 큰따옴표 안에서도 `%이름%` 을 풀어 버리므로 `%`·`"` 가 든 경로면 빼고, 안전하게 못 만드는 셸은 목록에 없다
+pub fn resume_commands_windows(dir: Option<&str>, id: &str, base: &str) -> Vec<ShellCommand> {
+    let resume = resume_part(id, base);
+    let Some(d) = usable_dir(dir) else {
+        return ["powershell", "cmd", "bash"].into_iter().map(|shell| ShellCommand { shell, command: resume.clone() }).collect();
+    };
+    let mut out = vec![ShellCommand { shell: "powershell", command: in_powershell(d, &resume) }];
+    if !d.contains(['%', '"']) {
+        out.push(ShellCommand { shell: "cmd", command: format!("cd /d \"{d}\" && {resume}") });
+    }
+    // Git Bash 는 `C:/…` 를 받는다 — 역슬래시는 bash 에서도 작은따옴표 안이라 글자지만, 슬래시가 어디서나 통한다
+    out.push(ShellCommand { shell: "bash", command: in_sh(&d.replace('\\', "/"), &resume) });
+    out
 }
 
 #[derive(Serialize)]
@@ -700,6 +754,102 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "/tmp/proj\"; touch X; echo \"$(id)`id`'x");
         assert_eq!(resume_command(Some("/x"), "abc; rm -rf ~"), "cd '/x' && claude --resume");
         assert_eq!(resume_command(Some("/x\n/y"), id), format!("claude --resume {id}"));
+    }
+
+    #[test]
+    fn windows_resume_commands_per_shell() {
+        use super::resume_commands_windows;
+        let id = "00000000-1111-4222-8333-444455556666";
+        let get = |v: &[super::ShellCommand], s: &str| v.iter().find(|c| c.shell == s).map(|c| c.command.clone());
+        let v = resume_commands_windows(Some(r"C:\work\it's mine"), id, "claude --resume");
+        assert_eq!(get(&v, "powershell").unwrap(), format!(r"Set-Location -LiteralPath 'C:\work\it''s mine'; claude --resume {id}"));
+        assert_eq!(get(&v, "cmd").unwrap(), format!(r#"cd /d "C:\work\it's mine" && claude --resume {id}"#));
+        assert_eq!(get(&v, "bash").unwrap(), format!(r"cd 'C:/work/it'\''s mine' && claude --resume {id}"));
+        // 명령 프롬프트는 %이름% 을 따옴표 안에서도 푼다 — 그런 경로면 명령 프롬프트용은 없다
+        let v = resume_commands_windows(Some(r"C:\a%PATH%b"), id, "claude --resume");
+        assert!(get(&v, "cmd").is_none() && get(&v, "powershell").is_some());
+        // 폴더를 모르면 이어가기 명령만
+        let v = resume_commands_windows(None, id, "codex resume");
+        assert!(v.iter().all(|c| c.command == format!("codex resume {id}")));
+    }
+
+    /// PowerShell 토크나이저의 작은따옴표 문자열 읽기(ScanStringLiteral)를 흉내 낸다 — 여는 따옴표부터 읽어 (문자열 값, 닫는 따옴표 뒤)
+    fn ps_literal(s: &str) -> Option<(String, &str)> {
+        use super::ps_single_quote;
+        let mut it = s.char_indices().peekable();
+        if !ps_single_quote(it.next()?.1) {
+            return None;
+        }
+        let mut out = String::new();
+        while let Some((i, c)) = it.next() {
+            if ps_single_quote(c) {
+                match it.peek() {
+                    // 따옴표 둘 = 뒤의 글자 하나
+                    Some(&(_, n)) if ps_single_quote(n) => {
+                        it.next();
+                        out.push(n);
+                        continue;
+                    }
+                    _ => return Some((out, &s[i + c.len_utf8()..])),
+                }
+            }
+            out.push(c);
+        }
+        None // 닫히지 않았다
+    }
+
+    #[test]
+    fn powershell_path_cannot_escape_with_curly_single_quotes() {
+        use super::resume_commands_windows;
+        let id = "00000000-1111-4222-8333-444455556666";
+        // PowerShell 은 ‘ ’ ‚ ‛ 도 작은따옴표로 친다 — ASCII ' 만 겹쳐 쓰면 `’; calc; ’` 가 명령으로 샌다
+        for d in [r"C:\w\x’; calc; ’", r"C:\w\x‘; calc; ‘", r"C:\w\‚a‛'b’’c", r"C:\it's", r"C:\plain"] {
+            let v = resume_commands_windows(Some(d), id, "claude --resume");
+            let ps = v.iter().find(|c| c.shell == "powershell").unwrap().command.clone();
+            let rest = ps.strip_prefix("Set-Location -LiteralPath ").unwrap_or_else(|| panic!("{ps}"));
+            let (lit, after) = ps_literal(rest).unwrap_or_else(|| panic!("닫히지 않은 문자열: {ps}"));
+            assert_eq!(lit, d, "{ps}");
+            assert_eq!(after, format!("; claude --resume {id}"), "경로가 명령으로 새지 않는다: {ps}");
+        }
+        assert_eq!(super::in_powershell("C:\\w\\x’; calc; ’", "claude"), "Set-Location -LiteralPath 'C:\\w\\x’’; calc; ’’'; claude");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn powershell_curly_quote_folder_is_a_literal_on_windows() {
+        use super::resume_commands_windows;
+        let dir = std::env::temp_dir().join(format!("aiinbox-ps ’; Write-Output PWNED; ’ {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("here.txt"), "").unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        let v = resume_commands_windows(Some(&d), "x", "Test-Path here.txt");
+        let ps = v.iter().find(|c| c.shell == "powershell").unwrap();
+        let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &ps.command]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout.trim(), "True", "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!stdout.contains("PWNED"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_resume_commands_land_in_the_folder() {
+        use super::resume_commands_windows;
+        use std::os::windows::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("aiinbox-resume it's {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("here.txt"), "").unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        // 세션 ID 가 형식에 안 맞으면 base 만 붙는다 — base 자리에 "이 폴더에 왔나" 확인을 넣어 본다
+        let v = resume_commands_windows(Some(&d), "x", "Test-Path here.txt");
+        let ps = v.iter().find(|c| c.shell == "powershell").unwrap();
+        let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &ps.command]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "True", "{}", String::from_utf8_lossy(&out.stderr));
+        let v = resume_commands_windows(Some(&d), "x", "if exist here.txt echo yes");
+        let cmd = v.iter().find(|c| c.shell == "cmd").unwrap();
+        let out = std::process::Command::new("cmd").raw_arg(format!("/C {}", cmd.command)).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "yes", "{}", cmd.command);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

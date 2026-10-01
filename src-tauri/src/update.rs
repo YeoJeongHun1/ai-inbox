@@ -173,10 +173,18 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
                 done += chunk as u64;
                 let _ = a.emit("update-progress", json!({"done": done, "total": total}));
             },
-            || {},
+            || {
+                // Windows: 대기 훅이 이 실행 파일을 쥐고 있으면 설치기가 강제로 끝낸다 — 설치 전에 스스로 끝나게(wake::release_all)
+                if cfg!(windows) {
+                    crate::wake::release_all(Duration::from_secs(3));
+                }
+            },
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            crate::wake::resume();
+            e.to_string()
+        })?;
     app.restart();
 }
 

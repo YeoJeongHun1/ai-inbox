@@ -141,8 +141,8 @@ fn detect_codex() -> CliInfo {
     info.version = crate::codex::version();
     c.args(["login", "status"]);
     if let Some(o) = capture_simple(c, Duration::from_secs(10)) {
-        let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&o.stderr));
+        let mut text = crate::text::cli_text(&o.stdout);
+        text.push_str(&crate::text::cli_text(&o.stderr));
         (info.logged_in, info.login_kind) = parse_codex_login(&text, o.code == Some(0));
     }
     info
@@ -330,6 +330,8 @@ fn run_claude_in(dir: &Path, mut cmd: Command, model: &str, system: &str, prompt
         return Err("모델 이름 형식이 올바르지 않습니다".into());
     }
     cmd.args(claude_args(model, system, safe_mode)).current_dir(dir).env(INTERNAL_ENV, "1");
+    // 지침(--system-prompt)은 여러 줄이다
+    crate::deliver::multiline_ok(&cmd)?;
     let out = exec_cli(cmd, prompt.as_bytes(), timeout).map_err(exec_msg)?;
     finish(out, None)
 }
@@ -359,9 +361,9 @@ fn finish(out: Captured, file_text: Option<String>) -> R<String> {
         None => String::from_utf8_lossy(&out.stdout).to_string(),
     };
     if out.code != Some(0) {
-        let mut hay = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        let mut hay = crate::text::cli_text(&out.stdout).to_lowercase();
         hay.push('\n');
-        hay.push_str(&String::from_utf8_lossy(&out.stderr).to_lowercase());
+        hay.push_str(&crate::text::cli_text(&out.stderr).to_lowercase());
         return Err(classify(&hay, out.code));
     }
     answer = answer.trim().to_string();
@@ -452,11 +454,23 @@ impl Reader {
 
 /// 명령을 돌린다: 표준입력에 `input` 을 쓰고 닫고, 제한 시간을 넘기면 죽인다. 출력은 상한까지만 모은다
 pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captured, ExecErr> {
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::deliver::no_console(&mut cmd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // 자기 프로세스 그룹에서 돌려, 시간 초과 때 CLI 가 띄운 하위 프로세스까지 함께 끝낸다
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    // Windows: 멈춘 채 만들어(창 없이는 그대로) 작업 개체에 넣은 뒤에 푼다 — `win_job` 참고
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, win_job::CREATE_NO_WINDOW | win_job::CREATE_SUSPENDED);
     let mut child = cmd.spawn().map_err(|_| ExecErr::Spawn)?;
+    #[cfg(windows)]
+    let job = win_job::Job::adopt(&child);
+    #[cfg(windows)]
+    if !win_job::resume(child.id()) {
+        // 풀지 못한 자식은 영영 멈춰 있다 — 끝내고 실행 실패로
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ExecErr::Spawn);
+    }
     let stdin = child.stdin.take();
     let data = input.to_vec();
     let writer = std::thread::spawn(move || {
@@ -476,6 +490,11 @@ pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captu
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }
+                // Windows 에는 프로세스 그룹 신호가 없다 — 작업 개체째 끝낸다(`kill` 은 직계 자식만 끝낸다)
+                #[cfg(windows)]
+                if let Some(j) = &job {
+                    j.terminate();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -492,9 +511,134 @@ pub fn exec_cli(mut cmd: Command, input: &[u8], limit: Duration) -> Result<Captu
     }
 }
 
+/// Windows: 시간 초과 때 CLI 가 띄운 하위 프로세스(손자·증손자)까지 끝내는 작업 개체(Job Object).
+///
+/// 프로세스 목록의 부모 pid 로 나무를 더듬으면, 끝난 부모의 pid 가 재사용됐을 때 무관한 프로세스를 끝낼 수 있고 목록을 뜬 뒤에 뜬 손자·
+/// 중간 부모가 먼저 끝난 손자는 놓친다. 작업 소속은 커널이 새 프로세스에 물려주므로 둘 다 없다(pid 로 고르지 않는다).
+/// 자식은 멈춘 채(`CREATE_SUSPENDED`) 만들어 작업에 넣은 뒤에 풀어, 넣기 전에 손자를 띄울 틈도 없다.
+/// 제한(`KILL_ON_JOB_CLOSE`)은 걸지 않는다 — 정상으로 끝난 뒤 작업을 닫아도 남은 프로세스는 두고(유닉스의 프로세스 그룹처럼 시간 초과 때만
+/// 끝낸다, CLI 가 따로 띄운 업데이트 같은 것을 끊지 않게)
+#[cfg(windows)]
+mod win_job {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject};
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    pub use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+
+    pub struct Job(HANDLE);
+
+    impl Job {
+        /// 새 작업을 만들어 (아직 멈춰 있는) 자식을 넣는다. 못 넣으면 None — 그때는 시간 초과 때 직계 자식만 끝난다
+        pub fn adopt(child: &std::process::Child) -> Option<Job> {
+            // SAFETY: 이름·보안 속성 없는 새 작업. 핸들은 Job 이 닫는다. 자식 핸들은 child 가 살아 있는 동안 유효하다
+            unsafe {
+                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if h.is_null() {
+                    return None;
+                }
+                let job = Job(h);
+                (AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) != 0).then_some(job)
+            }
+        }
+
+        /// 작업 안의 프로세스를 모두 끝낸다
+        pub fn terminate(&self) {
+            // SAFETY: 이 Job 이 연 핸들
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: 이 Job 이 연 핸들을 한 번만 닫는다
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// 멈춘 채 만든 프로세스 `pid` 의 스레드를 푼다(std 는 주 스레드 핸들을 안정 API 로 내주지 않는다). 하나도 못 풀면 false.
+    /// 호출하는 쪽이 그 프로세스 핸들(`Child`)을 쥐고 있어 pid 가 재사용될 수 없다
+    pub fn resume(pid: u32) -> bool {
+        let mut resumed = false;
+        // SAFETY: 스냅샷·스레드 핸들은 여기서 열고 닫는다. THREADENTRY32 는 dwSize 를 채워 넘긴다
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            let mut e: THREADENTRY32 = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut ok = Thread32First(snap, &mut e) != 0;
+            while ok {
+                if e.th32OwnerProcessID == pid {
+                    let h = OpenThread(THREAD_SUSPEND_RESUME, 0, e.th32ThreadID);
+                    if !h.is_null() {
+                        resumed |= ResumeThread(h) != u32::MAX;
+                        CloseHandle(h);
+                    }
+                }
+                ok = Thread32Next(snap, &mut e) != 0;
+            }
+            CloseHandle(snap);
+        }
+        resumed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn timeout_ends_grandchildren_on_windows() {
+        // cmd(자식)가 띄운 ping(손자)이 출력 파일을 쥐고 있다 — 손자가 살아 있으면 그 파일을 지울 수 없다
+        let dir = std::env::temp_dir().join(format!("aiinbox-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("held.txt");
+        let mut c = Command::new("cmd");
+        // cmd 의 따옴표 규칙은 Rust 의 인자 이스케이프와 다르다 — 그대로 넘긴다
+        std::os::windows::process::CommandExt::raw_arg(&mut c, format!("/C ping -n 60 127.0.0.1 > \"{}\"", held.display()));
+        let t = Instant::now();
+        assert!(matches!(exec_cli(c, b"", Duration::from_secs(2)), Err(ExecErr::Timeout)));
+        assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
+        let until = Instant::now() + Duration::from_secs(5);
+        while std::fs::remove_file(&held).is_err() {
+            assert!(Instant::now() < until, "손자 프로세스(ping)가 아직 파일을 쥐고 있다");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn timeout_ends_orphaned_grandchildren_on_windows() {
+        // 가운데 cmd 가 `start /b` 로 ping 을 띄우고 먼저 끝난다 — ping 의 부모 pid 는 이미 없는 프로세스라 부모 pid 로 나무를 더듬으면 놓친다.
+        // 바깥 cmd 는 두 번째 ping 으로 버틴다(시간 초과가 나게)
+        let dir = std::env::temp_dir().join(format!("aiinbox-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("held.txt");
+        let mut c = Command::new("cmd");
+        std::os::windows::process::CommandExt::raw_arg(
+            &mut c,
+            format!("/C cmd /C start /b ping -n 60 127.0.0.1 > \"{}\" & ping -n 60 127.0.0.1 > nul", held.display()),
+        );
+        assert!(matches!(exec_cli(c, b"", Duration::from_secs(3)), Err(ExecErr::Timeout)));
+        let until = Instant::now() + Duration::from_secs(5);
+        while std::fs::remove_file(&held).is_err() {
+            assert!(Instant::now() < until, "부모를 잃은 손자 프로세스(ping)가 아직 파일을 쥐고 있다");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn claude_auth_parsing_hides_identity() {

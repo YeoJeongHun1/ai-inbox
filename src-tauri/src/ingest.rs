@@ -27,7 +27,8 @@ mod cx;
 
 /// 파서 규칙이 바뀌면 올린다 → 다음 실행 때 백필 기간 안의 파일을 처음부터 다시 읽는다
 /// (읽음·별표 같은 사용자 상태는 upsert 가 건드리지 않으므로 보존된다).
-pub const PARSER_VERSION: &str = "14";
+/// 15: Windows 에서 도구 대상 경로(`turn_touch`)를 드라이브 문자째(`C:/…`) 모은다(`tags::collect_touched`)
+pub const PARSER_VERSION: &str = "15";
 
 const FINISHED: &[&str] = &["done", "interrupted", "stopped"];
 /// 이보다 오래 조용하고 프로세스도 없으면 멈춘 것으로 본다.

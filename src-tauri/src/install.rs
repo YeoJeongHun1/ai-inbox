@@ -66,13 +66,24 @@ pub fn wake_command() -> String {
 }
 
 /// 첨부 이미지 폴더 읽기 허용 규칙. Claude Code 규칙에서 절대 경로는 `//` 로 시작한다(실측: 공백 있는 경로도 된다).
-/// 윈도우는 경로 규칙 표기가 달라 넣지 않는다(권한 창이 뜬다).
 pub fn read_rule() -> Option<String> {
-    if cfg!(windows) {
-        return None;
-    }
-    let dir = crate::attach::dir().to_string_lossy().into_owned();
-    (dir.starts_with('/') && !dir.contains([')', '*', '\n'])).then(|| format!("Read(/{dir}/**)"))
+    rule_for_dir(&crate::attach::dir().to_string_lossy(), cfg!(windows))
+}
+
+/// Windows 는 경로를 POSIX 꼴로 바꿔 맞춘다(Claude Code 권한 문서: `C:\Users\alice` → `/c/Users/alice`, 규칙은 `//c/...`).
+/// 드라이브 문자 경로만 — 네트워크 경로(`\\server\share`)는 넣지 않는다(권한 창이 뜬다).
+fn rule_for_dir(dir: &str, windows: bool) -> Option<String> {
+    let posix = if windows {
+        let d = dir.replace('\\', "/");
+        let b = d.as_bytes();
+        if !(b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/') {
+            return None;
+        }
+        format!("/{}{}", d[..1].to_ascii_lowercase(), &d[2..])
+    } else {
+        dir.to_string()
+    };
+    (posix.starts_with('/') && !posix.contains([')', '*', '\n'])).then(|| format!("Read(/{posix}/**)"))
 }
 
 /// 우리가 넣은 읽기 규칙(데이터 폴더가 바뀌었어도 알아본다)
@@ -168,6 +179,20 @@ fn our_kind(command: &str) -> Option<&'static str> {
     };
     let name = path.rsplit(['/', '\\']).next().unwrap_or("");
     BIN_NAMES.contains(&name).then_some(kind)
+}
+
+/// 설치된 훅 명령어가 지금 실행 파일의 것과 같은가. Windows 경로는 대소문자·구분자(`\`·`/`)를 가리지 않는다
+fn same_command(a: &str, b: &str) -> bool {
+    same_command_on(a, b, cfg!(windows))
+}
+
+fn same_command_on(a: &str, b: &str, windows: bool) -> bool {
+    if windows {
+        let n = |s: &str| s.trim().replace('\\', "/").to_lowercase();
+        n(a) == n(b)
+    } else {
+        a == b
+    }
 }
 
 fn is_ours(command: &str) -> bool {
@@ -275,7 +300,7 @@ pub fn status() -> Result<HookStatus, String> {
             missing.push(ev.to_string());
         } else {
             installed.push(ev.to_string());
-            if let Some(other) = cmds.iter().find(|c| **c != command) {
+            if let Some(other) = cmds.iter().find(|c| !same_command(c, &command)) {
                 stale = Some(other.clone());
             }
         }
@@ -285,7 +310,7 @@ pub fn status() -> Result<HookStatus, String> {
         .iter()
         .filter(|ev| {
             let cmds = settings.get("hooks").and_then(|h| h.get(**ev)).map(|g| our_commands(g, "wake")).unwrap_or_default();
-            !cmds.iter().any(|c| *c == wake)
+            !cmds.iter().any(|c| same_command(c, &wake))
         })
         .map(|ev| ev.to_string())
         .collect();
@@ -483,6 +508,26 @@ mod tests {
         let mut s = json!({"permissions": {"allow": []}});
         assert!(!strip_rule(&mut s));
         assert_eq!(s, json!({"permissions": {"allow": []}}));
+    }
+
+    #[test]
+    fn hook_commands_compare_like_windows_paths_on_windows() {
+        let now = "\"C:/Program Files/AI Inbox/ai-inbox.exe\" wake";
+        assert!(same_command_on(r#""c:\program files\ai inbox\AI-INBOX.EXE" wake"#, now, true));
+        assert!(!same_command_on("\"C:/Other/ai-inbox.exe\" wake", now, true));
+        assert!(!same_command_on("\"/Applications/AI Inbox.app/Contents/MacOS/AI-INBOX\" wake", "\"/Applications/AI Inbox.app/Contents/MacOS/ai-inbox\" wake", false), "macOS 는 그대로 비교");
+    }
+
+    #[test]
+    fn read_rule_uses_the_posix_form_on_windows() {
+        let win = r"C:\Users\me\AppData\Local\com.yeojeonghun.ai-inbox\attachments";
+        let rule = rule_for_dir(win, true).unwrap();
+        assert_eq!(rule, "Read(//c/Users/me/AppData/Local/com.yeojeonghun.ai-inbox/attachments/**)");
+        assert!(rule.ends_with(&format!("/{}/attachments/**)", paths::IDENTIFIER)), "옛 데이터 폴더 규칙도 알아보는 꼴");
+        assert_eq!(rule_for_dir("D:/data/attachments", true).as_deref(), Some("Read(//d/data/attachments/**)"));
+        assert_eq!(rule_for_dir(r"\\server\share\attachments", true), None, "네트워크 경로는 넣지 않는다");
+        assert_eq!(rule_for_dir("/Users/me/x", false).as_deref(), Some("Read(//Users/me/x/**)"));
+        assert_eq!(rule_for_dir("/Users/me/a)b", false), None);
     }
 
     #[test]

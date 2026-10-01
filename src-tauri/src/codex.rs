@@ -143,6 +143,7 @@ pub(crate) fn codex_cmd_for(stdin_prompt: bool) -> Result<Command, String> {
         return Err("Windows 에서는 npm 래퍼(codex.cmd)로 여러 줄 말을 넘길 수 없습니다 — codex.exe 가 있는 설치가 필요합니다".into());
     }
     let mut c = Command::new(&bin);
+    crate::deliver::no_console(&mut c);
     for (k, _) in std::env::vars_os() {
         if k.to_str().is_some_and(inherited) {
             c.env_remove(k);
@@ -339,7 +340,7 @@ pub fn queue(thread_id: &str, text: &str, images: &[PathBuf]) -> Result<(), Stri
 }
 
 fn launch_error(stderr: &[u8], stdout: &[u8], code: Option<i32>) -> String {
-    let all = format!("{}\n{}", String::from_utf8_lossy(stderr), String::from_utf8_lossy(stdout));
+    let all = format!("{}\n{}", crate::text::cli_text(stderr), crate::text::cli_text(stdout));
     if all.contains("Not inside a trusted directory") {
         return "Codex 가 이 폴더를 신뢰하지 않습니다 — 터미널에서 그 폴더로 가서 codex 를 한 번 열고 신뢰를 허용하세요".into();
     }

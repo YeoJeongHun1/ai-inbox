@@ -204,6 +204,8 @@ export interface SessionHeader {
   input_total: number;
   api_calls: number;
   resume_command: string;
+  /** Windows 에서만: 셸별 이어가기 명령(없으면 빈 배열) */
+  resume_shells?: { shell: "powershell" | "cmd" | "bash"; command: string }[];
   /** 폰 답: 0 받음 · 1 막음 */
   conoti_mode: number;
   channel_live: boolean;

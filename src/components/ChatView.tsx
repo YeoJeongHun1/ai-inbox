@@ -46,6 +46,7 @@ import {
   type Turn,
 } from "../api";
 import { clock, dayKey, dayParts, daysLeft, duration, fullTime, modelName, numeral, statusView, tokens, toolName, usd } from "../format";
+import { kbd } from "../keys";
 import { AttStrip, Lightbox } from "./Attachments";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
@@ -79,9 +80,54 @@ const tocSaved = () => {
   }
 };
 
-const IS_MAC = navigator.userAgent.includes("Mac");
-
 const LIVE_LABEL: Record<string, string> = { busy: "작업 중", idle: "입력 대기", waiting: "승인 대기" };
+
+const SHELL_LABEL: Record<string, string> = { powershell: "PowerShell", cmd: "명령 프롬프트(cmd)", bash: "Git Bash" };
+
+/** Windows: 셸마다 문법이 달라 이어가기 명령을 셸별로 골라 복사한다 */
+function ShellMenu({ x, y, items, onPick, onClose }: { x: number; y: number; items: { shell: string; command: string }[]; onPick: (command: string) => void; onClose: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ x, y });
+  useEffect(() => {
+    const el = ref.current;
+    if (el) {
+      const r = el.getBoundingClientRect();
+      setPos({ x: Math.max(8, Math.min(x, window.innerWidth - r.width - 8)), y: Math.min(y, window.innerHeight - r.height - 8) });
+    }
+    const close = (e: Event) => {
+      if (e instanceof KeyboardEvent && e.key !== "Escape") return;
+      if (e.type === "mousedown" && ref.current?.contains(e.target as Node)) return;
+      onClose();
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("resize", close);
+    };
+  }, [x, y, onClose]);
+  return (
+    <div ref={ref} className="ctx-menu" role="menu" style={{ left: pos.x, top: pos.y }} onContextMenu={(e) => e.preventDefault()}>
+      {items.map((it) => (
+        <button
+          key={it.shell}
+          role="menuitem"
+          title={it.command}
+          onClick={() => {
+            onPick(it.command);
+            onClose();
+          }}
+        >
+          <SquareTerminal size={14} /> {SHELL_LABEL[it.shell] ?? it.shell}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 /** 새로 받은 요청들 중 내용이 그대로인 것은 앞의 객체를 그대로 쓴다 — 말풍선(memo)이 바뀐 것만 다시 그리게.
  *  대화는 수집기가 알릴 때마다(작업 중이면 1.5초마다) 통째로 다시 받는다. */
@@ -154,6 +200,8 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
 
   // ── 요청 목록(목차) · 하나씩 보기 ──
   const [tocOpen, setTocOpen] = useState(tocSaved);
+  const [shellMenu, setShellMenu] = useState<{ x: number; y: number } | null>(null);
+  const closeShellMenu = useCallback(() => setShellMenu(null), []);
   const [outline, setOutline] = useState<OutlineRow[] | null>(null);
   /** 하나씩 보기: 이 요청의 대화만 그린다 */
   const [single, setSingle] = useState(false);
@@ -638,17 +686,35 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
           )}
           <button
             className="text-btn"
-            title={s.attach_command ?? s.resume_command}
-            onClick={async () => {
+            title={s.attach_command ?? (s.resume_shells?.length ? "쓰는 셸을 골라 이어가기 명령을 복사" : s.resume_command)}
+            onClick={async (e) => {
+              // Windows: 셸마다 문법이 달라 고르게 한다(백그라운드 세션을 여는 명령은 어느 셸에서나 같다)
+              if (!s.attach_command && s.resume_shells?.length) {
+                const r = e.currentTarget.getBoundingClientRect();
+                setShellMenu({ x: r.left, y: r.bottom + 4 });
+                return;
+              }
               await writeText(s.attach_command ?? s.resume_command);
               toast(s.attach_command ? "백그라운드 세션을 여는 명령을 복사했습니다" : "이어가기 명령을 복사했습니다");
             }}
           >
             <SquareTerminal size={16} /> {s.attach_command ? "터미널에서 열기" : "이어가기"}
           </button>
+          {shellMenu && s.resume_shells && (
+            <ShellMenu
+              x={shellMenu.x}
+              y={shellMenu.y}
+              items={s.resume_shells}
+              onClose={closeShellMenu}
+              onPick={async (command) => {
+                await writeText(command);
+                toast("이어가기 명령을 복사했습니다");
+              }}
+            />
+          )}
           <button
             className={`toc-btn ${tocOpen ? "on" : ""}`}
-            title={`이 세션의 요청 목록 — 골라서 그 자리로 가거나 하나만 보기 (${IS_MAC ? "⌘⇧O" : "Ctrl+Shift+O"})`}
+            title={`이 세션의 요청 목록 — 골라서 그 자리로 가거나 하나만 보기 (${kbd("⌘⇧O")})`}
             aria-pressed={tocOpen}
             onClick={() => (tocOpen ? closeToc() : setTocOpen(true))}
           >
@@ -676,7 +742,7 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
               await api.setHidden(sessionId, !s.archived);
               await load();
               onRead();
-              toast(s.archived ? "목록으로 되돌렸습니다" : "보관했습니다 — 기록(⌘⇧F) › 세션 › 보관함에서 되돌릴 수 있습니다");
+              toast(s.archived ? "목록으로 되돌렸습니다" : `보관했습니다 — 기록(${kbd("⌘⇧F")}) › 세션 › 보관함에서 되돌릴 수 있습니다`);
             }}
           >
             {s.archived ? <ArchiveRestore size={17} /> : <Archive size={17} />}
