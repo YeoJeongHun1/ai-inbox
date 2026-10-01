@@ -2378,8 +2378,10 @@ mod tests {
         let c = mem();
         session(&c, S1);
         let p = Fake::new(S1, Rt::Live, Work::Idle);
-        add_ok(&c, &new_in(10), &p);
-        tick(&c, plus(10, 0), &p);
+        // 파이프라인의 3시간 상한은 실제 현재 시각(Utc::now)으로 판정하므로, 기준 시각도 현재에서 파생한다(고정 t0 는 시간이 지나면 깨진다).
+        let base = Utc::now() - Duration::minutes(10);
+        add(&c, base, "desktop", &new_in(10), &p).unwrap();
+        tick(&c, base + Duration::minutes(10), &p);
         let mut pipe = conoti::Pipeline::new(c);
         let cap = Capture::default();
         pipe.tick(&cap);
