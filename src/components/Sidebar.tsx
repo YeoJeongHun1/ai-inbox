@@ -194,7 +194,7 @@ export function Sidebar(p: Props) {
           return (
             <button key={t.key} className={`tab ${p.filter === t.key ? "on" : ""}`} onClick={() => p.onFilter(t.key)} title={t.key === "history" ? "/clear 뒤 이력으로 보관한 대화" : undefined}>
               {t.label}
-              {t.count && n > 0 && <span className={`tab-n ${t.key === "active" || t.key === "history" ? "plain" : ""}`}>{n}</span>}
+              {t.count && n > 0 && <span className={`tab-n n-${t.key} ${t.key === "active" || t.key === "history" ? "plain" : ""}`}>{n}</span>}
             </button>
           );
         })}
@@ -265,7 +265,7 @@ export function Sidebar(p: Props) {
                 <div className="row2">
                   <span className="s-preview">
                     {s.active > 0 && s.last_status !== "done" ? (
-                      <span className="s-working">
+                      <span className={`s-working st-${s.last_status}`}>
                         <Loader2 size={12} className="spin" />
                         {s.last_status === "waiting" ? "승인·답변 대기" : s.last_status === "background" ? "백그라운드 작업 대기" : "작업 중"}
                         {" · "}
