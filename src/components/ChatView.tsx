@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
+  AlertTriangle,
   Archive,
   ArchiveRestore,
   ArrowDown,
@@ -8,6 +9,7 @@ import {
   CheckCheck,
   CircleHelp,
   CircleSlash,
+  ChevronDown,
   ChevronLeft,
   Clock,
   ChevronRight,
@@ -18,6 +20,7 @@ import {
   Pin,
   PinOff,
   Reply,
+  Settings2,
   Smartphone,
   Star,
   SquareTerminal,
@@ -51,7 +54,8 @@ import { kbd } from "../keys";
 import { AttStrip, Lightbox } from "./Attachments";
 import { Composer } from "./Composer";
 import { AttentionBadge, CostLine, ProcessBlock, ResultBlock, UnderstandingLine } from "./TurnCard";
-import { attentionOf } from "../turncard";
+import { attentionOf, processSummary, understandingOf } from "../turncard";
+import { MoreMenu, type MenuEntry } from "./Menu";
 import { Outline, outlineTitle } from "./Outline";
 import { TagBar } from "./TagBar";
 import { TagBadges, TagPicker } from "./TagUi";
@@ -79,6 +83,23 @@ const tocSaved = () => {
     return localStorage.getItem(TOC_KEY) === "1";
   } catch {
     return false;
+  }
+};
+
+/** 대화 위 태그 칩 줄을 켜 두는지 — 이 PC 화면 설정 */
+const TAGBAR_KEY = "ai-inbox.tagbar";
+const savedFlag = (k: string) => {
+  try {
+    return localStorage.getItem(k) === "1";
+  } catch {
+    return false;
+  }
+};
+const saveFlag = (k: string, on: boolean) => {
+  try {
+    localStorage.setItem(k, on ? "1" : "0");
+  } catch {
+    /* 저장 못 해도 이번 창에서는 그대로 */
   }
 };
 
@@ -199,6 +220,11 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
   // 부모가 새로 만든 함수로 load 가 다시 만들어지면 대화가 처음부터 다시 그려진다 — 값만 ref 로 따라간다
   const onGoneRef = useRef(onGone);
   onGoneRef.current = onGone;
+
+  /** 태그 칩 줄 — 기본은 숨김(더보기 › 태그로 거르기). 거르는 중이면 늘 보인다 */
+  const [tagBarOpen, setTagBarOpen] = useState(() => savedFlag(TAGBAR_KEY));
+  useEffect(() => saveFlag(TAGBAR_KEY, tagBarOpen), [tagBarOpen]);
+  const tagBarOn = tagBarOpen || filterOn;
 
   // ── 요청 목록(목차) · 하나씩 보기 ──
   const [tocOpen, setTocOpen] = useState(tocSaved);
@@ -481,7 +507,8 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
       firstLoad.current = false;
       const target = firstUnread ? el.querySelector<HTMLElement>(`[data-turn="${firstUnread.id}"]`) : null;
       if (target) {
-        const user = target.previousElementSibling as HTMLElement | null;
+        // 결과 카드 위의 내 요청 말풍선부터 보이게(카드는 .ai-col 안에 한 겹 들어 있다)
+        const user = target.closest(".pair")?.querySelector<HTMLElement>(".user-row") ?? null;
         el.scrollTop = (user ?? target).offsetTop - 64;
       } else {
         el.scrollTop = el.scrollHeight;
@@ -643,44 +670,95 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
 
   if (!page) return <section className="chat loading" />;
   const s = page.session;
+  const live = s.live_status ? LIVE_LABEL[s.live_status] ?? s.live_status : "세션 종료";
+  const branch = s.git_branch && s.git_branch !== "HEAD" ? s.git_branch : null;
+  const folder = s.project_name || s.project_dir;
+
+  // 머리줄에 늘 둘 필요가 없는 것 — 세션 정보 · 태그 · 읽음 · 고정 · 보관 · 폰 답
+  const moreItems: MenuEntry[] = [
+    {
+      info: (
+        <>
+          {s.project_dir && <span className="mi-line mono" title={s.project_dir}>{s.project_dir}</span>}
+          <span className="mi-line">
+            {[branch, s.agent === "codex" ? `Codex${s.cc_version ? ` ${s.cc_version}` : ""}` : null, s.model ? modelName(s.model) : null, s.cost_usd != null ? `누적 ${usd(s.cost_usd)}` : null]
+              .filter(Boolean)
+              .join(" · ") || "—"}
+          </span>
+        </>
+      ),
+    },
+    "sep",
+    {
+      label: "태그로 거르기",
+      icon: <TagIcon size={14} />,
+      checked: tagBarOn,
+      title: "대화 위에 이 세션의 태그 칩 줄을 보이고 고른 태그의 요청만 봅니다",
+      onClick: () => {
+        // 끄면 거르기도 푼다(걸러진 채 칩 줄만 숨으면 왜 요청이 빠졌는지 알 수 없다)
+        if (tagBarOn) {
+          setTagBarOpen(false);
+          setFilter(NO_FILTER);
+        } else setTagBarOpen(true);
+      },
+    },
+    { label: "태그 관리…", icon: <Settings2 size={14} />, title: "태그 관리 — 태그·자동 규칙", onClick: onManageTags },
+    "sep",
+    { label: "이 세션 모두 읽음", icon: <CheckCheck size={14} />, disabled: !sessionUnread, onClick: readAllHere },
+    {
+      label: s.pinned ? "고정 해제" : "목록 위에 고정",
+      icon: s.pinned ? <PinOff size={14} /> : <Pin size={14} />,
+      onClick: async () => {
+        await api.setPinned(sessionId, !s.pinned);
+        await load();
+        onRead();
+      },
+    },
+    {
+      label: s.archived ? "목록으로 되돌리기" : "보관",
+      icon: s.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />,
+      title: s.archived ? "목록으로 되돌리기" : "보관 — 목록과 폰에서 빼고 기록 검색에는 남긴다",
+      onClick: async () => {
+        await api.setHidden(sessionId, !s.archived);
+        await load();
+        onRead();
+        toast(s.archived ? "목록으로 되돌렸습니다" : `보관했습니다 — 기록(${kbd("⌘⇧F")}) › 세션 › 보관함에서 되돌릴 수 있습니다`);
+      },
+    },
+    "sep",
+    {
+      label: "폰에서 답 받기",
+      icon: <Smartphone size={14} />,
+      checked: s.conoti_mode === 0,
+      title: "연결된 폰(코노티 앱)에서 이 세션에 답을 보내 작업을 이어갈 수 있게 할지 — 폰 연결은 설정에서",
+      onClick: async () => {
+        const next = s.conoti_mode === 0 ? 1 : 0;
+        await api.conotiSetSessionMode(sessionId, next);
+        await load();
+        toast(next === 0 ? "이 세션은 폰 답을 받습니다" : "이 세션은 폰 답을 받지 않습니다");
+      },
+    },
+  ];
 
   let lastDay = "";
   return (
     <section className={`chat ${s.ended ? `ended st-${s.ended.state}` : ""}`}>
       <header className="chat-head" data-tauri-drag-region>
         <div className="chat-title">
-          <h1 className={s.named ? "" : "unnamed"}>{s.name}</h1>
+          <h1 className={s.named ? "" : "unnamed"} title={s.name}>
+            {s.name}
+          </h1>
           <div className="chat-sub">
-            {s.project_dir && <span title={s.project_dir}>{s.project_dir}</span>}
-            {s.git_branch && s.git_branch !== "HEAD" && <span>{s.git_branch}</span>}
+            <span className={`live ${s.live_status ?? "off"}`}>{live}</span>
+            {folder && <span title={[s.project_dir, branch].filter(Boolean).join(" · ")}>{folder}</span>}
             {s.agent === "codex" && (
               <span className="agent-tag" title="OpenAI Codex 세션 — 기록은 ~/.codex/sessions">
-                Codex{s.cc_version ? ` ${s.cc_version}` : ""}
+                Codex
               </span>
             )}
-            <span className={`live ${s.live_status ?? "off"}`}>{s.live_status ? LIVE_LABEL[s.live_status] ?? s.live_status : "세션 종료"}</span>
-            {s.model && <span>{modelName(s.model)}</span>}
-            {s.cost_usd != null && <span title="Claude Code 가 기록한 세션 누적 비용(API 환산)">{usd(s.cost_usd)}</span>}
           </div>
         </div>
         <div className="chat-actions">
-          <label
-            className={`phone-mode ${s.conoti_mode === 0 ? "on" : ""}`}
-            title="연결된 폰(코노티 앱)에서 이 세션에 답을 보내 작업을 이어갈 수 있게 할지 — 폰 연결은 설정에서"
-          >
-            <Smartphone size={15} />
-            <select
-              value={s.conoti_mode}
-              onChange={async (e) => {
-                await api.conotiSetSessionMode(sessionId, Number(e.target.value));
-                await load();
-                toast(Number(e.target.value) === 0 ? "이 세션은 폰 답을 받습니다" : "이 세션은 폰 답을 받지 않습니다");
-              }}
-            >
-              <option value={0}>폰 답 받기</option>
-              <option value={1}>폰 답 막기</option>
-            </select>
-          </label>
           {s.send_mode === "terminal" && (
             <span className="chan-warn" title="실행 중인 세션에 앱·폰에서 말을 넣으려면 설정에서 훅을 다시 설치하세요">
               훅 업데이트 필요
@@ -715,47 +793,21 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
             />
           )}
           <button
-            className={`toc-btn ${tocOpen ? "on" : ""}`}
-            title={`이 세션의 요청 목록 — 골라서 그 자리로 가거나 하나만 보기 (${kbd("⌘⇧O")})`}
+            className={`icon-btn ${tocOpen ? "on" : ""}`}
+            title={`요청 목록 ${s.turns}개 — 골라서 그 자리로 가거나 하나만 보기 (${kbd("⌘⇧O")})`}
             aria-pressed={tocOpen}
             onClick={() => (tocOpen ? closeToc() : setTocOpen(true))}
           >
-            <ListOrdered size={16} />
-            <span>요청 {s.turns}</span>
+            <ListOrdered size={17} />
           </button>
-          <button className="icon-btn" title="이 세션 모두 읽음" disabled={!sessionUnread} onClick={readAllHere}>
-            <CheckCheck size={17} />
-          </button>
-          <button
-            className="icon-btn"
-            title={s.pinned ? "고정 해제" : "목록 위에 고정"}
-            onClick={async () => {
-              await api.setPinned(sessionId, !s.pinned);
-              await load();
-              onRead();
-            }}
-          >
-            {s.pinned ? <PinOff size={17} /> : <Pin size={17} />}
-          </button>
-          <button
-            className="icon-btn"
-            title={s.archived ? "목록으로 되돌리기" : "보관 — 목록과 폰에서 빼고 기록 검색에는 남긴다"}
-            onClick={async () => {
-              await api.setHidden(sessionId, !s.archived);
-              await load();
-              onRead();
-              toast(s.archived ? "목록으로 되돌렸습니다" : `보관했습니다 — 기록(${kbd("⌘⇧F")}) › 세션 › 보관함에서 되돌릴 수 있습니다`);
-            }}
-          >
-            {s.archived ? <ArchiveRestore size={17} /> : <Archive size={17} />}
-          </button>
+          <MoreMenu items={moreItems} title="더보기 — 세션 정보 · 태그 · 읽음 · 고정 · 보관 · 폰 답" />
         </div>
       </header>
 
       {s.archived && (
-        <div className="archived-bar">
+        <div className="archived-bar" title="목록과 폰에는 보이지 않고, 새 요청이나 결과가 오면(여기서 보내도) 저절로 목록으로 돌아옵니다">
           <Archive size={14} />
-          <span>보관한 세션입니다. 목록과 폰에는 보이지 않고, 새 요청이나 결과가 오면(여기서 보내도) 저절로 목록으로 돌아옵니다.</span>
+          <span>보관한 세션 — 새 요청이 오면 목록으로 돌아옵니다</span>
           <button
             className="more"
             onClick={async () => {
@@ -770,17 +822,25 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
       )}
 
       {s.ended && (
-        <div className={`ended-bar st-${s.ended.state}`}>
+        <div
+          className={`ended-bar st-${s.ended.state}`}
+          title={
+            s.ended.state === "purge"
+              ? `${fullTime(s.ended.purge_at).slice(0, 10)}에 이 앱의 사본이 삭제됩니다 — Claude Code 에서 /resume·/rewind 로 되돌릴 수 있는 기간이 끝난 뒤입니다. 이어서 쓰면 취소됩니다.`
+              : s.ended.state === "keep"
+                ? "자동으로 지워지지 않고 이력 탭·이력 찾기에서 볼 수 있습니다"
+                : "처리를 정할 때까지 자동으로 지워지지 않습니다"
+          }
+        >
           <Clock size={14} />
           <span>
             {s.ended.state === "keep" ? (
-              <>/clear 로 끝난 대화입니다. <strong>이력으로 보관 중</strong> — 자동으로 지워지지 않고 이력 탭·이력 찾기에서 볼 수 있습니다.</>
+              <>/clear 로 끝난 대화 · <strong>이력으로 보관 중</strong></>
             ) : s.ended.state === "ask" ? (
-              <>/clear 로 끝난 대화입니다. 아직 처리를 정하지 않았습니다 — <strong>자동으로 지워지지 않습니다.</strong></>
+              <>/clear 로 끝난 대화 · 처리 미정(자동으로 지우지 않음)</>
             ) : (
               <>
-                /clear 로 끝난 대화입니다. <strong>{daysLeft(s.ended.purge_at) ?? "?"}일 뒤({fullTime(s.ended.purge_at).slice(0, 10)})</strong> 이 앱의 사본이 삭제됩니다 — Claude Code 에서{" "}
-                <code>/resume</code>·<code>/rewind</code> 로 되돌릴 수 있는 기간이 끝난 뒤입니다. 이어서 쓰면 취소됩니다.
+                /clear 로 끝난 대화 · <strong>{daysLeft(s.ended.purge_at) ?? "?"}일 뒤 삭제</strong>
               </>
             )}
           </span>
@@ -857,15 +917,21 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
         </div>
       )}
 
-      <TagBar
-        sessionId={sessionId}
-        refreshKey={refreshKey + tagTick}
-        filter={filter}
-        onFilter={setFilter}
-        onManage={onManageTags}
-        onContext={(text) => setSeed({ text, atts: [], n: Date.now(), prepend: true })}
-        toast={toast}
-      />
+      {tagBarOn && (
+        <TagBar
+          sessionId={sessionId}
+          refreshKey={refreshKey + tagTick}
+          filter={filter}
+          onFilter={setFilter}
+          onManage={onManageTags}
+          onContext={(text) => setSeed({ text, atts: [], n: Date.now(), prepend: true })}
+          onClose={() => {
+            setTagBarOpen(false);
+            setFilter(NO_FILTER);
+          }}
+          toast={toast}
+        />
+      )}
 
       <div className={`chat-body ${tocOpen ? "with-toc" : ""}`}>
         <div className="chat-scroll" ref={scroller} onScroll={onScroll}>
@@ -906,8 +972,9 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
                 <div key={t.id} className={`pair ${flashId === t.id ? "flash" : ""}`} data-pair={t.id}>
                   {showDay && (
                     <div className="day">
-                      <span className="day-n">{dp.day}</span>
-                      <span className="day-rest">{dp.rest}</span>
+                      <span className="day-label">
+                        {dp.rest === "오늘" ? "오늘" : `${dp.rest.replace(/ .*/, "")} ${dp.day}일 ${dp.rest.replace(/^\S+ /, "")}`}
+                      </span>
                     </div>
                   )}
                   {firstUnread?.id === t.id && !single && (
@@ -944,9 +1011,8 @@ export function ChatView({ sessionId, refreshKey, openTurnId, onOpenTurn, onRead
 
         {sessionUnread > 0 && (
           <div className="jump-group">
-            <button className="jump-read" onClick={readAllHere} title="이 세션의 안 읽은 결과를 한 번에 읽음으로 — 되돌릴 수 있습니다">
+            <button className="jump-read" onClick={readAllHere} title="이 세션의 안 읽은 결과를 한 번에 읽음으로 — 되돌릴 수 있습니다" aria-label="이 세션 모두 읽음">
               <CheckCheck size={15} />
-              모두 읽음
             </button>
             {unreadCount > 0 && (
               <button className="jump" onClick={jumpUnread} title="다음 안 읽은 결과로">
@@ -1072,47 +1138,53 @@ const UserBubble = memo(function UserBubble({
   onTagsChanged: () => void;
 }) {
   const [more, setMore] = useState(false);
+  const { byId } = useTags();
   const phone = phoneReply(t.prompt_text);
   const { quote, rest } = splitQuote((phone ? phone.body : t.prompt_text) ?? "");
   const text = rest.trim();
   const long = text.length > 600 || text.split("\n").length > 12;
+  // 보낸 곳 — 터미널에서 직접 친 말("나")이 아닐 때만 말풍선 위에 한 줄(정보가 있을 때만 보인다)
+  const via = phone
+    ? `폰에서${phone.title ? ` — ${phone.title}` : ""}`
+    : t.origin === "peer"
+      ? `${t.peer_name ?? "다른 세션"} 이 보냄`
+      : t.origin === "inbox"
+        ? "AI Inbox 에서"
+        : t.origin === "sched"
+          ? "AI Inbox 예약"
+          : t.origin === "channel"
+            ? "채널에서 옴"
+            : null;
+  const src = t.prompt_source === "queued" ? "대기열" : t.prompt_source === "mid-turn" ? "작업 중에 보냄" : null;
+  // 모델이 제안한 태그는 받아들일지 정해야 하니 늘 보이고, 나머지 태그는 마우스를 올렸을 때 아래 줄에 글자로만
+  const pending = (t.tags ?? []).filter((x) => x.state === "ai");
+  const settled = (t.tags ?? []).filter((x) => x.state !== "ai" && byId.has(x.id));
   return (
     <div className="user-row">
-      <div className="user">
-        <div className="who">
-          {phone ? (
-            <span className="via-phone">나 · 폰에서{phone.title ? ` — ${phone.title}` : ""}</span>
-          ) : t.origin === "peer" ? (
-            `${t.peer_name ?? "다른 세션"} 이 보냄`
-          ) : t.origin === "inbox" ? (
-            "나 · AI Inbox"
-          ) : t.origin === "sched" ? (
-            "나 · AI Inbox 예약"
-          ) : t.origin === "channel" ? (
-            "채널에서 옴"
-          ) : (
-            "나"
+      <div className="user-col">
+        <div className="user">
+          {(via || src) && <div className="who">{[via, src].filter(Boolean).join(" · ")}</div>}
+          {quote && <QuoteBlock q={quote} onJump={onJump} />}
+          {t.slash_command && <code className="slash">{t.slash_command}</code>}
+          {text && <div className={`user-text ${long && !more ? "clamp" : ""}`}>{text}</div>}
+          {long && (
+            <button className="more" onClick={() => setMore(!more)}>
+              {more ? "접기" : "더 보기"}
+            </button>
           )}
-          {t.prompt_source === "queued" && " · 대기열"}
-          {t.prompt_source === "mid-turn" && " · 작업 중에 보냄"}
-          <time>{clock(t.prompt_at)}</time>
-          <button className="reply-btn" title="이 요청에 답장" onClick={() => onReply(t, "prompt")}>
-            <Reply size={13} />
+          <AttStrip ids={t.atts ?? []} onOpen={onOpenImages} />
+        </div>
+        {pending.length > 0 && <TagBadges tags={pending} turnId={t.id} onChanged={onTagsChanged} />}
+        <div className="msg-actions">
+          {settled.length > 0 && <span className="msg-tags">{settled.map((x) => `#${byId.get(x.id)!.name}`).join(" ")}</span>}
+          <time title={fullTime(t.prompt_at)}>{clock(t.prompt_at)}</time>
+          <button className="act-btn" title="이 요청에 답장" aria-label="이 요청에 답장" onClick={() => onReply(t, "prompt")}>
+            <Reply size={14} />
           </button>
-          <button className="reply-btn" title="이 요청의 태그 고치기" onClick={(e) => onTags(e.currentTarget.getBoundingClientRect())}>
-            <TagIcon size={13} />
+          <button className="act-btn" title="이 요청의 태그 고치기" aria-label="이 요청의 태그 고치기" onClick={(e) => onTags(e.currentTarget.getBoundingClientRect())}>
+            <TagIcon size={14} />
           </button>
         </div>
-        {quote && <QuoteBlock q={quote} onJump={onJump} />}
-        {t.slash_command && <code className="slash">{t.slash_command}</code>}
-        {text && <div className={`user-text ${long && !more ? "clamp" : ""}`}>{text}</div>}
-        {long && (
-          <button className="more" onClick={() => setMore(!more)}>
-            {more ? "접기" : "더 보기"}
-          </button>
-        )}
-        <AttStrip ids={t.atts ?? []} onOpen={onOpenImages} />
-        {t.tags?.length > 0 && <TagBadges tags={t.tags} turnId={t.id} onChanged={onTagsChanged} />}
       </div>
     </div>
   );
@@ -1172,45 +1244,89 @@ const AiBubble = memo(function AiBubble({
           : (step[2] ?? "").split("\n")[0]
       : null;
 
+  // 평소엔 결과 본문(+ 응답 필요)만. 상태 줄은 "완료"가 아닐 때 · 안 읽음 · 별표일 때만 보인다
+  const quietDone = st.tone === "done" && !unread && !t.starred;
+  const hasDetails = !!understandingOf(t.understanding, t.response_text) || isFinished(t.status) || t.tool_calls > 0;
+
   return (
-    <div
-      className={`ai tone-${st.tone} ${unread ? "unread" : ""} ${open ? "open" : ""}`}
-      data-turn={t.id}
-      data-unread={unread ? "1" : "0"}
-      onClick={(e) => {
-        const tag = (e.target as HTMLElement).closest("a,button");
-        if (!tag) onOpen();
-      }}
-    >
-      <div className="ai-head">
-        <span className="ai-status">
-          <StatusIcon t={t} />
-          {st.label}
-          {unread && <span className="new">새 결과</span>}
-          {t.starred && <Star size={13} className="star" />}
-        </span>
-        <span className="ai-num" title={live ? "요청 후 지난 시간" : `걸린 시간 ${duration(t.duration_ms)}`}>
-          {live ? <Elapsed since={t.prompt_at} /> : numeral(t.duration_ms)}
-        </span>
+    <div className="ai-col">
+      <div
+        className={`ai tone-${st.tone} ${unread ? "unread" : ""} ${open ? "open" : ""}`}
+        data-turn={t.id}
+        data-unread={unread ? "1" : "0"}
+        onClick={(e) => {
+          const tag = (e.target as HTMLElement).closest("a,button,.tc-details");
+          if (!tag) onOpen();
+        }}
+      >
+        {!quietDone && (
+          <div className="ai-head">
+            <span className="ai-status">
+              {st.tone !== "done" && <StatusIcon t={t} />}
+              {st.tone !== "done" && st.label}
+              {live && (
+                <span className="ai-elapsed" title="요청 후 지난 시간">
+                  <Elapsed since={t.prompt_at} />
+                </span>
+              )}
+              {unread && <span className="new">새 결과</span>}
+              {t.starred && <Star size={13} className="star" aria-label="별표" />}
+            </span>
+          </div>
+        )}
+
+        {/* 턴 카드 순서: (질문은 위 말풍선) 응답 필요 · 결과 — 이해 · 과정 · 비용은 "자세히" 한 줄에 접는다 */}
+        {attention && <AttentionBadge a={attention} />}
+        {/* 응답 필요 상자가 이미 질문을 옮겨 적었으면 "지금:" 줄은 되풀이라 뺀다(승인 대기처럼 항목이 없을 때만 무엇을 기다리는지 보인다) */}
+        {stepLine && !attention?.items.length && <div className="ai-step">지금: {stepLine}</div>}
+        <ResultBlock t={t} cap />
+        {hasDetails && <Details t={t} />}
       </div>
-
-      {/* 턴 카드 순서: (질문은 위 말풍선) 응답 필요 배지 · 이해 · 결과 · 과정 · 비용 */}
-      {attention && <AttentionBadge a={attention} />}
-      {stepLine && <div className="ai-step">지금: {stepLine}</div>}
-      <UnderstandingLine t={t} />
-      <ResultBlock t={t} cap />
-      {(isFinished(t.status) || t.tool_calls > 0) && <ProcessBlock t={t} />}
-
-      <div className="ai-foot">
-        <CostLine t={t} />
-        {t.ended_at && <time>{clock(t.ended_at)}</time>}
-        <button className="reply-btn" title="이 결과에 답장" onClick={() => onReply(t, "response")}>
-          <Reply size={13} /> 답장
+      <div className="msg-actions ai-actions">
+        <time title={t.ended_at ? `끝 ${fullTime(t.ended_at)} · 걸린 시간 ${duration(t.duration_ms)}` : fullTime(t.prompt_at)}>
+          {t.ended_at ? `${clock(t.ended_at)} · ${duration(t.duration_ms)}` : clock(t.prompt_at)}
+        </time>
+        <button className="act-btn" title="이 결과에 답장" aria-label="이 결과에 답장" onClick={() => onReply(t, "response")}>
+          <Reply size={14} />
         </button>
-        <button className="open-doc" onClick={onOpen}>
-          <FileText size={14} /> 문서로 보기
+        <button className="act-btn open-doc" title="문서로 보기 — 6칸 전부 · 복사 · 저장" aria-label="문서로 보기" onClick={onOpen}>
+          <FileText size={14} />
         </button>
       </div>
     </div>
   );
 });
+
+/** 이해 · 과정 · 비용 — 기본은 흐린 한 줄(과정 요약 + 오류 표식), 누르면 펼친다 */
+function Details({ t }: { t: Turn }) {
+  const [open, setOpen] = useState(false);
+  const sum = processSummary({ toolCalls: t.tool_calls, files: t.files_changed, subagents: t.subagent_count, errors: 0 }, toolName);
+  return (
+    <div className={`tc-details ${open ? "open" : ""}`}>
+      <button className="tc-details-head" aria-expanded={open} onClick={() => setOpen(!open)} title={open ? "자세히 접기" : "이해 · 과정 · 비용 펼치기"}>
+        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <span className="tc-details-sum">{open ? "자세히" : sum}</span>
+        {!open && t.error_count > 0 && (
+          <span className="tc-flag">
+            <AlertTriangle size={11} /> 오류 {t.error_count}
+          </span>
+        )}
+        {!open && t.status === "interrupted" && (
+          <span className="tc-flag">
+            <CircleSlash size={11} /> 중단
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="tc-details-body">
+          <UnderstandingLine t={t} />
+          {(isFinished(t.status) || t.tool_calls > 0) && <ProcessBlock t={t} />}
+          <div className="tc-cost-line">
+            <span className="tc-label">비용</span>
+            <CostLine t={t} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

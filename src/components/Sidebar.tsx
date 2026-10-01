@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Archive, CheckCheck, Clock, History, Loader2, Pin, PinOff, Plus, Search, Settings, Smartphone, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Archive, CheckCheck, CircleHelp, Clock, History, Loader2, PauseCircle, Pin, PinOff, Plus, Search, Settings, Smartphone, Trash2 } from "lucide-react";
 import type { Counts, Filter, SessionItem } from "../api";
 import { endedLabel, listTime } from "../format";
 import { kbd } from "../keys";
+import { groupSessions } from "../listGroups";
 import { tagColor, useTags } from "../tags";
 import { AboutBadge } from "./About";
 
@@ -54,6 +55,7 @@ function SessionMenu({ s, x, y, onPick, onClose }: { s: SessionItem; x: number; 
     if (el) {
       const r = el.getBoundingClientRect();
       setPos({ x: Math.min(x, window.innerWidth - r.width - 8), y: Math.min(y, window.innerHeight - r.height - 8) });
+      el.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
     }
     const close = (e: Event) => {
       if (e instanceof KeyboardEvent && e.key !== "Escape") return;
@@ -77,6 +79,12 @@ function SessionMenu({ s, x, y, onPick, onClose }: { s: SessionItem; x: number; 
   };
   return (
     <div ref={ref} className="ctx-menu" role="menu" style={{ left: pos.x, top: pos.y }} onContextMenu={(e) => e.preventDefault()}>
+      {/* 줄에서 뺀 정보(폴더 · 태그)는 여기 첫머리에 읽기 전용으로 */}
+      {(s.project_name || s.tags?.length) && (
+        <div className="menu-info">
+          <SessionFacts s={s} />
+        </div>
+      )}
       <button role="menuitem" onClick={() => pick(s.pinned ? "unpin" : "pin")}>
         {s.pinned ? <PinOff size={14} /> : <Pin size={14} />} {s.pinned ? "고정 해제" : "목록 위에 고정"}
       </button>
@@ -100,6 +108,27 @@ function SessionMenu({ s, x, y, onPick, onClose }: { s: SessionItem; x: number; 
   );
 }
 
+/** 세션의 폴더 · 대표 태그 — 줄에는 상시로 두지 않고 메뉴·툴팁에서만 */
+function SessionFacts({ s }: { s: SessionItem }) {
+  const { byId } = useTags();
+  const tags = (s.tags ?? []).filter((id) => byId.has(id));
+  return (
+    <>
+      {s.project_name && <span className="mi-line">{s.project_name}</span>}
+      {tags.length > 0 && (
+        <span className="mi-line mi-tags">
+          {tags.map((id) => (
+            <span key={id} className="mi-tag">
+              <span className="tag-dot" style={{ background: tagColor(byId.get(id)) }} />
+              {byId.get(id)!.name}
+            </span>
+          ))}
+        </span>
+      )}
+    </>
+  );
+}
+
 const TABS: { key: Filter; label: string; count?: keyof Counts }[] = [
   { key: "all", label: "전체" },
   { key: "unread", label: "안 읽음", count: "unread" },
@@ -108,93 +137,81 @@ const TABS: { key: Filter; label: string; count?: keyof Counts }[] = [
   { key: "history", label: "이력", count: "kept" },
 ];
 
-function initials(name: string): string {
-  // dev-02 → D2, api-01-login → A1
-  const m = name.match(/^([A-Za-z])[A-Za-z]*[-_ ]0*(\d+)/);
-  if (m) return (m[1] + m[2]).toUpperCase().slice(0, 3);
-  const clean = name.replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-  if (!clean) return "·";
-  const words = clean.split(/\s+/);
-  if (/^[\p{Script=Hangul}]/u.test(clean)) return clean.slice(0, 2);
-  if (words.length > 1) return (words[0][0] + words[1][0]).toUpperCase();
-  return clean.slice(0, 2).toUpperCase();
+/** 줄 앞 상태 표식 — 모양이 다르다(색만으로 가르지 않는다): 작업 중 = 도는 원 · 승인 대기 = 멈춤 · 켜져 쉼 = 점 · 꺼짐 = 없음 */
+function RowState({ s }: { s: SessionItem }) {
+  const working = s.active > 0 && s.last_status !== "done";
+  if (working && s.last_status === "waiting") return <PauseCircle size={13} className="rs rs-wait" aria-label="승인·답변 대기" />;
+  if (working) return <Loader2 size={13} className="rs rs-busy spin" aria-label={s.last_status === "background" ? "백그라운드 작업 대기" : "작업 중"} />;
+  if (s.live_status) return <span className="rs rs-idle" aria-label="열려 있음 · 입력 대기" />;
+  return <span className="rs rs-off" aria-hidden />;
+}
+
+function rowTitle(s: SessionItem): string {
+  const parts = [s.name];
+  if (s.project_name) parts.push(`폴더 ${s.project_name}`);
+  if (s.agent === "codex") parts.push("Codex 세션");
+  if (s.active > 0 && s.last_status !== "done") parts.push(s.last_status === "waiting" ? "승인·답변 대기" : s.last_status === "background" ? "백그라운드 작업 대기" : "작업 중");
+  else if (s.live_status) parts.push("열려 있음");
+  if (s.ended) parts.push(endedLabel(s.ended));
+  parts.push("오른쪽 클릭: 고정 · 모두 읽음 · 보관 · 지우기");
+  return parts.join(" · ");
 }
 
 export function Sidebar(p: Props) {
-  const { byId } = useTags();
   const [menu, setMenu] = useState<{ s: SessionItem; x: number; y: number } | null>(null);
   const closeMenu = useCallback(() => setMenu(null), []);
+  const groups = useMemo(() => groupSessions(p.sessions), [p.sessions]);
+  // 묶음 머리는 2묶음 이상일 때만(하나뿐이면 머리가 정보가 아니다)
+  const showHeads = groups.length > 1 || groups[0]?.key === "pinned";
   return (
     <aside className="sidebar">
       <header className="side-head" data-tauri-drag-region>
         <span className="wordmark">AI Inbox</span>
-        <div className="side-actions">
-          <button className="phone-btn new-btn" title={`폴더를 골라 Claude Code·Codex 에 새 일을 시키기 (${kbd("⌘N")})`} onClick={p.onNewTask}>
-            <Plus size={15} />
-            새 작업
-          </button>
-          <button
-            className={`phone-btn ${p.phone && p.phone.devices > 0 ? "paired" : ""}`}
-            title="코노티 앱(폰)에서 이 PC 의 세션을 보고 답하기 — QR 로 연결"
-            onClick={p.onPhone}
-          >
-            <Smartphone size={15} />
-            {p.phone && p.phone.devices > 0 ? (
-              <>
-                폰 {p.phone.devices}
-                {p.phone.online > 0 && <span className="phone-live" />}
-              </>
-            ) : (
-              "폰 연결"
-            )}
-          </button>
-          <button
-            className={`icon-btn sched-btn ${p.sched.held > 0 ? "warn" : ""}`}
-            title={p.sched.held > 0 ? `예약 ${p.sched.held}건이 전달되지 못했습니다 — 처리하세요` : "예약 전송 — 정한 시각에 세션에 보내기(입력창의 시계 버튼으로 만듭니다)"}
-            onClick={p.onSched}
-          >
-            <Clock size={17} />
-            {(p.sched.held > 0 || p.sched.active > 0) && <span className="sched-badge">{p.sched.held > 0 ? p.sched.held : p.sched.active}</span>}
-          </button>
-          <button className="icon-btn" title={`기록 — 지난 대화 검색·보낸 메시지·이미지 (${kbd("⌘⇧F")})`} onClick={p.onArchive}>
-            <Archive size={17} />
-          </button>
-          <button className="icon-btn" title="모든 세션 모두 읽음 — 되돌릴 수 있습니다" onClick={p.onReadAll} disabled={!p.counts.unread}>
-            <CheckCheck size={17} />
-          </button>
-          <button className="icon-btn" title="설정" onClick={p.onSettings}>
-            <Settings size={17} />
-          </button>
-        </div>
+        <button className="bar-btn new-btn" title={`새 작업 — 폴더를 골라 Claude Code·Codex 에 새 일을 시키기 (${kbd("⌘N")})`} onClick={p.onNewTask}>
+          <Plus size={15} />
+          새 작업
+        </button>
       </header>
 
       <div className="search-row">
-      <label className="search">
-        <Search size={15} />
-        <input
-          ref={p.searchRef}
-          value={p.query}
-          placeholder="세션 이름·요청·응답 검색"
-          onChange={(e) => p.onQuery(e.target.value)}
-          spellCheck={false}
-        />
-      </label>
-      <button
-            className={`icon-btn ${p.historyChatOpen ? "on" : ""}`}
+        <label className="search">
+          <Search size={15} />
+          <input
+            ref={p.searchRef}
+            value={p.query}
+            placeholder="세션 검색"
+            title={`세션 이름·요청·응답에서 찾기 (${kbd("⌘F")})`}
+            onChange={(e) => p.onQuery(e.target.value)}
+            spellCheck={false}
+          />
+          <button
+            className={`icon-btn in-search ${p.historyChatOpen ? "on" : ""}`}
             title={`대화 이력 찾기 — 내 작업 이력에서 찾는 대화(세션에 지시하지 않음) (${kbd("⌘⇧H")})`}
-            onClick={p.onHistoryChat}
+            aria-pressed={p.historyChatOpen}
+            onClick={(e) => {
+              e.preventDefault();
+              p.onHistoryChat();
+            }}
           >
-            <History size={17} />
+            <History size={15} />
           </button>
+        </label>
       </div>
 
-      <nav className="tabs">
+      <nav className="tabs" aria-label="세션 거르기">
         {TABS.map((t) => {
           const n = t.count ? p.counts[t.count] : 0;
           return (
-            <button key={t.key} className={`tab ${p.filter === t.key ? "on" : ""}`} onClick={() => p.onFilter(t.key)} title={t.key === "history" ? "/clear 뒤 이력으로 보관한 대화" : undefined}>
+            <button
+              key={t.key}
+              role="tab"
+              aria-selected={p.filter === t.key}
+              className={`tab ${p.filter === t.key ? "on" : ""}`}
+              onClick={() => p.onFilter(t.key)}
+              title={t.key === "history" ? "/clear 뒤 이력으로 보관한 대화" : undefined}
+            >
               {t.label}
-              {t.count && n > 0 && <span className={`tab-n n-${t.key} ${t.key === "active" || t.key === "history" ? "plain" : ""}`}>{n}</span>}
+              {t.count && n > 0 && <span className="tab-n">{n}</span>}
             </button>
           );
         })}
@@ -203,9 +220,9 @@ export function Sidebar(p: Props) {
       {p.counts.undecided > 0 && !p.query && (
         <div className="list-bar clear-bar">
           <span>
-            /clear 로 끝난 대화 <strong>{p.counts.undecided}</strong>개 — 이력으로 남길까요?
+            /clear 된 대화 <strong>{p.counts.undecided}</strong>개
           </span>
-          <button className="list-bar-btn" onClick={p.onDecide} title="기본은 삭제 예약입니다 — 이력으로 보관하거나 그대로 둘 수 있습니다">
+          <button className="list-bar-btn" onClick={p.onDecide} title="/clear 로 끝난 대화를 이력으로 남길지 — 기본은 삭제 예약이고, 이력으로 보관하거나 그대로 둘 수 있습니다">
             정하기
           </button>
         </div>
@@ -223,64 +240,66 @@ export function Sidebar(p: Props) {
       )}
 
       <ul className="session-list">
-        {p.sessions.map((s) => {
-          const live = s.live_status === "busy";
-          const mine = !s.last_from_ai && s.last_origin !== "peer";
-          return (
-            <li
-              key={s.id}
-              className={`session ${p.selectedId === s.id && !p.historyChatOpen ? "on" : ""} ${s.unread ? "has-unread" : ""} ${s.ended && s.ended.state !== "keep" ? "ended" : ""} ${s.ended?.state === "keep" ? "kept" : ""}`}
-              title={s.ended ? endedLabel(s.ended) : undefined}
-              onClick={() => p.onSelect(s.id)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                setMenu({ s, x: e.clientX, y: e.clientY });
-              }}
-            >
-              <div className={`avatar ${s.live_status ? "alive" : ""}`}>
-                {initials(s.name)}
-                {s.live_status && <span className={`live-dot ${live ? "busy" : ""}`} />}
-              </div>
-              <div className="session-body">
-                <div className="row1">
-                  <span className={`s-name ${s.named ? "" : "unnamed"}`}>{s.name}</span>
-                  {s.agent === "codex" && <span className="s-agent" title="OpenAI Codex 세션">Codex</span>}
-                  {s.project_name && <span className="s-proj">{s.project_name}</span>}
-                  {s.pinned && <Pin size={12} className="s-pin" />}
-                  <time className="s-time">{listTime(s.last_at)}</time>
-                </div>
-                {s.ended && <div className={`s-ended st-${s.ended.state}`}>{endedLabel(s.ended)}</div>}
-                {s.tags?.some((id) => byId.has(id)) && (
-                  <div className="s-tags" title="이 세션의 대표 태그 — 요청 태그에서 파생">
-                    {s.tags
-                      .filter((id) => byId.has(id))
-                      .map((id) => (
-                        <span key={id} className="s-tagchip">
-                          <span className="tag-dot" style={{ background: tagColor(byId.get(id)) }} />
-                          {byId.get(id)!.name}
+        {groups.map((g) => (
+          <li key={g.key} className="s-group">
+            {showHeads && <div className="s-group-head">{g.label}</div>}
+            <ul>
+              {g.items.map((s) => {
+                const mine = !s.last_from_ai && s.last_origin !== "peer";
+                return (
+                  <li
+                    key={s.id}
+                    className={`session ${p.selectedId === s.id && !p.historyChatOpen ? "on" : ""} ${s.unread ? "has-unread" : ""} ${s.ended && s.ended.state !== "keep" ? "ended" : ""} ${s.ended?.state === "keep" ? "kept" : ""}`}
+                    title={rowTitle(s)}
+                    tabIndex={0}
+                    aria-current={p.selectedId === s.id && !p.historyChatOpen ? "true" : undefined}
+                    onClick={() => p.onSelect(s.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        p.onSelect(s.id);
+                      } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+                        e.preventDefault();
+                        const r = e.currentTarget.getBoundingClientRect();
+                        setMenu({ s, x: r.left + 24, y: r.bottom - 4 });
+                      }
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setMenu({ s, x: e.clientX, y: e.clientY });
+                    }}
+                  >
+                    <RowState s={s} />
+                    <div className="session-body">
+                      <div className="row1">
+                        <span className={`s-name ${s.named ? "" : "unnamed"}`}>{s.name}</span>
+                        {s.agent === "codex" && <span className="s-agent">Codex</span>}
+                        <time className="s-time">{listTime(s.last_at)}</time>
+                      </div>
+                      <div className="row2">
+                        <span className="s-preview">
+                          {s.ended && <span className="s-ended">{s.ended.state === "keep" ? "이력 · " : "끝남 · "}</span>}
+                          {mine && <span className="s-me">나: </span>}
+                          {s.last_preview || "—"}
                         </span>
-                      ))}
-                  </div>
-                )}
-                <div className="row2">
-                  <span className="s-preview">
-                    {s.active > 0 && s.last_status !== "done" ? (
-                      <span className={`s-working st-${s.last_status}`}>
-                        <Loader2 size={12} className="spin" />
-                        {s.last_status === "waiting" ? "승인·답변 대기" : s.last_status === "background" ? "백그라운드 작업 대기" : "작업 중"}
-                        {" · "}
-                      </span>
-                    ) : null}
-                    {mine && <span className="s-me">나: </span>}
-                    {s.last_preview || "—"}
-                  </span>
-                  {s.attention > 0 && <span className="badge ask">?</span>}
-                  {s.unread > 0 && <span className="badge">{s.unread}</span>}
-                </div>
-              </div>
-            </li>
-          );
-        })}
+                        {s.attention > 0 && (
+                          <span className="badge ask" title="응답이 필요한 결과가 있습니다">
+                            <CircleHelp size={11} />
+                          </span>
+                        )}
+                        {s.unread > 0 && (
+                          <span className="badge" title={`안 읽은 결과 ${s.unread}`}>
+                            {s.unread}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </li>
+        ))}
         {p.sessions.length === 0 && (
           <li className="empty-list">
             {p.query
@@ -305,10 +324,51 @@ export function Sidebar(p: Props) {
         />
       )}
       {p.banner}
+      {/* 훅이 끊겼을 때만 알린다(해야 할 일) — 연결돼 있으면 조용히 */}
+      {!p.hookLine.ok && (
+        <button className="hook-warn" onClick={p.onSettings} title="설정 › 훅·Codex 에서 설치·업데이트">
+          <span className="hook-dot" />
+          <span className="hook-text">{p.hookLine.text}</span>
+        </button>
+      )}
       <footer className="side-foot">
-        <span className={`hook-dot ${p.hookLine.ok ? "ok" : ""}`} />
-        <span className="hook-text" title={p.hookLine.text}>{p.hookLine.text}</span>
-        {p.working && <span className="collecting">수집 중</span>}
+        <button className="foot-btn" title={`설정 (${kbd("⌘,")})`} onClick={p.onSettings}>
+          <Settings size={16} />
+          <span>설정</span>
+        </button>
+        <span className="foot-sp" />
+        {p.working && (
+          <span className="collecting" title={p.hookLine.text}>
+            <Loader2 size={12} className="spin" /> 수집 중
+          </span>
+        )}
+        <button className="icon-btn" title={`기록 — 지난 대화 검색·보낸 메시지·이미지·세션 정리 (${kbd("⌘⇧F")})`} onClick={p.onArchive}>
+          <Archive size={16} />
+        </button>
+        <button
+          className={`icon-btn foot-count ${p.sched.held > 0 ? "warn" : ""}`}
+          title={
+            p.sched.held > 0
+              ? `예약 ${p.sched.held}건이 전달되지 못했습니다 — 눌러서 처리하세요`
+              : `예약 전송${p.sched.active ? ` — 걸려 있는 예약 ${p.sched.active}건` : ""} (입력창의 시계로 만듭니다)`
+          }
+          onClick={p.onSched}
+        >
+          <Clock size={16} />
+          {(p.sched.held > 0 || p.sched.active > 0) && <span className="foot-n">{p.sched.held > 0 ? p.sched.held : p.sched.active}</span>}
+        </button>
+        <button
+          className={`icon-btn foot-count ${p.phone && p.phone.devices > 0 ? "paired" : ""}`}
+          title={
+            p.phone && p.phone.devices > 0
+              ? `폰(코노티) ${p.phone.devices}대 연결됨${p.phone.online > 0 ? ` · 지금 ${p.phone.online}대 보는 중` : ""} — 눌러서 관리`
+              : "폰 연결 — 코노티 앱(폰)에서 이 PC 의 세션을 보고 답하기(QR)"
+          }
+          onClick={p.onPhone}
+        >
+          <Smartphone size={16} />
+          {p.phone && p.phone.online > 0 && <span className="phone-live" aria-label="폰이 보는 중" />}
+        </button>
         <AboutBadge toast={p.toast} />
       </footer>
     </aside>

@@ -6,6 +6,7 @@ import { kbd } from "../keys";
 import { buildTurnMarkdown, suggestedFileName } from "../markdown";
 import { Lightbox } from "./Attachments";
 import { TurnCard } from "./TurnCard";
+import { MoreMenu } from "./Menu";
 
 interface Props {
   turnId: number;
@@ -67,55 +68,54 @@ export function DocPanel({ turnId, refreshKey, onClose, onNavigate, onChanged, t
           <span className="doc-seq">요청 {t.seq}</span>
         </div>
         <div className="doc-actions">
-          <button className="icon-btn" title={raw ? "문서로 보기" : "마크다운 원문 보기"} onClick={() => setRaw(!raw)}>
-            {raw ? <Eye size={17} /> : <Code2 size={17} />}
-          </button>
-          <button
-            className="icon-btn"
-            title="마크다운 복사"
-            onClick={async () => {
-              await writeText(md);
-              toast("마크다운을 복사했습니다");
-            }}
-          >
-            <Copy size={17} />
-          </button>
-          <button
-            className="icon-btn"
-            title=".md 파일로 저장"
-            onClick={async () => {
-              try {
-                if (await api.saveMarkdown(suggestedFileName(detail), md)) toast("저장했습니다");
-              } catch (e) {
-                toast(`저장 실패: ${e}`);
-              }
-            }}
-          >
-            <Download size={17} />
-          </button>
           <button
             className={`icon-btn ${t.starred ? "on" : ""}`}
             title={t.starred ? "별표 해제" : "별표"}
+            aria-pressed={t.starred}
             onClick={async () => {
               await api.setStarred(t.id, !t.starred);
               setDetail({ ...detail, turn: { ...t, starred: !t.starred } });
               onChanged();
             }}
           >
-            <Star size={17} />
+            <Star size={17} className={t.starred ? "filled" : ""} />
           </button>
-          <button
-            className="icon-btn"
-            title="안 읽음으로 표시"
-            disabled={!t.read_at}
-            onClick={async () => {
-              await api.markUnread(t.id);
-              onChanged();
-              onClose();
-            }}
-          >
-            <MailOpen size={17} />
-          </button>
+          <MoreMenu
+            title="더보기 — 원문 · 복사 · 저장 · 안 읽음"
+            items={[
+              { label: raw ? "문서로 보기" : "마크다운 원문 보기", icon: raw ? <Eye size={14} /> : <Code2 size={14} />, onClick: () => setRaw(!raw) },
+              {
+                label: "마크다운 복사",
+                icon: <Copy size={14} />,
+                onClick: async () => {
+                  await writeText(md);
+                  toast("마크다운을 복사했습니다");
+                },
+              },
+              {
+                label: ".md 파일로 저장",
+                icon: <Download size={14} />,
+                onClick: async () => {
+                  try {
+                    if (await api.saveMarkdown(suggestedFileName(detail), md)) toast("저장했습니다");
+                  } catch (e) {
+                    toast(`저장 실패: ${e}`);
+                  }
+                },
+              },
+              "sep",
+              {
+                label: "안 읽음으로 표시",
+                icon: <MailOpen size={14} />,
+                disabled: !t.read_at,
+                onClick: async () => {
+                  await api.markUnread(t.id);
+                  onChanged();
+                  onClose();
+                },
+              },
+            ]}
+          />
           <button className="icon-btn" title="닫기 (Esc)" onClick={onClose}>
             <X size={18} />
           </button>

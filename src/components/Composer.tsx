@@ -151,6 +151,8 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
   }
 
   const canSend = (text.trim().length > 0 || att.ids.length > 0) && !att.uploading && !att.failed && !sending;
+  /** 평소(실행 중인 세션에 바로 들어감)가 아닐 때만 보이는 안내 — 평소 안내는 입력칸 툴팁에 */
+  const modeNote = session.send_mode === "live" ? null : (session.agent === "codex" && CODEX_HINT[session.send_mode]) || HINT[session.send_mode] || null;
 
   const send = async () => {
     const body = text.trim();
@@ -194,12 +196,31 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
         else toast("이미지 파일만 붙일 수 있습니다");
       }}
     >
-      {(schedN > 0 || schedHeld > 0) && (
-        <div className={`sched-chip-row ${schedHeld > 0 ? "warn" : ""}`}>
+      {/* 전달 못 한 예약만 알린다(해야 할 일) — 걸려 있는 예약 수는 입력 상자 안 시계에 */}
+      {schedHeld > 0 && (
+        <div className="sched-chip-row warn">
           <Clock size={13} />
           <button className="more" onClick={() => setSchedList(true)}>
-            {schedHeld > 0 ? `예약 ${schedHeld}건이 전달되지 못했습니다 — 처리하기` : `예약 ${schedN}건 대기 중`}
+            예약 {schedHeld}건이 전달되지 못했습니다 — 처리하기
           </button>
+        </div>
+      )}
+      {/* 보내는 방식이 평소(바로 들어감)와 다를 때만 한 줄로 */}
+      {modeNote && (
+        <div className="composer-note">
+          <span>{modeNote}</span>
+          {session.attach_command && (session.send_mode === "approve" || session.send_mode === "queue") && (
+            <button
+              className="hint-cmd"
+              title="터미널에서 이 백그라운드 세션을 여는 명령을 복사"
+              onClick={async () => {
+                await writeText(session.attach_command!);
+                toast("명령을 복사했습니다 — 터미널에 붙여 넣으세요");
+              }}
+            >
+              {session.attach_command}
+            </button>
+          )}
         </div>
       )}
       {quote && (
@@ -236,15 +257,6 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
             ))}
           </ul>
         )}
-        <button
-          type="button"
-          className="attach-btn"
-          title={`이미지 붙이기 — 붙여넣기(${kbd("⌘V")})·끌어다 놓기도 됩니다 (${MAX_ATTS}장까지)`}
-          disabled={att.items.length >= MAX_ATTS}
-          onClick={() => picker.current?.click()}
-        >
-          <ImagePlus size={17} />
-        </button>
         <input
           ref={picker}
           type="file"
@@ -263,6 +275,8 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
           value={text}
           maxLength={4000}
           placeholder={att.items.length ? "이미지와 함께 보낼 말 (비워 둬도 됩니다)" : "이 세션에 이어서 시킬 일"}
+          title={`${(session.agent === "codex" && CODEX_HINT[session.send_mode]) || HINT[session.send_mode]} · #태그 를 쓰면 이 요청에 그 태그가 붙습니다 · Enter 보내기 · Shift+Enter 줄바꿈`}
+          aria-label="이 세션에 이어서 시킬 일"
           spellCheck={false}
           onChange={(e) => {
             setText(e.target.value);
@@ -308,18 +322,40 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
             }
           }}
         />
-        <button
-          type="button"
-          className="attach-btn"
-          title="예약해서 보내기 — 정한 시각에 이 세션에 넣습니다(AI Inbox 가 켜져 있을 때만)"
-          disabled={!canSend}
-          onClick={() => setSchedDlg(true)}
-        >
-          <Clock size={17} />
-        </button>
-        <button className="send-btn" title="보내기 (Enter · 줄바꿈은 Shift+Enter)" disabled={!canSend} onClick={send}>
-          <ArrowUp size={17} />
-        </button>
+        <div className="composer-tools">
+          <button
+            type="button"
+            className="attach-btn"
+            title={`이미지 붙이기 — 붙여넣기(${kbd("⌘V")})·끌어다 놓기도 됩니다 (${MAX_ATTS}장까지)`}
+            aria-label="이미지 붙이기"
+            disabled={att.items.length >= MAX_ATTS}
+            onClick={() => picker.current?.click()}
+          >
+            <ImagePlus size={17} />
+          </button>
+          {/* 시계 하나로: 쓴 말이 있으면 예약해서 보내기, 비어 있으면 이 세션의 예약 목록 */}
+          <button
+            type="button"
+            className="attach-btn sched-btn"
+            title={
+              canSend
+                ? "예약해서 보내기 — 정한 시각에 이 세션에 넣습니다(AI Inbox 가 켜져 있을 때만)"
+                : schedN > 0
+                  ? `이 세션의 예약 ${schedN}건 보기 — 새 예약은 보낼 말을 쓴 뒤 누르세요`
+                  : "예약해서 보내기 — 보낼 말을 먼저 쓰세요"
+            }
+            aria-label={canSend ? "예약해서 보내기" : "이 세션의 예약"}
+            disabled={!canSend && schedN === 0}
+            onClick={() => (canSend ? setSchedDlg(true) : setSchedList(true))}
+          >
+            <Clock size={17} />
+            {schedN > 0 && <span className="tool-n">{schedN}</span>}
+          </button>
+          <span className="tools-sp" />
+          <button className="send-btn" title="보내기 (Enter · 줄바꿈은 Shift+Enter)" aria-label="보내기" disabled={!canSend} onClick={send}>
+            <ArrowUp size={17} />
+          </button>
+        </div>
       </div>
       {schedDlg && (
         <ScheduleDialog
@@ -339,21 +375,6 @@ export function Composer({ session, seed, onSent, toast, quote, onClearQuote, on
         />
       )}
       {schedList && <ScheduleList sessionId={sid} toast={toast} onClose={() => setSchedList(false)} onOpenSession={() => {}} />}
-      <div className="composer-hint">
-        <span>{(session.agent === "codex" && CODEX_HINT[session.send_mode]) || HINT[session.send_mode]} · #태그 를 쓰면 이 요청에 그 태그가 붙습니다</span>
-        {session.attach_command && (session.send_mode === "approve" || session.send_mode === "queue") && (
-          <button
-            className="hint-cmd"
-            title="터미널에서 이 백그라운드 세션을 여는 명령을 복사"
-            onClick={async () => {
-              await writeText(session.attach_command!);
-              toast("명령을 복사했습니다 — 터미널에 붙여 넣으세요");
-            }}
-          >
-            {session.attach_command}
-          </button>
-        )}
-      </div>
     </div>
   );
 }

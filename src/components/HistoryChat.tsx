@@ -85,29 +85,30 @@ export function HistoryChat({ onOpenTurn, onSettings, toast }: Props) {
             <History size={18} className="hc-icon" /> 대화 이력 찾기
           </h1>
           <div className="chat-sub">
-            <span>내 작업 이력에서 찾는 대화 — Claude Code·Codex 세션에는 아무것도 전달되지 않습니다</span>
-            {st && <span className="hc-model">{localOnly ? "모델 없이 찾기(외부 전송 없음)" : modelName(st.model)}</span>}
+            <span title="내 작업 이력에서 찾는 대화 — Claude Code·Codex 세션에는 아무것도 전달되지 않습니다">세션에는 전달되지 않습니다</span>
+            {st && <span className="hc-model">{localOnly ? "모델 없이(이 PC 안에서만)" : modelName(st.model)}</span>}
           </div>
         </div>
         <div className="chat-actions">
           <label className={`phone-mode ${localOnly ? "" : "on"}`} title={ready ? "모델로 답하려면 발췌가 구독 서비스(Claude·Codex)의 서버로 전송되고 구독 사용량이 소모됩니다" : "설정에서 켜고 동의하면 모델로 답할 수 있습니다"}>
-            <select value={localOnly ? "local" : "model"} disabled={!ready} onChange={(e) => setLocalOnly(e.target.value === "local")}>
+            <select value={localOnly ? "local" : "model"} disabled={!ready} onChange={(e) => setLocalOnly(e.target.value === "local")} aria-label="답하는 방식">
               <option value="model">모델로 답하기</option>
               <option value="local">모델 없이 찾기</option>
             </select>
           </label>
-          <button className="text-btn" onClick={onSettings}>
-            <SettingsIcon size={16} /> 설정
+          <button className="icon-btn" onClick={onSettings} title="설정 › 대화 이력 검색">
+            <SettingsIcon size={17} />
           </button>
         </div>
       </header>
 
       {st && !ready && (
-        <div className="archived-bar hc-notice">
+        <div
+          className="archived-bar hc-notice"
+          title={'모델로 답하려면 설정의 "대화 이력 검색"에서 외부 전송에 동의하고, Claude Code 또는 Codex 를 설치·로그인해 두세요(API 키는 필요 없습니다). 지금은 모델 없이 이 앱에 저장된 요청·결과에서 키워드·날짜로 찾아 보여 줍니다.'}
+        >
           <Search size={14} />
-          <span>
-            모델로 답하려면 설정의 "대화 이력 검색"에서 외부 전송에 동의하고, Claude Code 또는 Codex 를 설치·로그인해 두세요(API 키는 필요 없습니다). 지금은 <strong>모델 없이</strong> 이 앱에 저장된 요청·결과에서 키워드·날짜로 찾아 보여 줍니다.
-          </span>
+          <span>지금은 모델 없이 키워드·날짜로 찾습니다 — 모델로 답하려면 설정에서 켜세요</span>
           <button className="more" onClick={onSettings}>
             설정 열기
           </button>
@@ -125,7 +126,7 @@ export function HistoryChat({ onOpenTurn, onSettings, toast }: Props) {
         <div className="chat-inner hc-inner">
           {turns.length === 0 && (
             <div className="hc-empty">
-              <p>예전에 어떤 작업을 했는지 물어보세요. 지운 세션은 찾을 수 없고, /clear 로 끝난 대화는 삭제 예정 전까지 · 이력으로 보관한 대화는 계속 찾을 수 있습니다.</p>
+              <p title="지운 세션은 찾을 수 없고, /clear 로 끝난 대화는 삭제 예정 전까지 · 이력으로 보관한 대화는 계속 찾을 수 있습니다.">예전에 어떤 작업을 했는지 물어보세요.</p>
               <div className="hc-examples">
                 {EXAMPLES.map((e) => (
                   <button key={e} className="hc-chip" onClick={() => send(e)}>
@@ -189,6 +190,8 @@ export function HistoryChat({ onOpenTurn, onSettings, toast }: Props) {
             value={text}
             maxLength={1000}
             placeholder="내 대화 이력에서 찾기 — 예: 지난주에 결제 관련해서 뭘 했지?"
+            title={`이 창의 말은 세션에 전달되지 않습니다 · ${localOnly ? "이 PC 안에서만 찾습니다" : "찾은 발췌만 모델에 보냅니다(도구·파일 접근 없음)"}`}
+            aria-label="내 대화 이력에서 찾기"
             spellCheck={false}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
@@ -199,12 +202,12 @@ export function HistoryChat({ onOpenTurn, onSettings, toast }: Props) {
               }
             }}
           />
-          <button className="send-btn" title="찾기 (Enter)" disabled={!text.trim() || busy} onClick={() => send()}>
-            <ArrowUp size={17} />
-          </button>
-        </div>
-        <div className="composer-hint">
-          <span>이 창의 말은 세션에 전달되지 않습니다 · {localOnly ? "이 PC 안에서만 찾습니다" : "찾은 발췌만 모델에 보냅니다(도구·파일 접근 없음)"}</span>
+          <div className="composer-tools">
+            <span className="tools-sp" />
+            <button className="send-btn" title="찾기 (Enter)" aria-label="찾기" disabled={!text.trim() || busy} onClick={() => send()}>
+              <ArrowUp size={17} />
+            </button>
+          </div>
         </div>
       </div>
     </section>

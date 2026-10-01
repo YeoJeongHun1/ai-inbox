@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { MessageSquareQuote, Settings2, Tag as TagIcon } from "lucide-react";
+import { MessageSquareQuote, Settings2, Tag as TagIcon, X } from "lucide-react";
 import { api, filterActive, NO_FILTER, type SessionTags, type TagFilter } from "../api";
 import { filterLabel, tagColor, toggleTag, toggleUntagged, useTags } from "../tags";
 
@@ -12,11 +12,13 @@ interface Props {
   onManage: () => void;
   /** 고른 태그 요청들의 요지를 입력창 앞에 붙인다 */
   onContext: (text: string) => void;
+  /** 칩 줄 숨기기(기본 숨김 — 더보기에서 켠다) */
+  onClose?: () => void;
   toast: (m: string) => void;
 }
 
 /** 대화 위의 태그 칩 줄 — 이 세션에서 쓰인 태그만, 요청 수와 함께. 누르면 그 태그의 요청만 보이고 여럿 고를 수 있다. */
-export function TagBar({ sessionId, refreshKey, filter, onFilter, onManage, onContext, toast }: Props) {
+export function TagBar({ sessionId, refreshKey, filter, onFilter, onManage, onContext, onClose, toast }: Props) {
   const { ov, byId } = useTags();
   const [st, setSt] = useState<SessionTags | null>(null);
   useEffect(() => {
@@ -81,6 +83,11 @@ export function TagBar({ sessionId, refreshKey, filter, onFilter, onManage, onCo
       <button className="tb-btn" onClick={onManage} title="태그·자동 규칙 관리">
         <Settings2 size={13} /> 태그 관리
       </button>
+      {onClose && (
+        <button className="icon-btn tb-close" onClick={onClose} title="태그 줄 숨기기 — 거르기도 풉니다(더보기 › 태그로 거르기로 다시 켭니다)" aria-label="태그 줄 숨기기">
+          <X size={14} />
+        </button>
+      )}
     </div>
   );
 }

@@ -9,6 +9,7 @@ import { SETTINGS_BLOCKS, SETTINGS_CATS, SETTINGS_ENTRIES, type BlockId, type Se
 import { flatHits, searchSettings, type Segment } from "../settingsSearch";
 import { CopyReport, useAbout } from "./About";
 import { ClearSection, HistorySection, ScheduleSection } from "./ClearSettings";
+import { Note } from "./Note";
 
 interface Props {
   onClose: () => void;
@@ -258,12 +259,12 @@ export function Settings({ onClose, onHooksChanged, onTags, toast }: Props) {
     hooks: () => (
       <section className="set">
         <h3>Claude Code 훅</h3>
-        <p className="set-note">
+        <Note>
           요청·응답은 대화 기록 파일에서 읽습니다. 훅을 설치하면 작업 완료·권한 대기·세션 종료를 즉시 받아 상태가 더 빨리
           정확해지고, <strong>실행 중인 세션에 입력창·폰에서 말을 넣을 수 있습니다</strong>(세션마다 대기 훅 하나가 쉬는 때를 기다림).
           보낸 이미지를 세션이 권한 창 없이 열 수 있게 <strong>첨부 이미지 폴더 읽기 허용</strong> 규칙 하나도 함께 넣습니다(읽기만, 그
           폴더만). 다른 훅·권한은 건드리지 않고, 설치 전에 <code>settings.json.ai-inbox-backup</code> 을 남깁니다.
-        </p>
+        </Note>
         {hooks && (
           <>
             <dl className="kv" data-set-id="hooks-status">
@@ -344,7 +345,7 @@ export function Settings({ onClose, onHooksChanged, onTags, toast }: Props) {
     tags: () => (
       <section className="set">
         <h3>요청 태그</h3>
-        <p className="set-note">한 세션에서 여러 주제를 다룰 때 요청마다 주제 태그를 달아 나눠 봅니다. 자동 태깅 규칙은 이 PC 안에서만 돌고, 모델 제안(선택)은 기본 꺼져 있습니다.</p>
+        <Note>한 세션에서 여러 주제를 다룰 때 요청마다 주제 태그를 달아 나눠 봅니다. 자동 태깅 규칙은 이 PC 안에서만 돌고, 모델 제안(선택)은 기본 꺼져 있습니다.</Note>
         <div className="set-row">
           <button className="btn" onClick={onTags}>
             태그·자동 규칙 관리…
@@ -692,11 +693,11 @@ export function PhoneSection({ toast, autoOffer = false }: { toast: (m: string) 
   return (
     <section className="set">
       <h3>폰 연결 (코노티 앱)</h3>
-      <p className="set-note">
+      <Note>
         코노티 앱의 홈 → AI 작업에서 이 PC 의 세션·요청·문서를 보고, 답을 보내 작업을 이어갑니다. 내용은 PC 와 폰에서만
         풀리는 종단간 암호문으로 오가고, 코노티 서버는 암호문을 넘겨 줄 뿐 읽거나 저장하지 않습니다. 켤 때만 네트워크를
         씁니다.
-      </p>
+      </Note>
       <dl className="kv">
         <dt>상태</dt>
         <dd className={st.status.state === "online" ? "ok" : st.status.state === "error" ? "warn" : ""}>
@@ -843,10 +844,10 @@ export function PhoneSection({ toast, autoOffer = false }: { toast: (m: string) 
 
       <div data-set-id="phone-channel">
       <h4>실행 중인 세션에 폰 답 넣기</h4>
-      <p className="set-note small">
+      <Note small>
         Claude Code 의 채널 기능(연구 미리보기)을 씁니다. 한 번 등록한 뒤, 세션을 아래 옵션으로 시작하면 폰 답이 그 세션
         대화에 바로 이어집니다. 시작할 때 뜨는 개발 채널 경고에서 1번을 고르세요.
-      </p>
+      </Note>
       <CopyLine text={st.mcp_add_command} toast={toast} />
       <CopyLine text={st.start_command} toast={toast} />
       </div>
@@ -906,11 +907,11 @@ function CodexSection({ toast }: { toast: (m: string) => void }) {
             : "codex 실행 파일을 찾지 못했습니다 — 모아 보기는 되지만, 말 넣기·새 작업은 Codex CLI 가 있어야 합니다"}
         </p>
       )}
-      <p className="set-note small">
+      <Note small>
         훅 설치가 필요 없습니다. 열려 있는 Codex 세션(터미널·앱)에는 보낸 말이 Codex 대기열로 바로 들어가고, 일하는 중이면 끝난 뒤에 들어갑니다.
         꺼진 세션은 codex exec 로 이어서 실행합니다 — 승인은 묻지 않고 그 세션이 쓰던 샌드박스를 씁니다(전권이던 세션은 폴더 안 쓰기로
         낮춤 · 폰 답은 아래 "꺼진 세션 이어서 실행"을 켰을 때만).
-      </p>
+      </Note>
     </section>
   );
 }

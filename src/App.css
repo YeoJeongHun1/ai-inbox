@@ -61,11 +61,11 @@ pre {
 
 .app {
   display: grid;
-  grid-template-columns: 340px minmax(0, 1fr);
+  grid-template-columns: 296px minmax(0, 1fr);
   height: 100%;
 }
 .app.with-doc {
-  grid-template-columns: 300px minmax(420px, 1fr) minmax(440px, 42%);
+  grid-template-columns: 272px minmax(420px, 1fr) minmax(440px, 42%);
 }
 
 .icon-btn {
@@ -111,7 +111,8 @@ pre {
 
 /* ── 사이드바 ─────────────────────────────────────────── */
 
-/* 사이드바 = 코노티 "AI 작업" 탭과 같은 층: 오크 바(앱 이름) → 크림 띠(새 작업·폰·검색·탭) → 코르크 위 세션 줄 → 크림 바닥줄 */
+/* 사이드바 = 오크 바(앱 이름 · 새 작업) → 크림 띠(검색 · 거르기 탭) → 코르크 위 세션 줄(날짜 묶음) → 크림 바닥줄(설정 · 기록 · 예약 · 폰).
+   밀도 원칙(DESIGN.md): 줄 하나 = 이름 · 시각 / 미리보기 · 배지. 폴더·태그·고정 핀은 줄에 두지 않는다(툴팁 · 오른쪽 클릭 · 묶음 머리). */
 .sidebar {
   display: flex;
   flex-direction: column;
@@ -122,62 +123,63 @@ pre {
   background: var(--canvas);
 }
 
-/* 머리: 1줄 = 앱 이름 + 아이콘 버튼(오크 바 · 흰 글씨) · 2줄 = 새 작업·폰 연결(크림 띠 위 글자 버튼).
-   한 줄이면 신호등 자리(84px)까지 더해 340px 를 넘어 오른쪽 버튼이 대화 영역 밑에 가려졌다.
-   오크는 위 --bar-h 만큼만 칠한다 — 대화 머리(같은 높이)와 한 줄로 이어진다. */
+/* 머리 = 오크 바 한 줄: 앱 이름 + [＋ 새 작업] 하나(글자 단추 — 처음 쓰는 사람도 찾게) */
 .side-head {
+  flex: none;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  column-gap: 2px;
-  row-gap: calc((var(--bar-h) - 52px + 12px) / 2); /* 줄이 셋(1줄 · 줄바꿈용 ::after · 2줄)이라 반씩 — 2줄은 오크 아래 12px */
-  padding: 0 12px 12px 16px;
-  background: linear-gradient(to bottom, var(--bar) 0 var(--bar-h), var(--paper) var(--bar-h));
-}
-.side-head .wordmark {
+  gap: var(--sp-4);
+  height: var(--bar-h);
+  padding: 0 12px 0 16px;
+  background: var(--bar);
   color: var(--on-bar);
-  background-color: var(--bar); /* 오크 띠 안 — 같은 색을 깔아 둬야 대비 검사가 바탕을 바로 읽는다 */
-}
-.side-head::after {
-  content: "";
-  order: 2;
-  flex-basis: 100%;
 }
 .wordmark {
-  order: 0;
   flex: 1 1 auto;
   min-width: 0;
-  display: flex;
-  align-items: center;
-  height: 52px;
   font-weight: 800;
   font-size: var(--fs-title);
   letter-spacing: -0.2px;
   white-space: nowrap;
-  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--on-bar);
+  background-color: var(--bar); /* 같은 색을 깔아 둬야 대비 검사가 바탕을 바로 읽는다 */
 }
-.side-actions {
-  display: contents;
+/* 오크 위 글자 단추 — 투명 바탕 + 흰 바깥선 + 흰 글자(대화 머리의 이어가기와 같은 꼴) */
+.bar-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 11px 0 9px;
+  border: 1px solid var(--on-bar-line);
+  border-radius: var(--r-sm);
+  background: var(--bar);
+  color: var(--on-bar);
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  white-space: nowrap;
+  transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
 }
-.side-actions > .icon-btn {
-  order: 1;
-}
-.side-actions > .phone-btn {
-  order: 3;
-  flex: 1 1 0;
-  justify-content: center;
-}
-.side-actions > .phone-btn + .phone-btn {
-  margin-left: var(--sp-3);
+.bar-btn:hover {
+  background: var(--bar-hover);
+  border-color: var(--on-bar);
 }
 
+/* 검색 한 칸 — 대화 이력 찾기는 검색 칸 안 오른쪽 아이콘 하나 */
+.search-row {
+  flex: none;
+  padding: 10px 12px 6px;
+  background: var(--paper);
+}
 .search {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 0 16px 10px;
-  padding: 0 10px;
   height: 34px;
+  padding: 0 3px 0 10px;
   border: 1px solid var(--line-strong);
   border-radius: var(--r-sm);
   background: var(--input);
@@ -196,29 +198,42 @@ pre {
   outline: 0;
   background: transparent;
   font: inherit;
+  font-size: var(--fs-sm);
   color: var(--ink);
   user-select: text;
 }
 .search input::placeholder {
   color: var(--ink-3);
 }
+.search .in-search {
+  width: 28px;
+  height: 28px;
+  color: var(--ink-2);
+}
 
+/* 거르기 탭 — 글자만, 숫자도 같은 잉크(색은 줄의 배지가 맡는다) */
 .tabs {
+  flex: none;
   display: flex;
-  gap: 16px;
-  padding: 0 20px;
+  gap: 12px;
+  padding: 0 14px;
   border-bottom: 1px solid var(--line-strong);
   background: var(--paper);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar {
+  display: none;
 }
 .tab {
   flex: none;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  height: 36px;
-  font-size: var(--fs-sm);
+  gap: 4px;
+  height: 34px;
+  font-size: var(--fs-sub);
   white-space: nowrap;
-  color: var(--ink-3);
+  color: var(--ink-2);
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
   transition: color var(--dur-1) var(--ease);
@@ -231,30 +246,11 @@ pre {
   font-weight: 700;
   border-bottom-color: var(--brand);
 }
-/* 탭 옆 숫자 — 안 읽음·응답 필요는 코노티 배지(알약), 나머지는 흐린 숫자 */
 .tab-n {
-  display: inline-grid;
-  place-items: center;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
-  border-radius: var(--r-pill);
-  background: var(--unread);
-  color: var(--accent-ink);
   font-size: var(--fs-badge);
   font-weight: 700;
-}
-/* 응답 필요 숫자 = 코노티 예약 유형 칩(연앰버 바탕 + 앰버 글자) — 진한 겨자색 채움은 탁해 보였다 */
-.tab-n.n-attention {
-  background: var(--attn-bg);
-  color: var(--attn-ink);
-  box-shadow: inset 0 0 0 1px var(--attn);
-}
-.tab-n.plain {
-  min-width: 0;
-  padding: 0;
-  background: none;
-  color: var(--ink-3);
+  color: inherit;
+  font-variant-numeric: tabular-nums;
 }
 
 .session-list {
@@ -262,89 +258,72 @@ pre {
   min-height: 0;
   overflow-y: auto;
   margin: 0;
+  padding: 2px 0 10px;
+  list-style: none;
+}
+.session-list ul {
+  margin: 0;
   padding: 0;
   list-style: none;
 }
-/* 줄 사이 선은 양옆 16px 들여 긋는다(코노티 방 목록 Divider indent 16) */
-.session {
-  display: flex;
-  gap: 12px;
-  padding: 12px 16px 12px 16px;
-  cursor: pointer;
-  position: relative;
-  transition: background-color var(--dur-1) var(--ease);
+/* 묶음 머리(고정 · 오늘 · 어제 · 지난 7일 · 이전) — 코르크 위 보조 글자는 ink-2 */
+.s-group-head {
+  padding: 12px 18px 4px;
+  font-size: var(--fs-caption);
+  font-weight: 700;
+  color: var(--ink-2);
 }
-.session::after {
-  content: "";
-  position: absolute;
-  left: 16px;
-  right: 16px;
-  bottom: 0;
-  height: 1px;
-  background: var(--line);
+/* 세션 한 줄 = 두 줄(이름 · 시각 / 미리보기 · 배지). 줄 사이 선 없이 여백으로 가른다 */
+.session {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 1px 8px;
+  padding: 8px 10px 8px 8px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease);
 }
 .session:hover {
   background: var(--tint);
 }
-/* 고른 세션 = 코르크에서 떠오른 크림 종이 한 줄 + 앞쪽 오크 막대(코노티 카드와 같은 면) */
+/* 고른 세션 = 코르크에서 떠오른 크림 종이 + 앞쪽 오크 막대(코노티 카드와 같은 면) */
 .session.on {
   background: var(--paper);
   color: var(--sel-ink);
-  box-shadow: inset 3px 0 0 var(--brand), 0 1px 0 var(--paper-line), 0 -1px 0 var(--paper-line);
+  box-shadow: inset 3px 0 0 var(--brand), 0 0 0 1px var(--paper-line);
 }
-.session.on::after,
-.session:hover::after {
-  background: transparent;
-}
-.session.on .s-proj,
-.session.on .s-time,
-.session.on .s-preview,
-.session.on .s-me {
-  color: var(--sel-ink-2);
+.session:focus-visible {
+  outline-offset: -2px;
 }
 .session.has-unread .s-name {
   font-weight: 800;
 }
 
-/* 아바타 — 사람·세션은 원(코노티: 방 = 사각, 사람 = 원), 연우드 바탕에 이니셜 */
-.avatar {
-  position: relative;
+/* 줄 앞 상태 — 모양으로 가른다: 도는 원(작업 중) · 멈춤(승인 대기) · 점(켜져 쉼) · 빈칸(꺼짐) */
+.rs {
   flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 3px;
+}
+.rs-busy {
+  color: var(--live-ink);
+}
+.rs-wait {
+  color: var(--attn-ink);
+}
+.rs-idle {
   display: grid;
   place-items: center;
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  background: var(--wood);
-  font-weight: 800;
-  font-size: var(--fs-sm);
-  color: var(--brand-ink);
 }
-.session.on .avatar {
-  background: var(--wood);
-}
-/* 켜진 세션 점: 쉬는 중 = 흐린 점 · 작업 중 = 세이지(폰과 같은 색) */
-.live-dot {
-  position: absolute;
-  right: -2px;
-  bottom: -2px;
-  width: 12px;
-  height: 12px;
+.rs-idle::before {
+  content: "";
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--dot-idle);
-  border: 2px solid var(--canvas);
-}
-.live-dot.busy {
-  background: var(--live);
-  animation: pulse 1.4s ease-in-out infinite;
-}
-.session.on .live-dot {
-  border-color: var(--paper);
-}
-@keyframes pulse {
-  50% {
-    opacity: 0.35;
-  }
 }
 
 .session-body {
@@ -359,40 +338,23 @@ pre {
   min-width: 0;
 }
 .s-name {
+  min-width: 0;
+  font-size: var(--fs-sm);
   font-weight: 700;
+  line-height: 1.45;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  min-width: 0;
 }
 .s-name.unnamed {
   font-weight: 500;
 }
-/* 세션을 만든 도구 — Codex 만 표시한다(코노티 폰 AiAgentBadge: 트랙 바탕·선·10.5/700) */
+/* 세션을 만든 도구 — Codex 만 표시한다(작은 글자 하나, 바탕 없음) */
 .s-agent {
   flex: none;
   font-size: 10.5px;
   font-weight: 700;
-  line-height: 15px;
-  padding: 0 5px;
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  background: var(--track);
   color: var(--ink-2);
-}
-/* 코르크 위 줄의 보조 글자는 ink-2 — ink-3 은 코르크에서 4.0:1 이라 흐려 보인다(종이·순백 위에서만 ink-3) */
-.s-proj {
-  font-size: 12px;
-  color: var(--ink-2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  flex: 0 1 auto;
-  min-width: 0;
-}
-.s-pin {
-  flex: none;
-  color: var(--brand);
 }
 .s-time {
   margin-left: auto;
@@ -400,67 +362,43 @@ pre {
   font-size: var(--fs-caption);
   color: var(--ink-2);
 }
-.session.has-unread .s-time,
-.session.on.has-unread .s-time {
-  color: var(--unread-ink);
-  font-weight: 700;
-}
 .row2 {
-  margin-top: 2px;
+  margin-top: 1px;
 }
 .s-preview {
   flex: 1;
   min-width: 0;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-caption);
+  line-height: 1.45;
   color: var(--ink-2);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  white-space: nowrap;
   overflow: hidden;
-  line-height: 1.4;
+  text-overflow: ellipsis;
 }
 .s-me {
-  color: var(--ink-2);
   font-weight: 600;
 }
-/* 진행 상태 글자 — 작업 중·백그라운드 = 세이지, 승인·답변 대기 = 앰버(폰 aiToneColor) */
-.s-working {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-weight: 700;
-  color: var(--live-ink);
-}
-.s-working.st-waiting {
-  color: var(--attn-ink);
-}
-.s-working svg {
-  vertical-align: -2px;
-}
-.session.on .s-working {
-  color: var(--sel-ink);
-}
 
-/* 안 읽음 배지 — 코노티 UnreadBadge: 브릭 알약 · 흰 11/700 · 높이 18 */
+/* 배지는 "지금 할 일"에만 — 안 읽음 = 브릭 알약 · 응답 필요 = 앰버 테 + 물음표 아이콘 */
 .badge {
   flex: none;
-  align-self: flex-end;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
   border-radius: var(--r-pill);
   background: var(--unread);
   color: var(--accent-ink);
-  font-size: var(--fs-badge);
+  font-size: 10.5px;
   font-weight: 700;
   display: grid;
   place-items: center;
 }
-/* 응답 필요(?) — 앰버 테두리 알약(긴급 배지처럼 연앰버 바탕) */
 .badge.ask {
+  padding: 0;
+  width: 16px;
   background: var(--attn-bg);
   color: var(--attn-ink);
-  border: 1px solid var(--attn);
+  box-shadow: inset 0 0 0 1px var(--attn);
 }
 
 .empty-list {
@@ -471,28 +409,100 @@ pre {
   word-break: keep-all;
 }
 
-.side-foot {
+/* 훅이 끊겼을 때만 — 바닥줄 위 한 줄(눌러서 설정으로) */
+.hook-warn {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 34px;
-  padding: 0 16px;
-  border-top: 1px solid var(--line-strong);
-  background: var(--paper); /* 코노티 바텀바와 같은 크림 */
+  width: 100%;
+  padding: 7px 16px;
+  border-top: 1px solid var(--danger-line);
+  background: var(--danger-bg);
+  color: var(--danger-ink);
   font-size: var(--fs-caption);
-  color: var(--ink-3);
+  font-weight: 600;
+  text-align: left;
 }
-/* 훅 상태 점 — 연결됨 = 세이지 채움, 아님 = 빈 원(모양으로도 구분) */
+/* 훅 상태 점 — 끊김 = 빈 원(모양으로도 구분) */
 .hook-dot {
   flex: none;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  border: 1.5px solid var(--ink-3);
+  border: 1.5px solid currentColor;
 }
-.hook-dot.ok {
-  background: var(--live);
-  border-color: var(--live);
+
+/* 바닥줄 = 설정 한 곳 + 기록 · 예약 · 폰(아이콘, 이름은 툴팁) + 버전 */
+.side-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 44px;
+  padding: 0 8px;
+  border-top: 1px solid var(--line-strong);
+  background: var(--paper); /* 코노티 바텀바와 같은 크림 */
+  font-size: var(--fs-caption);
+  color: var(--ink-2);
+}
+.foot-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+.foot-btn:hover {
+  background: var(--tint);
+  color: var(--ink);
+}
+.foot-sp {
+  flex: 1;
+}
+.side-foot .icon-btn {
+  color: var(--ink-2);
+}
+.foot-count {
+  position: relative;
+}
+/* 개수 — 중립(트랙 알약). 못 보낸 예약만 브릭(할 일) */
+.foot-n {
+  position: absolute;
+  top: 1px;
+  right: 0;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: var(--r-pill);
+  background: var(--track);
+  box-shadow: 0 0 0 1.5px var(--paper);
+  color: var(--ink);
+  font-size: var(--fs-nano);
+  font-weight: 800;
+  line-height: 14px;
+  text-align: center;
+}
+.foot-count.warn .foot-n {
+  background: var(--danger);
+  color: var(--accent-ink);
+}
+.foot-count .phone-live {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  box-shadow: 0 0 0 1.5px var(--paper);
+}
+.side-foot .about-wrap {
+  margin-left: 4px;
+}
+.side-foot .about-build {
+  display: none; /* 빌드 시각은 눌러서 여는 정보 창에 */
 }
 .about-wrap {
   position: relative;
@@ -597,6 +607,11 @@ pre {
   text-overflow: ellipsis;
 }
 .collecting {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 4px;
+  font-size: var(--fs-caption);
   color: var(--ink-2);
 }
 
@@ -665,6 +680,10 @@ pre {
 :is(.chat-head, .doc-head, .modal-head, .archive-head) .icon-btn.on {
   background: var(--bar-press);
   color: var(--on-bar);
+}
+/* 문서 머리의 별표 — 켜지면 채운다(색만이 아니라 모양으로) */
+.doc-head .icon-btn svg.filled {
+  fill: currentColor;
 }
 /* 오크 위 포커스 링 — 오크 링은 바에 묻히니 흰 링 */
 :is(.chat-head, .doc-head, .modal-head, .archive-head, .side-head) :focus-visible {
@@ -785,10 +804,11 @@ pre {
   min-height: 0;
   overflow-y: auto;
 }
+/* 대화 = 가운데 한 줄기(본문 760px) — 넓은 창에서도 글줄이 길어지지 않게 양옆을 비운다 */
 .chat-inner {
-  max-width: 900px;
+  max-width: 808px;
   margin: 0 auto;
-  padding: 12px 28px 48px;
+  padding: 8px 24px 40px;
 }
 
 .load-older {
@@ -801,27 +821,13 @@ pre {
   color: var(--ink-2);
 }
 
-/* 날짜 — 큰 일(日) 숫자는 AI Inbox 의 표식으로 남기고, 코노티 굵기(800)로 */
+/* 날짜 — 가운데 작은 알약 하나(코노티 날짜 칩). 선·큰 숫자 없이 */
 .day {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 26px 0 12px;
+  justify-content: center;
+  margin: 24px 0 4px;
 }
-.day::after {
-  content: "";
-  flex: 1;
-  height: 1px;
-  background: var(--line-strong);
-}
-.day-n {
-  font-size: 28px;
-  font-weight: 800;
-  line-height: 1;
-  letter-spacing: -0.6px;
-  color: var(--ink);
-}
-.day-rest {
+.day-label {
   padding: 2px 10px;
   border-radius: var(--r-pill);
   background: var(--track);
@@ -853,14 +859,25 @@ pre {
   flex-direction: column;
 }
 
-/* 내 요청 — 오크 말풍선, 꼬리는 오른쪽 아래(폰 AiUserBubble 16·16·4·16) */
+/* 내 요청 — 오크 말풍선, 꼬리는 오른쪽 아래(폰 AiUserBubble 16·16·4·16).
+   말풍선 안에는 글만 — 시각·답장·태그는 아래 줄(마우스를 올리면 보인다) */
 .user-row {
   display: flex;
   justify-content: flex-end;
-  margin-top: 16px;
+  margin-top: 10px;
+}
+.user-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  max-width: 78%;
+  min-width: 0;
+}
+.user-col > .tag-badges {
+  justify-content: flex-end;
 }
 .user {
-  max-width: 74%;
+  max-width: 100%;
   padding: 9px 14px 11px;
   background: var(--user);
   color: var(--me-ink);
@@ -884,6 +901,50 @@ pre {
   margin-left: auto;
   padding-left: 12px;
 }
+/* 말풍선·카드 아래 한 줄(시각 · 태그 · 답장 · 문서) — 평소엔 숨고, 마우스를 올리거나 키보드로 들어오면 보인다.
+   자리는 늘 잡아 둬서 나타날 때 글줄이 밀리지 않는다 */
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 22px;
+  padding: 0 2px;
+  font-size: 11.5px;
+  color: var(--ink-2);
+  opacity: 0;
+  transition: opacity var(--dur-1) var(--ease);
+}
+.user-row:hover .msg-actions,
+.user-row:focus-within .msg-actions,
+.ai-col:hover .msg-actions,
+.ai-col:focus-within .msg-actions,
+.ai-col:has(.ai.open) .msg-actions {
+  opacity: 1;
+}
+.msg-actions time {
+  margin: 0 4px;
+  font-variant-numeric: tabular-nums;
+}
+.msg-tags {
+  margin-right: 4px;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.act-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 24px;
+  border-radius: var(--r-xs);
+  color: var(--ink-2);
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+.act-btn:hover {
+  background: var(--wood);
+  color: var(--ink);
+}
 .user-text {
   white-space: pre-wrap;
   word-break: keep-all;
@@ -893,14 +954,9 @@ pre {
 .user:not(.pending) .slash {
   border-color: rgba(255, 255, 255, 0.55);
 }
-.user:not(.pending) .more,
-.user:not(.pending) .reply-btn {
+.user:not(.pending) .more {
   color: var(--me-ink);
   border-bottom-color: rgba(255, 255, 255, 0.55);
-}
-.user:not(.pending) .reply-btn:hover {
-  color: var(--me-ink);
-  background: rgba(255, 255, 255, 0.16);
 }
 .user:not(.pending) .quote-block {
   border-left-color: var(--me-meta);
@@ -938,13 +994,18 @@ pre {
   border-bottom-color: var(--brand);
 }
 
-/* 결과 카드 = 코르크 위의 종이 한 장 — 꼬리는 왼쪽 위(폰 4·16·16·16), 그림자는 브라운 */
+/* 결과 카드 = 코르크 위의 종이 한 장 — 꼬리는 왼쪽 위(폰 4·16·16·16), 그림자는 브라운.
+   카드 안은 결과 본문이 주인공: 상태 줄은 "완료"가 아닐 때만, 이해·과정·비용은 "자세히" 한 줄에 접는다 */
+.ai-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  margin-top: 4px;
+}
 .ai {
   position: relative;
-  align-self: flex-start;
-  width: min(100%, 780px);
-  margin-top: 8px;
-  padding: 12px 16px 10px 16px;
+  width: 100%;
+  padding: 14px 18px 12px;
   background: var(--paper);
   border: 1px solid var(--paper-line);
   border-radius: var(--r-tail) var(--r-bubble) var(--r-bubble) var(--r-bubble);
@@ -967,11 +1028,18 @@ pre {
 
 .ai-head {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
+  align-items: center;
   gap: 12px;
+  margin-bottom: 8px;
 }
-/* 상태 — 아이콘 + 글자. 진행 중·응답 필요는 코노티 유형 칩(연한 바탕 알약)으로 */
+.ai > :first-child {
+  margin-top: 0;
+}
+.ai-elapsed {
+  margin-left: 2px;
+  font-variant-numeric: tabular-nums;
+}
+/* 상태 — 아이콘 + 글자(바탕 알약 없이). 응답 필요는 아래 앰버 상자가 따로 알리니 여기선 글자색만 */
 .ai-status {
   display: inline-flex;
   align-items: center;
@@ -980,46 +1048,22 @@ pre {
   font-weight: 700;
   color: var(--ink-2);
 }
-.tone-live .ai-status,
-.tone-attention .ai-status {
-  margin: -2px 0 0 -4px;
-  padding: 2px 9px 2px 7px;
-  border-radius: var(--r-pill);
-}
 .tone-live .ai-status {
-  background: var(--live-bg);
   color: var(--live-ink);
 }
 .tone-attention .ai-status {
-  background: var(--attn-bg);
   color: var(--attn-ink);
 }
 .tone-muted .ai-status {
   color: var(--ink-3);
 }
 .new {
-  margin-left: 4px;
   color: var(--unread-ink);
 }
 .star {
   color: var(--attn);
   fill: currentColor;
 }
-/* 걸린 시간 — 결과마다 오른쪽 위에 큰 숫자(코노티 h1 굵기·자간) */
-.ai-num {
-  font-size: var(--fs-h1);
-  font-weight: 800;
-  line-height: 0.95;
-  letter-spacing: -0.4px;
-  color: var(--ink);
-}
-.tone-muted .ai-num {
-  color: var(--ink-3);
-}
-.tone-live .ai-num {
-  color: var(--live-ink);
-}
-
 .ai-step {
   margin-top: 6px;
   font-size: var(--fs-caption);
@@ -1030,9 +1074,7 @@ pre {
   font-family: var(--mono);
 }
 .ai-summary {
-  margin: 8px 0 0;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--line);
+  margin: 0;
   font-weight: 700;
   font-size: var(--fs-body);
   line-height: 1.55;
@@ -1042,7 +1084,7 @@ pre {
   position: relative;
   max-height: 300px;
   overflow: hidden;
-  margin-top: 6px;
+  margin-top: 4px;
   user-select: text;
 }
 .ai-body.over::after {
@@ -1059,15 +1101,60 @@ pre {
   font-size: 13px;
 }
 
-.ai-foot {
+/* 자세히(이해 · 과정 · 비용) — 접힌 한 줄: 과정 요약 + 오류·중단 표식(트랙 알약, 색 대신 아이콘·글자) */
+.tc-details {
+  margin-top: 10px;
+  cursor: auto;
+}
+.tc-details-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
-  font-size: 12px;
-  color: var(--ink-3);
+  gap: var(--sp-3);
+  max-width: 100%;
+  min-width: 0;
+  text-align: left;
+  font-size: var(--fs-caption);
+  color: var(--ink-2);
+  transition: color var(--dur-1) var(--ease);
+}
+.tc-details-head:hover {
+  color: var(--ink);
+}
+.tc-details-sum {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tc-flag {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-pill);
+  background: var(--track);
+  font-size: var(--fs-badge);
+  font-weight: 700;
+  line-height: 18px;
+  color: var(--ink-2);
+}
+.tc-details-body {
+  margin: var(--sp-3) 0 0 19px;
+  padding-left: var(--sp-6);
+  border-left: 1px solid var(--line);
+}
+.tc-details-body > .tc-under,
+.tc-details-body > .tc-proc {
+  margin-top: 0;
+  margin-bottom: var(--sp-4);
+}
+.tc-cost-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-4);
+  font-size: var(--fs-caption);
+  color: var(--ink-2);
 }
 /* ── 턴 카드(질문 · 이해 · 결과 · 응답 필요 · 과정 · 비용) ─────────── */
 
@@ -1341,7 +1428,7 @@ pre {
   color: var(--ink);
 }
 
-/* 안 읽은 결과가 있을 때 오른쪽 아래: [모두 읽음] [↓ N] */
+/* 안 읽은 결과가 있을 때 오른쪽 아래: [✓✓ 모두 읽음(아이콘)] [↓ N] */
 .jump-group {
   position: absolute;
   right: 22px;
@@ -1354,12 +1441,11 @@ pre {
   right: calc(var(--toc-w) + 22px);
 }
 .jump-read {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
   height: 36px;
-  padding: 0 14px;
-  border-radius: var(--r-pill);
+  border-radius: 50%;
   border: 1px solid var(--line);
   background: var(--paper);
   color: var(--ink);
@@ -1640,6 +1726,42 @@ pre {
   font-size: var(--fs-caption);
   color: var(--ink-3);
   margin: 10px 0 0;
+}
+/* 긴 설명은 2줄까지 — 둘째 줄 끝에 겹친 "… 자세히"로 펼친다(동의·권한·경고 문구는 접지 않는다, Note.tsx) */
+.note-wrap {
+  position: relative;
+}
+.note-wrap.small {
+  margin-top: 10px;
+}
+.note-wrap.small > .set-note.small {
+  margin-top: 0;
+}
+.set-note.clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.note-more {
+  margin-left: 6px;
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  color: var(--brand-ink);
+}
+/* 겹친 단추 — 둘째 줄 오른쪽 끝, 글자를 덮는 종이색 그러데이션(카드 바탕과 같은 --paper) */
+.note-more.over {
+  position: absolute;
+  right: 0;
+  bottom: 0; /* 문단 아래 여백은 감싼 상자 밖으로 접힌다(margin collapse) — 글 아래 끝에 붙는다 */
+  margin: 0;
+  padding-left: 28px;
+  line-height: 1.55;
+  background: linear-gradient(to right, transparent, var(--paper) 22px);
+}
+.note-more:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .set-err {
   color: var(--danger-ink);
@@ -2067,20 +2189,20 @@ input[type="radio"] {
 /* 좁은 창: 문서는 채팅 위로 덮는다 */
 @media (max-width: 1180px) {
   .app.with-doc {
-    grid-template-columns: 300px minmax(0, 1fr);
+    grid-template-columns: 272px minmax(0, 1fr);
   }
   .app.with-doc .doc {
     position: fixed;
     top: 0;
     right: 0;
     bottom: 0;
-    width: min(620px, calc(100vw - 300px));
+    width: min(620px, calc(100vw - 272px));
     z-index: 10;
     box-shadow: var(--shadow-pop);
     animation: slide-in var(--dur-3) var(--ease);
   }
   .app {
-    grid-template-columns: 300px minmax(0, 1fr);
+    grid-template-columns: 272px minmax(0, 1fr);
   }
 }
 
@@ -2181,40 +2303,7 @@ input[type="radio"] {
   color: var(--ink-3);
 }
 
-/* 사이드바의 새 작업·폰 연결 — 아이콘만이 아니라 글자로(처음 쓰는 사람이 찾을 수 있게).
-   새 작업 = 오크 채움(코노티 ＋ 버튼), 폰 연결 = 연우드 보조 버튼 */
-.phone-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 32px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--tint);
-  color: var(--brand-ink);
-  font: inherit;
-  font-size: var(--fs-sm);
-  font-weight: 700;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
-}
-.phone-btn:hover {
-  background: var(--wood);
-}
-.phone-btn.paired {
-  border-color: var(--wood);
-}
-.phone-btn.new-btn {
-  background: var(--brand);
-  border-color: var(--brand);
-  color: var(--on-brand);
-}
-.phone-btn.new-btn:hover {
-  background: var(--brand-hover);
-  border-color: var(--brand-hover);
-}
+/* 폰이 지금 보는 중 — 바닥줄 폰 아이콘 위 세이지 점 */
 .phone-live {
   width: 7px;
   height: 7px;
@@ -2395,34 +2484,78 @@ input[type="radio"] {
   display: flex;
   flex-direction: column;
 }
-/* 입력줄 — 코노티 AI 작업 입력: 크림 바 위 순백 둥근 칸 + 오크 원형 보내기 */
+/* 입력 — 대화 줄기 아래 가운데 둥근 상자 하나(순백 + 오크 원형 보내기). 띠·안내문 없이 코르크 위에 떠 있다.
+   첨부·예약은 상자 안 아래쪽 아이콘, 보내는 방식 안내는 평소와 다를 때만 상자 위 한 줄 */
 .composer {
   flex: none;
-  padding: 10px 28px 12px;
-  border-top: 1px solid var(--line-strong);
-  background: var(--paper);
+  position: relative;
+  padding: 4px 24px 16px;
+  background: var(--canvas);
 }
 .composer-box {
+  position: relative;
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  max-width: 844px;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 760px;
   margin: 0 auto;
-  padding: 5px 5px 5px 14px;
+  padding: 10px 8px 8px 14px;
   border: 1px solid var(--line-strong);
   border-radius: var(--r-field);
   background: var(--input);
+  box-shadow: var(--shadow-card);
   transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
 }
 .composer-box:focus-within {
   border-color: var(--brand);
-  box-shadow: 0 0 0 1px var(--brand);
+  box-shadow: 0 0 0 1px var(--brand), var(--shadow-card);
+}
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: -6px;
+}
+.tools-sp {
+  flex: 1;
+}
+.composer-tools .attach-btn {
+  position: relative;
+  margin-left: 0;
+}
+/* 이 세션에 걸린 예약 수 — 시계 위 작은 중립 숫자 */
+.tool-n {
+  position: absolute;
+  top: 1px;
+  right: -1px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: var(--r-pill);
+  background: var(--track);
+  box-shadow: 0 0 0 1.5px var(--input);
+  color: var(--ink);
+  font-size: var(--fs-nano);
+  font-weight: 800;
+  line-height: 14px;
+  text-align: center;
+}
+.composer-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  max-width: 760px;
+  margin: 0 auto 6px;
+  padding: 0 4px;
+  font-size: var(--fs-caption);
+  color: var(--ink-2);
 }
 .composer textarea {
   flex: 1;
   min-width: 0;
   max-height: 200px;
-  padding: 5px 0;
+  padding: 0 6px 4px 0;
   border: 0;
   outline: none;
   resize: none;
@@ -2454,16 +2587,6 @@ input[type="radio"] {
   color: var(--ink-3);
   opacity: 1;
   cursor: default;
-}
-.composer-hint {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 10px;
-  max-width: 844px;
-  margin: 6px auto 0;
-  font-size: var(--fs-caption);
-  color: var(--ink-3);
 }
 .hint-cmd {
   font-family: var(--mono);
@@ -2640,7 +2763,7 @@ input[type="radio"] {
   display: flex;
   align-items: flex-end;
   gap: 8px;
-  max-width: 844px;
+  max-width: 760px;
   margin: 0 auto 8px;
 }
 .set .draft-tray {
@@ -2862,8 +2985,8 @@ input[type="radio"] {
 .archive-tabs {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 10px 28px 0;
+  gap: 20px;
+  padding: 6px 28px 0;
   border-bottom: 1px solid var(--line);
   flex: none;
 }
@@ -3170,7 +3293,63 @@ input[type="radio"] {
   font-size: var(--fs-sub);
 }
 
-/* 세션 줄 오른쪽 클릭 메뉴 */
+/* 세션 줄 오른쪽 클릭 메뉴 · 머리줄 "⋯ 더보기" 메뉴(같은 꼴) */
+.pop-menu {
+  min-width: 220px;
+  max-width: 320px;
+}
+/* 메뉴 첫머리의 읽기 전용 정보(폴더 · 브랜치 · 모델 · 태그) — 줄·머리에서 뺀 메타는 여기서 본다 */
+.menu-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-caption);
+  color: var(--ink-2);
+  user-select: text;
+  cursor: auto;
+}
+.mi-line {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mi-line.mono {
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.mi-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+}
+.mi-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.menu-ic {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  color: var(--ink-2);
+}
+.ctx-menu button[aria-checked="true"] .menu-ic {
+  color: var(--brand-ink);
+}
+.menu-label {
+  flex: 1;
+  min-width: 0;
+}
+.menu-hint {
+  font: inherit;
+  font-size: var(--fs-caption);
+  color: var(--ink-3);
+}
 .ctx-menu {
   position: fixed;
   z-index: 60;
@@ -3197,6 +3376,12 @@ input[type="radio"] {
 .ctx-menu button:hover:not(:disabled) {
   background: var(--tint);
 }
+/* 키보드로 고른 항목 — 바탕 + 안쪽 오크 링(메뉴 밖으로 링이 잘리지 않게) */
+.ctx-menu button:focus-visible {
+  background: var(--tint);
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
 .ctx-menu button:disabled {
   color: var(--ink-3);
 }
@@ -3215,7 +3400,7 @@ input[type="radio"] {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 20px;
+  padding: 6px 20px;
   border-bottom: 1px solid var(--line);
   background: var(--bg-soft);
   font-size: 12.5px;
@@ -3226,35 +3411,7 @@ input[type="radio"] {
   margin: 0 0 0 auto;
 }
 
-/* ── 메신저식 답장(0.7.0) ── */
-.reply-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  margin-left: 6px;
-  padding: 1px 6px;
-  border: 0;
-  border-radius: var(--r-xs);
-  background: transparent;
-  color: var(--ink-3);
-  font: inherit;
-  font-size: 11.5px;
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity var(--dur-1) var(--ease), background-color var(--dur-1) var(--ease);
-}
-.user:hover .reply-btn,
-.ai:hover .reply-btn,
-.reply-btn:focus-visible {
-  opacity: 1;
-}
-.reply-btn:hover {
-  color: var(--brand-ink);
-  background: var(--tint);
-}
-.ai-foot .reply-btn {
-  margin-left: auto;
-}
+/* ── 메신저식 답장(0.7.0) — 답장 단추는 말풍선·카드 아래 줄(.msg-actions) ── */
 /* 답장 인용 — 폰 AiQuoteBlock: 연우드 바탕 · 오크 3px 막대 · 머리 오크 · 본문 ink-2 */
 .quote-block {
   display: flex;
@@ -3288,7 +3445,7 @@ input[type="radio"] {
   display: flex;
   align-items: center;
   gap: 8px;
-  max-width: 844px;
+  max-width: 760px;
   margin: 0 auto 6px;
   padding: 6px 8px 6px 10px;
   border-left: 3px solid var(--brand);
@@ -3641,77 +3798,25 @@ input[type="radio"] {
 }
 
 /* ── /clear 로 끝난 대화(0.9.0) — 투명도·빗금으로 흐리게 하지 않는다(코노티는 끝난 세션도 같은 진하기).
-   표시는 셋: 아바타 = 트랙 바탕(나무색을 뺀다, 폰과 같다) · 이름 600 · "끝남 …" 한 줄 ── */
-.session.ended .avatar {
-  background: var(--track);
-  color: var(--ink-2);
-}
+   표시는 둘: 이름 600 · 미리보기 앞 "끝남 ·"(이력 보관은 "이력 ·") — 자세한 날짜는 툴팁 ── */
 .session.ended .s-name {
   font-weight: 600;
 }
-.session.kept .avatar {
-  box-shadow: 0 0 0 2px var(--canvas), 0 0 0 3.5px var(--brand);
-}
-.session.kept.on .avatar {
-  box-shadow: 0 0 0 2px var(--paper), 0 0 0 3.5px var(--brand);
-}
 .s-ended {
-  margin-top: 1px;
-  font-size: 11.5px;
-  color: var(--ink-2);
-  letter-spacing: 0.01em;
-}
-.s-ended.st-purge {
-  font-weight: 600;
-}
-.session.on .s-ended {
-  color: var(--sel-ink-2);
+  font-weight: 700;
 }
 .clear-bar strong {
   color: var(--ink);
 }
-.tabs {
-  gap: 12px;
-  padding: 0 16px;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.tabs::-webkit-scrollbar {
-  display: none;
-}
-/* 사이드바가 300px 로 줄 때(문서를 열었거나 창이 좁을 때) — 코노티 dense 배지(16px · 10.5px)로 한 줄을 지킨다 */
+/* 사이드바가 272px 로 줄 때(문서를 열었거나 창이 좁을 때) — 탭 간격만 줄여 한 줄을 지킨다 */
 .app.with-doc .tabs {
-  gap: 7px;
-  padding: 0 12px;
-}
-.app.with-doc .tab {
-  gap: 4px;
-  font-size: var(--fs-sub);
-}
-.app.with-doc .tab-n {
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
-  font-size: 10.5px;
-}
-.app.with-doc .tab-n.plain {
-  min-width: 0;
-  padding: 0;
+  gap: 9px;
+  padding: 0 10px;
 }
 @media (max-width: 1180px) {
   .tabs {
-    gap: 7px;
-    padding: 0 12px;
-  }
-  .tab {
-    gap: 4px;
-    font-size: var(--fs-sub);
-  }
-  .tab-n {
-    min-width: 16px;
-    height: 16px;
-    padding: 0 4px;
-    font-size: 10.5px;
+    gap: 9px;
+    padding: 0 10px;
   }
 }
 
@@ -3721,7 +3826,7 @@ input[type="radio"] {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 8px 20px;
+  padding: 6px 20px;
   border-bottom: 1px solid var(--line);
   background: var(--track);
   font-size: var(--fs-sub);
@@ -3729,7 +3834,7 @@ input[type="radio"] {
   flex: none;
 }
 .ended-bar span {
-  flex: 1 1 320px;
+  flex: 1 1 200px;
   min-width: 0;
   user-select: text;
 }
@@ -3834,6 +3939,13 @@ input[type="radio"] {
 }
 
 /* ── 대화 이력 찾기(검색 모드 채팅) — 모델을 부르는 기능이라 코노티의 AI 색(플럼) ── */
+.s-working {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 700;
+  color: var(--live-ink);
+}
 /* 머리는 다른 화면과 같은 오크 바(코노티 "AI 공지 도우미"도 오크 바) — 플럼은 본문(답·입력·안내)에서 */
 .history-chat .hc-icon {
   vertical-align: -3px;
@@ -3957,20 +4069,6 @@ input[type="radio"] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.search-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding-right: 12px;
-  background: var(--paper); /* 크림 띠(새 작업·폰 아래로 이어짐) */
-}
-.search-row .search {
-  flex: 1;
-  min-width: 0;
-}
-.search-row .icon-btn {
-  margin-bottom: 10px;
 }
 
 /* ── 요청 태그 ───────────────────────────────────────────
@@ -4116,8 +4214,17 @@ input[type="radio"] {
   background: var(--tint);
   color: var(--ink);
 }
+.tagbar .tb-close {
+  width: 26px;
+  height: 26px;
+}
+.tagbar .tb-close:hover:not(:disabled) {
+  background: var(--paper);
+}
+/* 창·이력 화면 안의 태그 거르기 칩 — 띠 바탕 없이(종이 위에 코르크 띠가 끼면 면이 하나 더 생긴다) */
 .tf-chips {
   border-bottom: 1px solid var(--line);
+  background: transparent;
 }
 .archive-tags {
   margin: 0 0 8px;
@@ -4134,24 +4241,6 @@ input[type="radio"] {
   margin: 0 0 0 6px;
 }
 
-/* 사이드바 대표 태그 */
-.s-tags {
-  display: flex;
-  gap: 8px;
-  margin: 1px 0 2px;
-  overflow: hidden;
-  white-space: nowrap;
-}
-.s-tagchip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  color: var(--ink-2); /* 코르크 위 */
-}
-.session.on .s-tagchip {
-  color: var(--sel-ink-2);
-}
 
 /* 요청의 태그 고치기 */
 .tag-picker {
@@ -4460,7 +4549,7 @@ input[type="radio"] {
 }
 .tag-suggest {
   position: absolute;
-  left: 44px;
+  left: 12px;
   bottom: calc(100% + 6px);
   z-index: 20;
   min-width: 180px;
@@ -4508,36 +4597,12 @@ input[type="radio"] {
   color: var(--ink-2);
 }
 
-/* 예약 = 코노티 예약 발송 색(앰버). 전달 못 한 예약(held)만 브릭.
-   예약 단추는 오크 바 위에 있다 — 아이콘은 흰색 그대로, 숫자는 흰 알약(오크 글자) · 못 보낸 예약은 브릭 알약 + 흰 테 */
-.side-head .sched-btn.warn {
-  color: var(--on-bar);
-}
-.sched-badge {
-  position: absolute;
-  top: 0;
-  right: -1px;
-  min-width: 15px;
-  height: 15px;
-  padding: 0 4px;
-  border-radius: var(--r-pill);
-  background: var(--on-bar);
-  color: var(--brand-ink);
-  font-size: var(--fs-nano);
-  font-weight: 800;
-  line-height: 15px;
-  text-align: center;
-}
-.sched-btn.warn .sched-badge {
-  background: var(--danger);
-  color: var(--on-bar);
-  box-shadow: 0 0 0 1.5px var(--on-bar);
-}
+/* 예약 = 코노티 예약 발송 색(앰버). 전달 못 한 예약(held)만 브릭(입력 위 한 줄 · 바닥줄 숫자) */
 .sched-chip-row {
   display: flex;
   align-items: center;
   gap: 6px;
-  max-width: 844px;
+  max-width: 760px;
   margin: 0 auto 6px;
   padding: 4px 10px;
   border-left: 3px solid var(--attn);

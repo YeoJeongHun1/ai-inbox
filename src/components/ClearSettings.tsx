@@ -4,6 +4,7 @@ import { api, POLICY_LABEL, type ClearOverview, type CliInfo, type HistoryStatus
 import { fullTime } from "../format";
 import { kbd } from "../keys";
 import { ClearDialog } from "./ClearDialog";
+import { Note } from "./Note";
 
 /** 설정 — /clear 로 끝난 대화의 기본 처리 */
 export function ClearSection({ toast }: { toast: (m: string) => void }) {
@@ -17,10 +18,10 @@ export function ClearSection({ toast }: { toast: (m: string) => void }) {
   return (
     <section className="set">
       <h3>/clear 로 끝난 대화</h3>
-      <p className="set-note">
+      <Note>
         연결된 세션에서 /clear 하면 그 대화는 끝난 대화로 흐리게 표시됩니다. Claude Code 는 /clear 한 대화를 <code>/resume</code>·<code>/rewind</code> 로 되돌릴 수 있게
         {ov ? ` ${ov.retention_days}일` : " 30일"}(cleanupPeriodDays) 동안 두고 지웁니다. 삭제 예약한 대화는 그 기간 + 유예 {ov?.grace_days ?? 7}일이 지난 뒤에만 이 앱에서도 지워집니다.
-      </p>
+      </Note>
       <label className="set-line">
         <span>새로 /clear 된 대화는</span>
         <select
@@ -273,10 +274,10 @@ export function ScheduleSection({ toast }: { toast: (m: string) => void }) {
   return (
     <section className="set">
       <h3>예약 전송</h3>
-      <p className="set-note">
+      <Note>
         입력창의 <strong>시계 버튼</strong>으로 쓴 말을 정한 시각(또는 N분 뒤)에 세션에 보냅니다. <strong>이 PC 의 AI Inbox 가 켜져 있을 때만</strong> 전달되고(서버에 저장하지 않습니다),
         세션이 꺼져 있거나 받을 수 없으면 자동으로 보내지 않고 <strong>알림만</strong> 갑니다.
-      </p>
+      </Note>
       <label className="check">
         <input type="checkbox" checked={!st.paused} disabled={busy} onChange={(e) => run(() => api.schedSetSetting("paused", e.target.checked ? "0" : "1"), e.target.checked ? "예약 전송을 켰습니다" : "예약 전송을 멈췄습니다")} />
         예약 전송 켜기 (끄면 아무것도 발사하지 않고, 다시 켜면 놓친 예약은 각 예약의 "놓쳤을 때" 설정을 따릅니다)
@@ -299,9 +300,9 @@ export function ScheduleSection({ toast }: { toast: (m: string) => void }) {
           ))}
         </select>
       </div>
-      <p className="set-note small">
+      <Note small>
         우선순위: 예약을 만들 때 고른 것 → 세션 규칙 → 태그 규칙 → 방해금지 시간대 → 이 기본값. 세션 규칙은 아래에서, 예약마다 덮어쓰기는 예약 창에서 정합니다.
-      </p>
+      </Note>
 
       <div data-set-id="sched-dnd">
       <h4>방해금지 시간 (시간대 규칙)</h4>
@@ -321,7 +322,7 @@ export function ScheduleSection({ toast }: { toast: (m: string) => void }) {
           </label>
         ))}
       </div>
-      <p className="set-note small">이 시간 안에 시각이 된 예약은 "방해금지 시간이 끝난 뒤"로 미룹니다(예약·세션·태그 규칙이 따로 있으면 그쪽이 먼저). 자정을 넘겨도 됩니다.</p>
+      <Note small>이 시간 안에 시각이 된 예약은 "방해금지 시간이 끝난 뒤"로 미룹니다(예약·세션·태그 규칙이 따로 있으면 그쪽이 먼저). 자정을 넘겨도 됩니다.</Note>
       </div>
 
       <div data-set-id="sched-rules">
