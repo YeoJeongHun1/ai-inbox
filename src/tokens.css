@@ -1,10 +1,19 @@
 /* AI Inbox — 디자인 토큰(한 곳). 정본 설명은 DESIGN.md.
-   코노티(폰 앱) 우드톤을 데스크톱으로 옮긴 것: 코르크 캔버스 위 크림 종이, 오크가 기본 액션,
-   의미색 다섯(오크·플럼·앰버·세이지·브릭)만 쓴다. 코노티는 라이트 전용이라 다크는 같은 나무를 밤에 본 "에스프레소"로 새로 짰다.
-   글자색은 코노티 원값의 색상(hue)을 지키되 본문 대비 4.5:1 을 넘게 한 단계 어둡게(다크는 밝게) 맞췄다 — 표는 DESIGN.md.
+   코노티(폰 앱) 실제 화면과 같은 톤: 화면 맨 위 = 오크 단색 바(흰 글씨) · 바탕 = 코르크 · 카드·입력 = 크림/순백 + 얇은 선,
+   의미색 다섯(오크·플럼·앰버·세이지·브릭)만 쓴다.
+   **라이트 전용** — 코노티 앱에 다크 모드가 없다(theme.dart 는 light 하나). 시스템이 다크여도 이 앱은 밝게 뜬다.
+   글자색은 코노티 원값의 색상(hue)을 지키되 본문 대비 4.5:1 을 넘게 한 단계 어둡게 맞췄다 — 표는 DESIGN.md.
    예전 이름(--bg · --accent · --sel-* …)은 다른 규칙·브랜치가 그대로 쓰도록 맨 아래에서 새 토큰으로 잇는다. */
 
 :root {
+  /* ── 오크 바: 사이드바 맨 위 · 대화 머리 · 문서 머리 · 창 머리 — 코노티 AppBar(kBrand 단색 · 흰 글씨 · 그림자 없음) ── */
+  --bar: #9c6b43;
+  --on-bar: #ffffff; /* 오크 위 글자는 흰색만 4.5:1 을 넘는다(4.57) — 보조 줄도 흰색, 위계는 크기·굵기로 */
+  --on-bar-line: rgba(255, 255, 255, 0.55); /* 오크 위 바깥선 버튼 테두리 */
+  --bar-hover: rgba(40, 22, 8, 0.16); /* 오크 위 누르기 — 밝히지 않고 어둡게(흰 글자 대비 유지) */
+  --bar-press: rgba(40, 22, 8, 0.26); /* 오크 위 켜짐(목차 버튼·요청 번호) */
+  --bar-h: 64px;
+
   /* ── 표면: 캔버스(코르크) < 종이 < 입력(순백) ── */
   --canvas: #ece1cb; /* 대화 영역 바탕 — 코르크판 */
   --paper: #fffdf6; /* 사이드바·머리줄·카드·창 — 크림 종이 */
@@ -17,7 +26,7 @@
   --line: #e8ddc8;
   --line-strong: #d9cbb0;
 
-  /* ── 잉크(에스프레소 3단) — ink-3 은 종이·틴트·입력 위에서만(캔버스·고른 줄 위에선 ink-2) ── */
+  /* ── 잉크 3단 — ink-3 은 종이·틴트·입력 위에서만(코르크 위에선 ink-2 — 4.0:1 이라 흐려 보인다) ── */
   --ink: #3a2c20;
   --ink-2: #6e5847;
   --ink-3: #7f6955;
@@ -41,7 +50,7 @@
   --danger-bg: #f6e6e0;
   --danger-line: #e8c3b3;
   --live: #5f8a58; /* 세이지 — 작업 중(코노티 폰 aiToneColor.live) */
-  --live-ink: #4a7044;
+  --live-ink: #466b40; /* 코르크 위에서도 4.5:1(세션 목록이 코르크 위로 왔다) */
   --live-bg: #eef3e8;
   --attn: #c0822e; /* 앰버 — 응답 필요·예약(폰 attention·scheduled) */
   --attn-ink: #8a5a14;
@@ -69,6 +78,7 @@
   --r-card: 14px;
   --r-dialog: 16px;
   --r-bubble: 16px;
+  --r-field: 21px; /* 대화 입력 칸 — 코노티 AI 작업 입력처럼 둥글게 */
   --r-tail: 4px;
   --r-pill: 999px;
 
@@ -106,65 +116,8 @@
   --dur-3: 250ms;
   --ease: cubic-bezier(0.2, 0, 0, 1);
 
-  color-scheme: light;
-}
-
-/* 다크 — 에스프레소. 코노티엔 다크가 없어 같은 의미색을 밝은 쪽으로 옮겨 새로 맞췄다 */
-@media (prefers-color-scheme: dark) {
-  :root {
-    --canvas: #1a1511;
-    --paper: #231c16;
-    --paper-line: #33291f;
-    --tint: #2b231c;
-    --wood: #3a2d22;
-    --track: #322820;
-    --input: #1e1813;
-    --code: #2a221b;
-    --line: #362c23;
-    --line-strong: #4a3d31;
-
-    --ink: #f2e9dc;
-    --ink-2: #cdbda8;
-    --ink-3: #a8957e;
-    --hint: #a8957e;
-
-    --brand: #d2a276;
-    --brand-ink: #d9ac82;
-    --brand-hover: #e0b68f;
-    --on-brand: #1a1511;
-    --me: #6e4a2c;
-    --me-ink: #f2e9dc;
-    --me-meta: #dcc9ae;
-
-    --unread: #b84d33;
-    --unread-ink: #ee8b70;
-    --danger: #b84d33;
-    --danger-ink: #ee8b70;
-    --danger-bg: #3a221b;
-    --danger-line: #6b3527;
-    --live: #7fae76;
-    --live-ink: #97c08e;
-    --live-bg: #243021;
-    --attn: #d99a48;
-    --attn-ink: #e5ac5c;
-    --attn-bg: #332816;
-    --attn-line: #5c4421;
-    --attn-fill: #d99a48;
-    --on-attn: #1a1511;
-    --ai: #b48fc0;
-    --ai-ink: #c6a3d1;
-    --ai-bg: #2e2331;
-    --ai-line: #5a4462;
-    --dot-idle: #6b5a49;
-
-    --shadow-card: 0 1px 0 rgba(8, 5, 2, 0.35);
-    --shadow-float: 0 4px 16px rgba(8, 5, 2, 0.5);
-    --shadow-pop: 0 16px 40px rgba(8, 5, 2, 0.6), 0 0 0 1px rgba(242, 233, 220, 0.04);
-    --scrim: rgba(8, 5, 2, 0.6);
-    --focus: #d2a276;
-
-    color-scheme: dark;
-  }
+  /* 라이트 전용 — 시스템 다크 설정을 따르지 않는다(입력·스크롤바·선택 상자까지 밝게). 창 자체도 tauri.conf.json "theme": "Light" */
+  color-scheme: only light;
 }
 
 /* ── 예전 이름 → 새 토큰(App.css 와 다른 브랜치의 규칙이 그대로 쓴다) ── */

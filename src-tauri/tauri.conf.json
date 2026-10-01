@@ -21,6 +21,7 @@
         "center": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
+        "theme": "Light",
         "create": false,
         "dragDropEnabled": false
       }

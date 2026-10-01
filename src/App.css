@@ -111,22 +111,32 @@ pre {
 
 /* ── 사이드바 ─────────────────────────────────────────── */
 
+/* 사이드바 = 코노티 "AI 작업" 탭과 같은 층: 오크 바(앱 이름) → 크림 띠(새 작업·폰·검색·탭) → 코르크 위 세션 줄 → 크림 바닥줄 */
 .sidebar {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border-right: 1px solid var(--line);
-  background: var(--paper);
+  /* 경계선은 오크 바 아래에서만 — 바는 대화 머리와 이음매 없이 한 줄 */
+  border-right: 1px solid var(--line-strong);
+  border-image: linear-gradient(to bottom, var(--bar) 0 var(--bar-h), var(--line-strong) var(--bar-h)) 1;
+  background: var(--canvas);
 }
 
-/* 머리: 1줄 = 앱 이름 + 아이콘 버튼 · 2줄 = 새 작업·폰 연결(글자 버튼).
-   한 줄이면 신호등 자리(84px)까지 더해 340px 를 넘어 오른쪽 버튼이 대화 영역 밑에 가려졌다. */
+/* 머리: 1줄 = 앱 이름 + 아이콘 버튼(오크 바 · 흰 글씨) · 2줄 = 새 작업·폰 연결(크림 띠 위 글자 버튼).
+   한 줄이면 신호등 자리(84px)까지 더해 340px 를 넘어 오른쪽 버튼이 대화 영역 밑에 가려졌다.
+   오크는 위 --bar-h 만큼만 칠한다 — 대화 머리(같은 높이)와 한 줄로 이어진다. */
 .side-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   column-gap: 2px;
+  row-gap: calc((var(--bar-h) - 52px + 12px) / 2); /* 줄이 셋(1줄 · 줄바꿈용 ::after · 2줄)이라 반씩 — 2줄은 오크 아래 12px */
   padding: 0 12px 12px 16px;
+  background: linear-gradient(to bottom, var(--bar) 0 var(--bar-h), var(--paper) var(--bar-h));
+}
+.side-head .wordmark {
+  color: var(--on-bar);
+  background-color: var(--bar); /* 오크 띠 안 — 같은 색을 깔아 둬야 대비 검사가 바탕을 바로 읽는다 */
 }
 .side-head::after {
   content: "";
@@ -197,7 +207,8 @@ pre {
   display: flex;
   gap: 16px;
   padding: 0 20px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--line-strong);
+  background: var(--paper);
 }
 .tab {
   flex: none;
@@ -233,9 +244,11 @@ pre {
   font-size: var(--fs-badge);
   font-weight: 700;
 }
+/* 응답 필요 숫자 = 코노티 예약 유형 칩(연앰버 바탕 + 앰버 글자) — 진한 겨자색 채움은 탁해 보였다 */
 .tab-n.n-attention {
-  background: var(--attn-fill);
-  color: var(--on-attn);
+  background: var(--attn-bg);
+  color: var(--attn-ink);
+  box-shadow: inset 0 0 0 1px var(--attn);
 }
 .tab-n.plain {
   min-width: 0;
@@ -273,11 +286,11 @@ pre {
 .session:hover {
   background: var(--tint);
 }
-/* 고른 세션 = 연우드 바탕 + 앞쪽 오크 막대(흐린 글자는 ink-2 로 올린다) */
+/* 고른 세션 = 코르크에서 떠오른 크림 종이 한 줄 + 앞쪽 오크 막대(코노티 카드와 같은 면) */
 .session.on {
-  background: var(--sel-bg);
+  background: var(--paper);
   color: var(--sel-ink);
-  box-shadow: inset 3px 0 0 var(--brand);
+  box-shadow: inset 3px 0 0 var(--brand), 0 1px 0 var(--paper-line), 0 -1px 0 var(--paper-line);
 }
 .session.on::after,
 .session:hover::after {
@@ -308,7 +321,7 @@ pre {
   color: var(--brand-ink);
 }
 .session.on .avatar {
-  background: var(--paper);
+  background: var(--wood);
 }
 /* 켜진 세션 점: 쉬는 중 = 흐린 점 · 작업 중 = 세이지(폰과 같은 색) */
 .live-dot {
@@ -319,14 +332,14 @@ pre {
   height: 12px;
   border-radius: 50%;
   background: var(--dot-idle);
-  border: 2px solid var(--paper);
+  border: 2px solid var(--canvas);
 }
 .live-dot.busy {
   background: var(--live);
   animation: pulse 1.4s ease-in-out infinite;
 }
 .session.on .live-dot {
-  border-color: var(--sel-bg);
+  border-color: var(--paper);
 }
 @keyframes pulse {
   50% {
@@ -367,12 +380,10 @@ pre {
   background: var(--track);
   color: var(--ink-2);
 }
-.session.on .s-agent {
-  background: var(--paper);
-}
+/* 코르크 위 줄의 보조 글자는 ink-2 — ink-3 은 코르크에서 4.0:1 이라 흐려 보인다(종이·순백 위에서만 ink-3) */
 .s-proj {
   font-size: 12px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -387,7 +398,7 @@ pre {
   margin-left: auto;
   flex: none;
   font-size: var(--fs-caption);
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
 .session.has-unread .s-time,
 .session.on.has-unread .s-time {
@@ -409,7 +420,8 @@ pre {
   line-height: 1.4;
 }
 .s-me {
-  color: var(--ink-3);
+  color: var(--ink-2);
+  font-weight: 600;
 }
 /* 진행 상태 글자 — 작업 중·백그라운드 = 세이지, 승인·답변 대기 = 앰버(폰 aiToneColor) */
 .s-working {
@@ -465,7 +477,8 @@ pre {
   gap: 8px;
   height: 34px;
   padding: 0 16px;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--line-strong);
+  background: var(--paper); /* 코노티 바텀바와 같은 크림 */
   font-size: var(--fs-caption);
   color: var(--ink-3);
 }
@@ -598,11 +611,13 @@ pre {
   min-height: 0;
   background: var(--canvas);
 }
-/* 빈 상태 — 코노티 AI 소개처럼 연우드 타일 안의 오크 아이콘 + 안내 한 줄 */
+/* 빈 상태 — 코노티 AI 소개처럼 크림 타일 안의 오크 아이콘 + 안내 한 줄.
+   세션을 고르기 전에도 맨 위 오크 바는 이어진다(사이드바 첫 줄과 같은 높이) */
 .chat.empty {
   display: grid;
   place-items: center;
   color: var(--ink-2);
+  background: linear-gradient(to bottom, var(--bar) 0 var(--bar-h), var(--canvas) var(--bar-h));
 }
 .chat.empty p {
   display: flex;
@@ -617,16 +632,81 @@ pre {
   content: "";
   width: 56px;
   height: 56px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--paper-line);
   border-radius: var(--r-dialog);
-  background: var(--tint)
+  background: var(--paper)
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 24 24' fill='none' stroke='%239c6b43' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='22 12 16 12 14 15 10 15 8 12 2 12'/%3E%3Cpath d='M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z'/%3E%3C/svg%3E")
     center / 28px no-repeat;
+  box-shadow: var(--shadow-card);
 }
-@media (prefers-color-scheme: dark) {
-  .chat.empty p::before {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28' viewBox='0 0 24 24' fill='none' stroke='%23d2a276' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='22 12 16 12 14 15 10 15 8 12 2 12'/%3E%3Cpath d='M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z'/%3E%3C/svg%3E");
-  }
+
+/* ── 오크 바 — 코노티 AppBar: kBrand 단색 · 흰 제목 · 흰 아이콘 · 그림자 없음 ──
+   대화 머리 · 문서 머리 · 창 머리 · 기록 머리 · 사이드바 첫 줄이 같은 바다. 오크 위 글자는 흰색만(4.57:1). */
+.chat-head,
+.doc-head,
+.modal-head,
+.archive-head {
+  background: var(--bar);
+  color: var(--on-bar);
+  border-bottom-color: var(--bar);
+}
+:is(.chat-head, .doc-head, .modal-head, .archive-head) h1,
+:is(.chat-head, .doc-head, .modal-head, .archive-head) h2 {
+  color: var(--on-bar);
+}
+:is(.chat-head, .doc-head, .modal-head, .archive-head, .side-head) .icon-btn,
+.side-head .icon-btn:disabled {
+  color: var(--on-bar);
+}
+:is(.chat-head, .doc-head, .modal-head, .archive-head, .side-head) .icon-btn:hover:not(:disabled) {
+  background: var(--bar-hover);
+  color: var(--on-bar);
+}
+:is(.chat-head, .doc-head, .modal-head, .archive-head) .icon-btn.on {
+  background: var(--bar-press);
+  color: var(--on-bar);
+}
+/* 오크 위 포커스 링 — 오크 링은 바에 묻히니 흰 링 */
+:is(.chat-head, .doc-head, .modal-head, .archive-head, .side-head) :focus-visible {
+  outline-color: var(--on-bar);
+}
+/* 오크 위 글자 버튼 — 투명 바탕 + 흰 바깥선 + 흰 글자(코노티 앱바 TextButton) */
+.chat-head .text-btn,
+.chat-head .phone-mode {
+  border-color: var(--on-bar-line);
+  background: transparent;
+  color: var(--on-bar);
+}
+.chat-head .text-btn:hover,
+.chat-head .phone-mode:hover {
+  background: var(--bar-hover);
+  border-color: var(--on-bar);
+}
+.chat-head .phone-mode.on {
+  border-color: var(--on-bar);
+  color: var(--on-bar);
+}
+.chat-head .phone-mode select {
+  color: var(--on-bar);
+  font-weight: 600;
+}
+/* 펼친 목록은 OS·WebView 가 그린다 — 흰 글자가 흰 바탕에 묻히지 않게 항목은 잉크로 */
+.chat-head .phone-mode option {
+  color: var(--ink);
+  background: var(--input);
+}
+.chat-head .toc-btn,
+.chat-head .chan-warn {
+  color: var(--on-bar);
+}
+.chat-head .toc-btn:hover {
+  background: var(--bar-hover);
+  color: var(--on-bar);
+}
+.chat-head .toc-btn.on {
+  background: var(--bar-press);
+  color: var(--on-bar);
+  box-shadow: inset 0 0 0 1px var(--on-bar-line);
 }
 
 /* 좁아서 제목이 140px 아래로 눌리면 버튼 줄을 아래로 내린다(예전엔 제목이 한 글자 폭까지 눌렸다) */
@@ -635,10 +715,9 @@ pre {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 16px;
-  min-height: 64px;
-  padding: 10px 16px 10px 24px;
-  border-bottom: 1px solid var(--line);
-  background: var(--paper);
+  min-height: var(--bar-h);
+  padding: 8px 16px 8px 24px;
+  border-bottom: 1px solid var(--bar);
 }
 .chat-title {
   flex: 1 1 140px;
@@ -648,21 +727,23 @@ pre {
   margin: 0;
   font-size: 18px;
   font-weight: 800;
+  line-height: 1.35;
   letter-spacing: -0.3px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .chat-title h1.unnamed {
-  font-weight: 500;
+  font-weight: 600;
 }
+/* 보조 줄(폴더 · 브랜치 · 상태 · 모델) — 코노티 앱바 부제처럼 바 위에서 흰 12px */
 .chat-sub {
   display: flex;
   flex-wrap: wrap;
   gap: 0 14px;
-  margin-top: 2px;
+  margin-top: 1px;
   font-size: 12px;
-  color: var(--ink-3);
+  color: var(--on-bar);
   min-width: 0;
 }
 .chat-sub span {
@@ -672,12 +753,23 @@ pre {
   max-width: 360px;
 }
 .chat-sub .agent-tag {
-  color: var(--ink-2);
-  font-weight: 600;
-}
-.chat-sub .live.busy {
-  color: var(--live-ink);
   font-weight: 700;
+}
+/* 작업 중 — 세이지 점(흰 테두리) + 굵은 흰 글자. 색만으로 가르지 않는다 */
+.chat-sub .live.busy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 700;
+}
+.chat-sub .live.busy::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--live);
+  box-shadow: 0 0 0 1.5px var(--on-bar);
 }
 .chat-actions {
   display: flex;
@@ -1301,16 +1393,17 @@ pre {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  border-left: 1px solid var(--line);
+  border-left: 1px solid var(--line-strong);
+  border-image: linear-gradient(to bottom, var(--bar-press) 0 var(--bar-h), var(--line-strong) var(--bar-h)) 1;
   background: var(--paper);
 }
 .doc-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 64px;
+  height: var(--bar-h);
   padding: 0 10px 0 14px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--bar);
 }
 .doc-nav,
 .doc-actions {
@@ -1318,14 +1411,15 @@ pre {
   align-items: center;
   gap: 2px;
 }
+/* 요청 번호 — 오크 바 위의 어두운 알약 + 흰 글자 */
 .doc-seq {
   margin-left: 8px;
-  padding: 2px 9px;
+  padding: 2px 10px;
   border-radius: var(--r-pill);
-  background: var(--track);
-  font-size: var(--fs-caption);
+  background: var(--bar-press);
+  font-size: var(--fs-sm);
   font-weight: 700;
-  color: var(--ink-2);
+  color: var(--on-bar);
 }
 .doc-scroll {
   flex: 1;
@@ -1480,7 +1574,7 @@ pre {
 
 /* ── 설정 ─────────────────────────────────────────────── */
 
-/* 창 — 에스프레소 스크림 위의 종이(코노티 dialog: 16px · 제목 17/800) */
+/* 창 — 진한 갈색 스크림 위의 종이(코노티 dialog: 16px) · 머리는 오크 바(제목 17/800 흰색) */
 .modal-back {
   position: fixed;
   inset: 0;
@@ -1501,6 +1595,7 @@ pre {
   padding: 0 28px 24px;
   animation: rise-in var(--dur-2) var(--ease);
 }
+/* 창 머리 = 오크 바(코노티 화면 맨 위와 같다) — 창 안쪽 여백(28px)을 거슬러 양끝까지 칠한다 */
 .modal-head {
   position: sticky;
   top: 0;
@@ -1509,8 +1604,12 @@ pre {
   align-items: center;
   justify-content: space-between;
   height: 56px;
-  background: var(--paper);
-  border-bottom: 1px solid var(--line);
+  margin: 0 -28px;
+  padding: 0 14px 0 28px;
+  border-bottom: 1px solid var(--bar);
+}
+.modal-head + .set {
+  padding-top: 20px;
 }
 .modal-head h2 {
   margin: 0;
@@ -1645,20 +1744,37 @@ input[type="radio"] {
   position: static;
   flex: none;
   gap: 16px;
+  height: var(--bar-h);
+  margin: 0;
   padding: 0 16px 0 24px;
 }
 .set-head h2 {
   flex: none;
 }
+/* 오크 바 안의 검색 = 코노티 알림 검색처럼 순백 둥근 칸(테두리 없음) · 포커스는 흰 링 */
+.set-search,
+.search.archive-search {
+  border-color: var(--input);
+}
+.set-search:focus-within,
+.search.archive-search:focus-within {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px var(--on-bar);
+}
 .set-search {
   flex: 1;
   max-width: 380px;
   margin: 0 0 0 auto;
-  height: 32px;
+  height: 34px;
 }
 .set-search .icon-btn {
   width: 22px;
   height: 22px;
+  color: var(--ink-2);
+}
+.set-search .icon-btn:hover:not(:disabled) {
+  background: var(--tint);
+  color: var(--ink);
 }
 .set-body {
   flex: 1;
@@ -1666,12 +1782,13 @@ input[type="radio"] {
   display: grid;
   grid-template-columns: 200px minmax(0, 1fr);
 }
+/* 왼쪽 범주 = 크림 띠 · 오른쪽 내용 = 코르크 위 크림 카드(코노티 알림 설정 화면) */
 .set-nav {
   min-height: 0;
   overflow-y: auto;
   padding: 14px 10px;
-  border-right: 1px solid var(--line);
-  background: var(--tint);
+  border-right: 1px solid var(--line-strong);
+  background: var(--paper);
 }
 .set-tabs {
   display: flex;
@@ -1702,7 +1819,7 @@ input[type="radio"] {
   color: var(--ink-2);
 }
 .set-tab:hover {
-  background: var(--paper);
+  background: var(--tint);
   color: var(--ink);
 }
 /* 고른 범주 = 세션 목록과 같은 표시(연우드 + 앞쪽 오크 막대 + 굵게) */
@@ -1725,10 +1842,10 @@ input[type="radio"] {
   min-height: 0;
   overflow-y: auto;
   padding: 0 28px 28px;
+  background: var(--canvas);
 }
 .set-cat-head {
-  padding: 22px 0 14px;
-  border-bottom: 1px solid var(--line);
+  padding: 22px 2px 4px;
 }
 .set-cat-head h3 {
   margin: 0;
@@ -1740,13 +1857,20 @@ input[type="radio"] {
 .set-cat-head p {
   margin: 4px 0 0;
   font-size: var(--fs-caption);
-  color: var(--ink-3);
+  color: var(--ink-2); /* 코르크 위라 ink-2 */
 }
-.set-block:not(:last-child) .set {
-  border-bottom: 1px solid var(--line);
+/* 설정 한 절 = 코르크 위 크림 카드 한 장(코노티 WoodCard: 14px · 1px 선 · 브라운 그림자) */
+.set-block {
+  margin-top: 12px;
 }
-.set-block:last-child .set {
-  border-bottom: 0;
+.set-block:not(:last-child) .set,
+.set-block:last-child .set,
+.set-pane .set {
+  padding: 16px 20px;
+  border: 1px solid var(--paper-line);
+  border-radius: var(--r-card);
+  background: var(--paper);
+  box-shadow: var(--shadow-card);
 }
 .set-block:empty {
   display: none;
@@ -1774,7 +1898,12 @@ input[type="radio"] {
   }
 }
 .set-results {
-  padding: 18px 0 0;
+  margin-top: 18px;
+  padding: 12px 16px 16px;
+  border: 1px solid var(--paper-line);
+  border-radius: var(--r-card);
+  background: var(--paper);
+  box-shadow: var(--shadow-card);
 }
 .set-count {
   margin: 0 0 6px;
@@ -2109,7 +2238,7 @@ input[type="radio"] {
   width: 200px;
   height: 200px;
   padding: 6px;
-  background: #ffffff; /* QR 은 어두운 테마에서도 흰 바탕이어야 읽힌다 */
+  background: #ffffff; /* QR 은 순백 바탕이어야 읽힌다(크림 종이 위에서도) */
   border-radius: var(--r-xs);
 }
 .pair-box .qr svg {
@@ -2266,11 +2395,11 @@ input[type="radio"] {
   display: flex;
   flex-direction: column;
 }
-/* 입력줄 — 종이 바 위 순백 입력(코노티 comment-input · 입력 12px · 포커스 오크) */
+/* 입력줄 — 코노티 AI 작업 입력: 크림 바 위 순백 둥근 칸 + 오크 원형 보내기 */
 .composer {
   flex: none;
   padding: 10px 28px 12px;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--line-strong);
   background: var(--paper);
 }
 .composer-box {
@@ -2279,9 +2408,9 @@ input[type="radio"] {
   gap: 8px;
   max-width: 844px;
   margin: 0 auto;
-  padding: 5px 5px 5px 12px;
+  padding: 5px 5px 5px 14px;
   border: 1px solid var(--line-strong);
-  border-radius: var(--r-md);
+  border-radius: var(--r-field);
   background: var(--input);
   transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
 }
@@ -2312,7 +2441,7 @@ input[type="radio"] {
   place-items: center;
   width: 32px;
   height: 32px;
-  border-radius: var(--r-sm);
+  border-radius: 50%;
   background: var(--brand);
   color: var(--on-brand);
   transition: background-color var(--dur-1) var(--ease);
@@ -2714,9 +2843,9 @@ input[type="radio"] {
   display: flex;
   align-items: center;
   gap: 16px;
-  height: 60px;
+  height: var(--bar-h);
   padding: 0 16px 0 28px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--bar);
   flex: none;
 }
 .archive-head h2 {
@@ -3511,34 +3640,29 @@ input[type="radio"] {
   box-shadow: var(--shadow-pop);
 }
 
-/* ── /clear 로 끝난 대화(0.9.0) — 음영·투명도로 "끝난 대화"임을 알린다 ── */
-.session.ended {
-  opacity: 0.6;
-  background-image: repeating-linear-gradient(135deg, transparent 0 7px, var(--track) 7px 8px);
-}
-/* 끝난 세션 아바타 — 폰처럼 트랙 바탕(나무색을 뺀다) */
+/* ── /clear 로 끝난 대화(0.9.0) — 투명도·빗금으로 흐리게 하지 않는다(코노티는 끝난 세션도 같은 진하기).
+   표시는 셋: 아바타 = 트랙 바탕(나무색을 뺀다, 폰과 같다) · 이름 600 · "끝남 …" 한 줄 ── */
 .session.ended .avatar {
   background: var(--track);
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
-.session.ended:hover,
-.session.ended.on {
-  opacity: 0.88;
-}
-.session.ended.on {
-  background-image: none;
+.session.ended .s-name {
+  font-weight: 600;
 }
 .session.kept .avatar {
+  box-shadow: 0 0 0 2px var(--canvas), 0 0 0 3.5px var(--brand);
+}
+.session.kept.on .avatar {
   box-shadow: 0 0 0 2px var(--paper), 0 0 0 3.5px var(--brand);
 }
 .s-ended {
   margin-top: 1px;
-  font-size: 11px;
-  color: var(--ink-3);
+  font-size: 11.5px;
+  color: var(--ink-2);
   letter-spacing: 0.01em;
 }
 .s-ended.st-purge {
-  color: var(--ink-2);
+  font-weight: 600;
 }
 .session.on .s-ended {
   color: var(--sel-ink-2);
@@ -3591,18 +3715,7 @@ input[type="radio"] {
   }
 }
 
-.chat.ended .chat-inner {
-  opacity: 0.6;
-  filter: saturate(0.35);
-  transition: opacity var(--dur-2) var(--ease);
-}
-.chat.ended .chat-inner:hover {
-  opacity: 0.9;
-  filter: none;
-}
-.chat.ended .chat-head h1 {
-  color: var(--ink-2);
-}
+/* 끝난 대화도 흐리게 하지 않는다 — 머리 아래 ended-bar(트랙 띠)가 알린다 */
 .ended-bar {
   display: flex;
   align-items: center;
@@ -3721,14 +3834,14 @@ input[type="radio"] {
 }
 
 /* ── 대화 이력 찾기(검색 모드 채팅) — 모델을 부르는 기능이라 코노티의 AI 색(플럼) ── */
+/* 머리는 다른 화면과 같은 오크 바(코노티 "AI 공지 도우미"도 오크 바) — 플럼은 본문(답·입력·안내)에서 */
 .history-chat .hc-icon {
   vertical-align: -3px;
   margin-right: 4px;
-  color: var(--ai);
+  color: var(--on-bar);
 }
 .hc-model {
   font-weight: 700;
-  color: var(--ai-ink);
 }
 .hc-notice {
   flex-wrap: wrap;
@@ -3806,7 +3919,7 @@ input[type="radio"] {
   background: var(--tint);
 }
 .hc-sources li.ended {
-  opacity: 0.75;
+  color: var(--ink-2);
 }
 .hc-n {
   flex: none;
@@ -3850,6 +3963,7 @@ input[type="radio"] {
   align-items: center;
   gap: 4px;
   padding-right: 12px;
+  background: var(--paper); /* 크림 띠(새 작업·폰 아래로 이어짐) */
 }
 .search-row .search {
   flex: 1;
@@ -3924,18 +4038,18 @@ input[type="radio"] {
   color: var(--ink-2);
 }
 
-/* 대화 위 칩 줄 */
+/* 대화 위 칩 줄 — 코노티 AI 작업 필터 칩처럼 코르크 위에 순백 칩 */
 .tagbar {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 7px 20px;
-  border-bottom: 1px solid var(--line);
-  background: var(--bg);
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--line-strong);
+  background: var(--canvas);
 }
 .tb-icon {
-  color: var(--ink-3);
+  color: var(--ink-2);
   flex: none;
 }
 /* 칩 — 코노티 chip-default(순백 + 선) / chip-selected(오크 채움 + 흰 글자) */
@@ -4033,7 +4147,7 @@ input[type="radio"] {
   align-items: center;
   gap: 4px;
   font-size: 11px;
-  color: var(--ink-3);
+  color: var(--ink-2); /* 코르크 위 */
 }
 .session.on .s-tagchip {
   color: var(--sel-ink-2);
@@ -4394,9 +4508,10 @@ input[type="radio"] {
   color: var(--ink-2);
 }
 
-/* 예약 = 코노티 예약 발송 색(앰버). 전달 못 한 예약(held)만 브릭 */
-.sched-btn.warn {
-  color: var(--danger-ink);
+/* 예약 = 코노티 예약 발송 색(앰버). 전달 못 한 예약(held)만 브릭.
+   예약 단추는 오크 바 위에 있다 — 아이콘은 흰색 그대로, 숫자는 흰 알약(오크 글자) · 못 보낸 예약은 브릭 알약 + 흰 테 */
+.side-head .sched-btn.warn {
+  color: var(--on-bar);
 }
 .sched-badge {
   position: absolute;
@@ -4406,15 +4521,17 @@ input[type="radio"] {
   height: 15px;
   padding: 0 4px;
   border-radius: var(--r-pill);
-  background: var(--attn-fill);
-  color: var(--on-attn);
+  background: var(--on-bar);
+  color: var(--brand-ink);
   font-size: var(--fs-nano);
-  font-weight: 700;
+  font-weight: 800;
   line-height: 15px;
   text-align: center;
 }
 .sched-btn.warn .sched-badge {
   background: var(--danger);
+  color: var(--on-bar);
+  box-shadow: 0 0 0 1.5px var(--on-bar);
 }
 .sched-chip-row {
   display: flex;
@@ -4480,8 +4597,9 @@ input[type="radio"] {
   border-left: 3px solid var(--danger);
   padding-left: 8px;
 }
-.sched-row.dim {
-  opacity: 0.6;
+/* 취소된 예약 — 흐리게(opacity) 하지 않고 본문을 ink-2 로 한 단계 낮춘다(상태 글자 "취소됨"이 함께 알린다) */
+.sched-row.dim .sched-text {
+  color: var(--ink-2);
 }
 .sched-main {
   display: flex;
