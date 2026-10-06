@@ -1,3 +1,15 @@
+> ## 이 앱은 **Conoti AI** 로 이름을 바꾸고 새 저장소로 이사했습니다
+>
+> - **새 설치 파일·업데이트·소식**: [github.com/YeoJeongHun1/conoti-ai](https://github.com/YeoJeongHun1/conoti-ai) 의 [Releases](https://github.com/YeoJeongHun1/conoti-ai/releases)
+> - **AI Inbox(0.10.1 이하)를 쓰고 있다면**: 앱의 "새 버전 확인"으로 Conoti AI 0.12.x 로 올라옵니다. 데이터·설정·훅·폰 연결은 그대로 이어집니다.
+> - **라이선스**: 이 저장소의 0.10.1 까지의 소스는 **MIT 라이선스 그대로**입니다. 0.12.0 부터의 설치 파일은 ELD 의 이용 조건([TERMS.md](https://github.com/YeoJeongHun1/conoti-ai/blob/main/TERMS.md))을 따릅니다.
+> - **지우지 마세요**: 이 저장소의 릴리스 `moved-to-conoti-ai` 는 옛 설치본이 새 저장소를 찾아가게 하는 안내 파일입니다. 이 저장소는 관찰 기간(약 2주) 뒤 보관(Archive)할 예정이며 삭제·이름 변경은 하지 않습니다.
+> - **문의·신고**: 새 저장소의 [Issues](https://github.com/YeoJeongHun1/conoti-ai/issues), 취약점은 그곳의 Security → Report a vulnerability.
+>
+> *English:* AI Inbox is now **Conoti AI** and has moved to [YeoJeongHun1/conoti-ai](https://github.com/YeoJeongHun1/conoti-ai) (installers, updates, issues). Existing AI Inbox 0.10.1 installs update to Conoti AI 0.12.x through the in-app update check. Sources up to 0.10.1 in this repository remain MIT-licensed; installers from 0.12.0 on are provided under ELD's terms of use. The release `moved-to-conoti-ai` is a pointer for old installs — please do not delete it.
+
+---
+
 # AI Inbox
 
 **Claude Code·Codex 에 맡긴 요청을 메신저처럼 모아 보는 데스크톱 앱** — macOS · Windows
